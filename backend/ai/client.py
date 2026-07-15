@@ -143,3 +143,36 @@ def call_ai(
     except Exception as e:
         logger.error(f"AI call failed (provider={provider}, model={use_model}): {e}")
         return None
+
+
+def stream_ai(
+    messages: List[Dict],
+    system: str,
+    model: Optional[str] = None,
+    max_tokens: int = 8192,
+    temperature: float = 0.3,
+):
+    """
+    Stream AI response as a generator of text chunks.
+    Only works with Anthropic provider. Returns None if streaming unavailable.
+    """
+    client, default_model, provider = get_ai_client()
+    if not client or provider != "anthropic":
+        return None
+    use_model = model or default_model
+
+    def _gen():
+        try:
+            with client.messages.stream(
+                model=use_model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+            ) as stream:
+                for chunk in stream.text_stream:
+                    yield chunk
+        except Exception as e:
+            logger.error(f"AI stream failed (model={use_model}): {e}")
+            yield "__STREAM_ERROR__"
+
+    return _gen()

@@ -53,6 +53,9 @@ export const chatApi = {
   },
   getSession: (sessionId) =>
     apiClient.get(`/api/bom/session/${sessionId}`).then(r => r.data),
+  /** Load full conversation messages for Claude-like session restore */
+  getMessages: (sessionId) =>
+    apiClient.get(`/api/bom/session/${sessionId}/messages`).then(r => r.data),
   /** List past sessions from Cosmos (sidebar history) */
   getHistory: (userId = 'demo_user', limit = 30) =>
     apiClient.get('/api/bom/history', { params: { user_id: userId, limit } }).then(r => r.data),

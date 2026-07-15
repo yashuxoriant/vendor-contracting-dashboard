@@ -1,0 +1,10 @@
+# Placeholder — this directory will hold BOM agent instruction and skill files.
+#
+# Files to be created in Step 7:
+#   BOMAgent.md                — L1 system prompt (from Vendor_Contracting_Agent_System_Instructions)
+#   Skill_Network_Telecom.md   — LAN, WAN/SD-WAN, Wireless, Voice
+#   Skill_DataCenter.md        — Data Center, Colocation, Cloud Infrastructure
+#   Skill_Security.md          — Firewalls, Identity, Endpoint
+#   Skill_EUC.md               — End User Computing
+#   Skill_Applications.md      — Applications
+#   Skill_M365.md              — Microsoft 365 / Productivity Licensing

@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   Box, Typography, TextField, IconButton, Paper, Chip, Button,
   Avatar, Tooltip, LinearProgress, Snackbar, Alert, Menu, MenuItem,
+  Dialog, DialogContent, DialogTitle, DialogActions,
 } from '@mui/material'
 import {
   Send, Add, AutoAwesome, Save, Build, Download,
@@ -428,6 +429,31 @@ function getAIResponse(userMsg, currentBOM, bomList, ctx) {
   }
 }
 
+// ── BOM domain options shown in the New BOM picker modal ──────────────────
+const BOM_DOMAINS = [
+  { key: 'Data Center / COLO',    label: 'Data Center / COLO',    icon: '🏗️', desc: 'DC builds, colocation, server infra' },
+  { key: 'SD-WAN',                label: 'SD-WAN / WAN',          icon: '🌐', desc: 'SD-WAN edges, MPLS, branch networking' },
+  { key: 'Cybersecurity',         label: 'Cybersecurity',         icon: '🔒', desc: 'EDR, SIEM, PAM, Zero Trust, WAF' },
+  { key: 'End User Computing',    label: 'End User Computing',    icon: '💻', desc: 'Laptops, VDI, peripherals, EUC fleet' },
+  { key: 'M365 & Power Platform', label: 'M365 & Power Platform', icon: '☁️', desc: 'Microsoft 365, Teams, SharePoint' },
+  { key: 'Network Equipment',     label: 'Network Equipment',     icon: '🔌', desc: 'Switches, routers, firewalls, APs' },
+  { key: 'Cloud Infrastructure',  label: 'Cloud Infrastructure',  icon: '⚡', desc: 'Azure, AWS, hybrid cloud landing zones' },
+]
+
+// Steps used to compute live progress % in the BOM Preview sidebar panel.
+const INTAKE_STEPS = [
+  { key: 'ma_phase',                   label: 'M&A Phase' },
+  { key: 'workstream_category',        label: 'Category' },
+  { key: 'triggering_event',           label: 'Triggering Event' },
+  { key: 'site_entity_scope',          label: 'Sites in Scope' },
+  { key: 'site_classification_type',   label: 'Site Type' },
+  { key: 'site_classification_size',   label: 'Site Size' },
+  { key: 'conveyance_status',          label: 'Conveyance Status' },
+  { key: 'required_by_date',           label: 'Required-By Date' },
+  { key: 'vendor_standard_preferred',  label: 'Preferred Vendor' },
+  { key: 'requestor',                  label: 'Requestor' },
+]
+
 // Convert backend BOM (snake_case line_items) to frontend BOM (camelCase lineItems)
 function backendBOMtoFrontend(backendBOM, projectName) {
   if (!backendBOM || !backendBOM.line_items) return null
@@ -526,6 +552,12 @@ export default function ChatPage() {
 
   // Chat history (from backend — persisted in Cosmos + ADLS)
   const [chatHistory, setChatHistory] = useState([])
+  const [sidebarSearch, setSidebarSearch] = useState('')
+
+  // Domain picker modal + intake progress tracking
+  const [domainPickerOpen, setDomainPickerOpen] = useState(false)
+  const [intakeFields, setIntakeFields] = useState({})
+  const [confirmDeleteEntry, setConfirmDeleteEntry] = useState(null) // {type:'chat'|'bom', item}
 
   // Derive current phase (1-10) from progress percentage
   const currentPhase = phaseProgress > 0 ? Math.max(1, Math.min(10, Math.ceil(phaseProgress / 10))) : 0
@@ -543,7 +575,33 @@ export default function ChatPage() {
     return sessions.filter(s => !hidden.has(s.session_id) && (s.message_count || 0) > 0)
   }
 
-  // On mount: check backend + load chat history
+  // ── Conversation localStorage cache ─────────────────────────────────────
+  // Conversations survive backend restarts and ADLS transcript delays.
+  const CONV_CACHE_PREFIX = 'chat_conv_'
+  const BOM_SESSION_MAP_KEY = 'bom_session_map'
+
+  const saveBOMSession = (bomId, sid) => {
+    if (!bomId || !sid) return
+    try { const map = JSON.parse(localStorage.getItem(BOM_SESSION_MAP_KEY) || '{}'); map[bomId] = sid; localStorage.setItem(BOM_SESSION_MAP_KEY, JSON.stringify(map)) } catch (_) {}
+  }
+  const lookupBOMSession = (bomId) => {
+    if (!bomId) return null
+    try { return JSON.parse(localStorage.getItem(BOM_SESSION_MAP_KEY) || '{}')[bomId] || null } catch (_) { return null }
+  }
+  const saveConvCache = (sid, msgs) => {
+    if (!sid || !msgs?.length) return
+    try {
+      const payload = msgs.map(m => ({ role: m.role, type: m.type || 'text', text: m.text || '' }))
+      localStorage.setItem(CONV_CACHE_PREFIX + sid, JSON.stringify(payload))
+    } catch (_) {}
+  }
+  const loadConvCache = (sid) => {
+    try {
+      const raw = localStorage.getItem(CONV_CACHE_PREFIX + sid)
+      if (!raw) return null
+      return JSON.parse(raw).map((m, i) => ({ id: 'c_' + i, ...m }))
+    } catch (_) { return null }
+  }
   useEffect(() => {
     chatApi.ping().then(online => {
       setBackendMode(online)
@@ -566,7 +624,76 @@ export default function ChatPage() {
     }
   }
 
-  useEffect(() => {
+  // Load a historical chat session — tries backend then falls back to localStorage cache.
+  const switchToSession = (sessionItem, linkedBom = null) => {
+    const restoredBom = linkedBom || null
+    setLocalBOM(restoredBom)
+    dispatch(setCurrentBOM(restoredBom))
+    setCtx({ project: restoredBom?.project || null, category: restoredBom?.category || null })
+    setPhaseProgress(sessionItem.progress || (restoredBom ? 100 : 0))
+    setIntakeFields({})
+    setIsTyping(false)
+    sendingRef.current = false
+    setInput('')
+    const sid = sessionItem.session_id
+    setSessionId(sid)
+    sessionStorage.setItem('chat_session_id', sid)
+    setMessages([{ id: 'loading', role: 'ai', type: 'text', text: '_Loading conversation…_' }])
+
+    chatApi.getMessages(sid).then(data => {
+      const fromBackend = (data.messages || []).map((m, i) => ({
+        id: 'h_' + i,
+        role: m.role === 'assistant' ? 'ai' : m.role,
+        type: 'text',
+        text: m.content || '',
+      }))
+      const cached = loadConvCache(sid)
+      const toShow = (cached?.length || 0) > fromBackend.length ? cached : (fromBackend.length ? fromBackend : null)
+      if (toShow?.length) {
+        setMessages(toShow)
+        if (fromBackend.length >= (cached?.length || 0) && fromBackend.length) saveConvCache(sid, toShow)
+      } else {
+        setMessages([{ id: 'empty', role: 'ai', type: 'text', text: 'Session loaded — no messages found.' }])
+      }
+    }).catch(() => {
+      const cached = loadConvCache(sid)
+      if (cached?.length) {
+        setMessages(cached)
+        setToast({ open: true, msg: 'Restored from local cache (backend session expired)', severity: 'info' })
+      } else {
+        setMessages([{ id: 'err', role: 'ai', type: 'text', text: 'Could not load session transcript.' }])
+        setToast({ open: true, msg: 'Could not load session', severity: 'error' })
+      }
+    })
+  }
+
+  // Handle domain/category selection from the Domain Picker modal.
+  // Pre-starts a backend session and sets up the welcome message with M&A intake questions.
+  const handleDomainSelect = async (category) => {
+    setDomainPickerOpen(false)
+    setLocalBOM(null)
+    dispatch(setCurrentBOM(null))
+    setCtx({ category, project: null })
+    setSessionId(null)
+    setPhaseProgress(0)
+    setIntakeFields({})
+    sessionStorage.removeItem('chat_session_id')
+    const domainObj = BOM_DOMAINS.find(d => d.key === category) || { icon: '📋' }
+    setMessages([{
+      id: Date.now(), role: 'ai', type: 'text',
+      text: `${domainObj.icon} **${category} BOM** selected.\n\nI've loaded the ${category} skill and qualification checklist.\n\n**Step 1 — M&A Phase:** What phase is this engagement in?\n\n- **Day-1 Readiness** — minimum viable cutover to legally close\n- **TSA Exit / Cutover** — active migration off TSA-provided services\n- **Full Integration / Standalone Build** — post-TSA steady-state build-out`,
+    }])
+    if (backendMode) {
+      try {
+        const resp = await chatApi.startSession(category, 'New Project', 'demo_user')
+        setSessionId(resp.session_id)
+        sessionStorage.setItem('chat_session_id', resp.session_id)
+      } catch (_) {
+        // Session created lazily on first message
+      }
+    }
+  }
+
     const welcome = savedCurrentBOM
       ? { id: 1, role: 'ai', type: 'loaded', text: 'Loaded **"' + savedCurrentBOM.name + '"** (v' + savedCurrentBOM.version + ') - **' + savedCurrentBOM.lineItems.length + ' items**, ' + fmt(savedCurrentBOM.totalValue) + '. What would you like to do?', bom: savedCurrentBOM }
       : { id: 1, role: 'ai', type: 'help', text: 'Hello! I am your **AI BOM Assistant**.\n\nI can create, update, analyze and manage your Bills of Materials in real-time. Just describe what you need in plain English.', suggestions: ['Create a Data Center BOM for Panasonic', 'Create SD-WAN BOM for 30 sites', 'Create Cybersecurity BOM for Idemia', 'Show my BOMs'] }
@@ -738,11 +865,19 @@ export default function ChatPage() {
           bom: aiBOM,
           actions: resp.complete && aiBOM ? ['library', 'rfq'] : undefined,
           attachment: resp.attachment || null,
+          suggestions: resp.suggestions?.length ? resp.suggestions : undefined,
+          sessionTitle: resp.session_title || null,
         })
         // When creating a new BOM while one already exists → session divider + reset session
         if (resp.complete && aiBOM && currentBOM) {
           addMsg({ role: 'divider', type: 'divider', prevBOM: currentBOM.name })
           setSessionId(null)
+        }
+        // Update session title in sidebar when backend provides one
+        if (resp.session_title && sid) {
+          setChatHistory(prev => prev.map(s =>
+            s.session_id === sid ? { ...s, title: resp.session_title } : s
+          ))
         }
         if (resp.complete) refreshHistory()   // pull updated history from Cosmos/ADLS
         backendFailCount.current = 0   // reset failure counter on success
@@ -874,14 +1009,7 @@ export default function ChatPage() {
       <Box sx={{ width: 220, flexShrink: 0, bgcolor: 'white', borderRight: '1px solid #F3F4F6', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <Box sx={{ p: 1.25, borderBottom: '1px solid #F3F4F6' }}>
           <Button fullWidth variant="contained" size="small" startIcon={<Add sx={{ fontSize: 14 }} />}
-            onClick={() => {
-              setLocalBOM(null)
-              dispatch(setCurrentBOM(null))
-              setCtx({})
-              setSessionId(null)
-              setPhaseProgress(0)
-              setMessages([{ id: Date.now(), role: 'ai', type: 'help', text: 'New session started. What BOM would you like to create?', suggestions: ['Create Data Center BOM for Panasonic', 'Create SD-WAN for 20 sites'] }])
-            }}
+            onClick={() => setDomainPickerOpen(true)}
             sx={{ textTransform: 'none', fontSize: '0.72rem', fontWeight: 700, bgcolor: '#D04A02', '&:hover': { bgcolor: '#A33A00' } }}>
             New BOM Chat
           </Button>
@@ -904,18 +1032,39 @@ export default function ChatPage() {
             )}
           </Box>
         </Box>
+        {/* Search bar */}
+        <Box sx={{ px: 1, pb: 0.5 }}>
+          <TextField
+            size="small" fullWidth
+            placeholder="Search sessions…"
+            value={sidebarSearch}
+            onChange={e => setSidebarSearch(e.target.value)}
+            InputProps={{ sx: { fontSize: '0.68rem', height: 26, bgcolor: '#F9FAFB', '& input': { py: 0 } } }}
+            sx={{ '& .MuiOutlinedInput-root': { borderRadius: '6px', '& fieldset': { borderColor: '#E5E7EB' } } }}
+          />
+        </Box>
         <Box sx={{ flex: 1, overflowY: 'auto', px: 1, pb: 1 }}>
           {/* Merge chat sessions + saved BOMs into one time-sorted list */}
           {(() => {
-            const chatItems = chatHistory.map(s => ({
-              key: 'chat_' + s.session_id,
-              type: 'chat',
-              label: s.category || s.project || 'Chat Session',
-              sub: s.message_count + ' msgs',
-              date: s.updated_at || '',
-              active: s.session_id === sessionId,
-              raw: s,
-            }))
+            const chatItems = chatHistory.map(s => {
+              // Prefer human-readable title: backend-generated title > project+category > fallback
+              const title = s.title
+                || (s.project && s.category ? `${s.project} · ${s.category}` : null)
+                || s.project
+                || s.category
+                || 'Chat Session'
+              const lastMsg = s.last_message || ''
+              const preview = lastMsg.length > 50 ? lastMsg.slice(0, 50) + '…' : lastMsg
+              return {
+                key: 'chat_' + s.session_id,
+                type: 'chat',
+                label: title,
+                sub: preview || (s.message_count + ' msgs'),
+                date: s.updated_at || '',
+                active: s.session_id === sessionId,
+                raw: s,
+              }
+            })
             const bomItems = bomList.map(b => ({
               key: 'bom_' + b.id,
               type: 'bom',
@@ -925,7 +1074,10 @@ export default function ChatPage() {
               active: currentBOM?.id === b.id,
               raw: b,
             }))
-            const all = [...chatItems, ...bomItems].sort((a, b) => (b.date > a.date ? 1 : -1))
+            const sq = sidebarSearch.toLowerCase().trim()
+            const all = [...chatItems, ...bomItems]
+              .sort((a, b) => (b.date > a.date ? 1 : -1))
+              .filter(item => !sq || item.label.toLowerCase().includes(sq) || (item.sub || '').toLowerCase().includes(sq))
             if (all.length === 0) return (
               <Typography sx={{ fontSize: '0.65rem', color: '#9CA3AF', textAlign: 'center', mt: 2 }}>
                 No history yet. Start a chat to create your first BOM.
@@ -943,14 +1095,7 @@ export default function ChatPage() {
                     '&:hover': { bgcolor: '#F9FAFB', '& .del-entry': { opacity: 1 } } }}
                   onClick={() => {
                     if (item.type === 'chat') {
-                      chatApi.getTranscript(item.raw.session_id).then(data => {
-                        const restored = (data.messages || []).map((m, i) => ({
-                          id: i + 1, role: m.role === 'assistant' ? 'ai' : m.role, type: 'text', text: m.content,
-                        }))
-                        setMessages(restored.length ? restored : [{ id: 1, role: 'ai', type: 'text', text: 'Session loaded — no messages found.' }])
-                        setSessionId(item.raw.session_id)
-                        setPhaseProgress(item.raw.progress || 0)
-                      }).catch(() => setToast({ open: true, msg: 'Could not load session transcript', severity: 'error' }))
+                      switchToSession(item.raw)
                     } else {
                       handleSend('Load ' + item.raw.name)
                     }
@@ -963,21 +1108,18 @@ export default function ChatPage() {
                       <Typography sx={{ fontSize: '0.67rem', fontWeight: 600, color: item.active ? '#D04A02' : '#1F2937', lineHeight: 1.2, pr: 1.5 }} noWrap>
                         {item.label}
                       </Typography>
-                      <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.2 }}>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.2, alignItems: 'center' }}>
                         {item.type === 'bom'
                           ? <Chip label={item.sub} size="small" sx={{ fontSize: '0.5rem', height: 13, bgcolor: statusBg, color: '#374151' }} />
-                          : <Typography sx={{ fontSize: '0.56rem', color: '#9CA3AF' }}>{item.sub}</Typography>}
-                        <Typography sx={{ fontSize: '0.55rem', color: '#9CA3AF' }}>{dateStr}</Typography>
+                          : <Typography sx={{ fontSize: '0.56rem', color: '#9CA3AF', flex: 1, mr: 0.5 }} noWrap>{item.sub}</Typography>}
+                        <Typography sx={{ fontSize: '0.55rem', color: '#9CA3AF', flexShrink: 0 }}>{dateStr}</Typography>
                       </Box>
                     </Box>
                   </Box>
                   <IconButton className="del-entry" size="small"
                     onClick={e => {
                       e.stopPropagation()
-                      if (item.type === 'chat') {
-                        addHidden(item.raw.session_id)   // persist tombstone
-                        setChatHistory(prev => prev.filter(s => s.session_id !== item.raw.session_id))
-                      } else dispatch(deleteBOM(item.raw.id))
+                      setConfirmDeleteEntry({ type: item.type, item })
                     }}
                     sx={{ opacity: 0, position: 'absolute', top: 3, right: 3, p: 0.15, color: '#EF4444',
                       transition: 'opacity 0.15s', '&:hover': { bgcolor: '#FEE2E2' } }}>
@@ -1136,14 +1278,30 @@ export default function ChatPage() {
                   )}
 
                   {msg.suggestions && (
-                    <Box sx={{ mt: 1 }}>
-                      <Typography sx={{ fontSize: '0.62rem', color: '#9CA3AF', mb: 0.5 }}>Try asking:</Typography>
-                      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.4 }}>
+                    <Box sx={{ mt: 1.25 }}>
+                      <Typography sx={{ fontSize: '0.6rem', color: '#9CA3AF', mb: 0.6, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                        Follow-up suggestions
+                      </Typography>
+                      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
                         {msg.suggestions.map(s => (
-                          <Box key={s} onClick={() => !isTyping && !sendingRef.current && handleSend(s)}
-                            sx={{ fontSize: '0.7rem', color: '#3B82F6', cursor: isTyping ? 'default' : 'pointer', p: '4px 8px', borderRadius: '4px', bgcolor: '#EFF6FF', opacity: isTyping ? 0.5 : 1, '&:hover': { bgcolor: isTyping ? '#EFF6FF' : '#DBEAFE' } }}>
-                            {s}
-                          </Box>
+                          <Chip
+                            key={s}
+                            label={s}
+                            size="small"
+                            onClick={() => !isTyping && !sendingRef.current && handleSend(s)}
+                            disabled={isTyping}
+                            sx={{
+                              fontSize: '0.65rem',
+                              height: 24,
+                              cursor: isTyping ? 'default' : 'pointer',
+                              bgcolor: '#F0F9FF',
+                              color: '#0369A1',
+                              border: '1px solid #BAE6FD',
+                              fontWeight: 500,
+                              '&:hover': { bgcolor: '#0369A1', color: 'white', borderColor: '#0369A1' },
+                              '& .MuiChip-label': { px: 1 },
+                            }}
+                          />
                         ))}
                       </Box>
                     </Box>
@@ -1368,15 +1526,75 @@ export default function ChatPage() {
         </Box>
 
         {!currentBOM ? (
-          <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', p: 2, textAlign: 'center' }}>
-            <AutoAwesome sx={{ fontSize: 32, color: '#E5E7EB', mb: 1 }} />
-            <Typography sx={{ fontSize: '0.75rem', color: '#9CA3AF', lineHeight: 1.5 }}>
-              Your BOM will appear here as you build it in the chat
-            </Typography>
-            <Typography sx={{ fontSize: '0.65rem', color: '#C4C9D0', mt: 0.5 }}>
-              Try: Create a Data Center BOM for Panasonic
-            </Typography>
-          </Box>
+          (() => {
+            const answeredCount = INTAKE_STEPS.filter(s => intakeFields[s.key]).length
+            const pct = Math.round((answeredCount / INTAKE_STEPS.length) * 100)
+            const hasProgress = answeredCount > 0 || phaseProgress > 0
+            const displayPct = phaseProgress > 0 ? phaseProgress : pct
+            return hasProgress ? (
+              // Intake progress tracker — shown while gathering fields
+              <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', p: 1.5, overflow: 'hidden' }}>
+                <Box sx={{ mb: 1.5 }}>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
+                    <Typography sx={{ fontSize: '0.68rem', fontWeight: 700, color: '#1F2937' }}>Intake Progress</Typography>
+                    <Typography sx={{ fontSize: '0.68rem', fontWeight: 700, color: '#D04A02' }}>{displayPct}%</Typography>
+                  </Box>
+                  <LinearProgress variant="determinate" value={displayPct}
+                    sx={{ height: 6, borderRadius: 3, bgcolor: '#FEF3C7',
+                      '& .MuiLinearProgress-bar': { bgcolor: displayPct === 100 ? '#10B981' : '#D04A02', borderRadius: 3 } }} />
+                  <Typography sx={{ fontSize: '0.6rem', color: '#9CA3AF', mt: 0.5 }}>
+                    {answeredCount}/{INTAKE_STEPS.length} qualification fields collected
+                  </Typography>
+                </Box>
+                <Box sx={{ flex: 1, overflowY: 'auto' }}>
+                  {INTAKE_STEPS.map(step => {
+                    const done = !!intakeFields[step.key]
+                    return (
+                      <Box key={step.key} sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.6, borderBottom: '1px solid #F9FAFB' }}>
+                        <Box sx={{ width: 16, height: 16, borderRadius: '50%', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          bgcolor: done ? '#D1FAE5' : '#F3F4F6' }}>
+                          <Typography sx={{ fontSize: '0.6rem', color: done ? '#10B981' : '#9CA3AF', fontWeight: 700, lineHeight: 1 }}>
+                            {done ? '✓' : '·'}
+                          </Typography>
+                        </Box>
+                        <Typography sx={{ fontSize: '0.68rem', color: done ? '#065F46' : '#6B7280', fontWeight: done ? 600 : 400, lineHeight: 1.3 }}>
+                          {step.label}
+                        </Typography>
+                      </Box>
+                    )
+                  })}
+                </Box>
+                <Box sx={{ mt: 1, display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+                  {phaseProgress >= 85 && (
+                    <Button fullWidth size="small" variant="contained"
+                      onClick={() => { if (!sendingRef.current) handleSend('generate') }}
+                      disabled={isTyping}
+                      sx={{ textTransform: 'none', fontSize: '0.68rem', fontWeight: 700, bgcolor: '#D04A02', '&:hover': { bgcolor: '#A33A00' }, py: 0.6, borderRadius: '8px' }}>
+                      ⚡ Generate BOM Now
+                    </Button>
+                  )}
+                  <Box sx={{ p: 1, bgcolor: '#FDF3ED', borderRadius: '8px', border: '1px dashed #FBBF9F' }}>
+                    <Typography sx={{ fontSize: '0.62rem', color: '#92400E', textAlign: 'center', lineHeight: 1.5 }}>
+                      {phaseProgress >= 85
+                        ? 'Intake complete — type "confirmed" or click Generate'
+                        : 'BOM will appear here once all qualification questions are answered'}
+                    </Typography>
+                  </Box>
+                </Box>
+              </Box>
+            ) : (
+              // Empty state (no session active)
+              <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', p: 2, textAlign: 'center' }}>
+                <AutoAwesome sx={{ fontSize: 32, color: '#E5E7EB', mb: 1 }} />
+                <Typography sx={{ fontSize: '0.75rem', color: '#9CA3AF', lineHeight: 1.5 }}>
+                  Your BOM will appear here as you build it in the chat
+                </Typography>
+                <Typography sx={{ fontSize: '0.65rem', color: '#C4C9D0', mt: 0.5 }}>
+                  Try: Create a Data Center BOM for Panasonic
+                </Typography>
+              </Box>
+            )
+          })()
         ) : (
           <>
             <Box sx={{ px: 1.5, pt: 1.25, pb: 0.75, borderBottom: '1px solid #F9FAFB' }}>
@@ -1441,6 +1659,93 @@ export default function ChatPage() {
           </>
         )}
       </Box>
+
+      {/* ── Delete Confirmation Dialog ───────────────────────────────────── */}
+      <Dialog open={!!confirmDeleteEntry} onClose={() => setConfirmDeleteEntry(null)} maxWidth="xs" fullWidth
+        PaperProps={{ sx: { borderRadius: '12px' } }}>
+        <DialogTitle sx={{ pb: 0.5, display: 'flex', alignItems: 'center', gap: 1 }}>
+          <DeleteOutline sx={{ color: '#EF4444', fontSize: 20 }} />
+          <Typography sx={{ fontWeight: 700, fontSize: '0.95rem' }}>
+            {confirmDeleteEntry?.type === 'chat' ? 'Delete Chat Session' : 'Delete BOM'}
+          </Typography>
+        </DialogTitle>
+        <DialogContent sx={{ pt: 1 }}>
+          <Typography sx={{ fontSize: '0.82rem', color: '#374151' }}>
+            {confirmDeleteEntry?.type === 'chat'
+              ? <span>Remove <strong>{confirmDeleteEntry.item.label}</strong> from chat history?</span>
+              : <span>Permanently delete <strong>{confirmDeleteEntry?.item.label}</strong>? This will also remove it from the BOM Library.</span>
+            }
+          </Typography>
+          <Typography sx={{ fontSize: '0.74rem', color: '#6B7280', mt: 0.75 }}>
+            This action cannot be undone.
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={{ px: 2, pb: 1.5 }}>
+          <Button size="small" onClick={() => setConfirmDeleteEntry(null)}
+            sx={{ textTransform: 'none', fontSize: '0.72rem' }}>Cancel</Button>
+          <Button size="small" variant="contained"
+            onClick={() => {
+              const { type, item } = confirmDeleteEntry
+              if (type === 'chat') {
+                addHidden(item.raw.session_id)
+                setChatHistory(prev => prev.filter(s => s.session_id !== item.raw.session_id))
+              } else {
+                dispatch(deleteBOM(item.raw.id))
+                bomApi.delete?.(item.raw.id)
+              }
+              setConfirmDeleteEntry(null)
+            }}
+            sx={{ bgcolor: '#EF4444', '&:hover': { bgcolor: '#DC2626' }, textTransform: 'none', fontSize: '0.72rem' }}>
+            Delete
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* ── Domain Picker Dialog ─────────────────────────────────────────── */}
+      <Dialog open={domainPickerOpen} onClose={() => setDomainPickerOpen(false)}
+        maxWidth="sm" fullWidth
+        PaperProps={{ sx: { borderRadius: '14px', p: 0.5 } }}>
+        <DialogTitle sx={{ pb: 0.5, display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+          <Box>
+            <Typography sx={{ fontSize: '0.9rem', fontWeight: 700, color: '#1F2937', lineHeight: 1.2 }}>
+              Select BOM Domain
+            </Typography>
+            <Typography sx={{ fontSize: '0.68rem', color: '#6B7280', fontWeight: 400, mt: 0.25, lineHeight: 1.4 }}>
+              Choose a category — the matching skill file will be loaded and domain-specific questions asked.
+            </Typography>
+          </Box>
+          <IconButton size="small" onClick={() => setDomainPickerOpen(false)}
+            sx={{ color: '#9CA3AF', mt: -0.5, mr: -0.5 }}>
+            <Close sx={{ fontSize: 16 }} />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent sx={{ pt: 1, pb: 2 }}>
+          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1 }}>
+            {BOM_DOMAINS.map(domain => (
+              <Box key={domain.key}
+                onClick={() => handleDomainSelect(domain.key)}
+                sx={{
+                  p: 1.5, borderRadius: '10px',
+                  border: '1.5px solid #E5E7EB', cursor: 'pointer',
+                  transition: 'all 0.15s ease',
+                  '&:hover': {
+                    borderColor: '#D04A02', bgcolor: '#FDF3ED',
+                    transform: 'translateY(-2px)',
+                    boxShadow: '0 4px 12px rgba(208,74,2,0.14)',
+                  },
+                }}>
+                <Box sx={{ fontSize: '1.5rem', mb: 0.75, lineHeight: 1 }}>{domain.icon}</Box>
+                <Typography sx={{ fontSize: '0.73rem', fontWeight: 700, color: '#1F2937', lineHeight: 1.25 }}>
+                  {domain.label}
+                </Typography>
+                <Typography sx={{ fontSize: '0.62rem', color: '#6B7280', mt: 0.3, lineHeight: 1.4 }}>
+                  {domain.desc}
+                </Typography>
+              </Box>
+            ))}
+          </Box>
+        </DialogContent>
+      </Dialog>
 
       {/* Toast notifications */}
       <Snackbar open={toast.open} autoHideDuration={4000}

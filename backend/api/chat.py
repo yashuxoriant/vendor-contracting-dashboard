@@ -277,6 +277,8 @@ class ChatMessageResponse(BaseModel):
     partial_bom: Optional[Dict[str, Any]] = None
     progress: int
     complete: bool
+    suggestions: List[str] = []          # 3 contextual follow-up questions
+    session_title: Optional[str] = None  # Auto-generated title from first exchange
 
 class SessionStatusResponse(BaseModel):
     session_id: str
@@ -413,12 +415,22 @@ async def send_message(request: ChatMessageRequest):
     except Exception:
         pass
 
+    # Generate contextual follow-up suggestions (best-effort)
+    suggestions = _generate_suggestions(
+        response_text, session.context.category, partial_bom, complete
+    )
+
+    # Auto-generate session title from first user message
+    session_title = _session_title(session)
+
     return ChatMessageResponse(
         session_id=request.session_id,
         response=response_text,
         partial_bom=partial_bom,
         progress=progress,
         complete=complete,
+        suggestions=suggestions,
+        session_title=session_title,
     )
 
 
@@ -569,12 +581,17 @@ async def send_message_with_attachment(
     cosmos_client.update_session(session_id, session.model_dump(mode="json"))
     _archive_session_to_adls(session, user_id)
 
+    suggestions = _generate_suggestions(response_text, session.context.category, partial_bom, complete)
+    session_title = _session_title(session)
+
     resp = ChatMessageResponse(
         session_id=session_id,
         response=response_text,
         partial_bom=partial_bom,
         progress=progress,
         complete=complete,
+        suggestions=suggestions,
+        session_title=session_title,
     )
     # Attach the upload metadata as an extra field (Pydantic ignores it on the
     # response model but FastAPI returns it in the JSON)
@@ -601,6 +618,35 @@ async def get_session_status(session_id: str):
     )
 
 
+@router.get("/session/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    """Return full conversation messages for Claude-like history loading.
+
+    Tries ADLS transcript first (full fidelity), falls back to Cosmos.
+    Returns list of {role, content, ts} objects.
+    """
+    cosmos_client = get_cosmos_client()
+    session_data = cosmos_client.get_session(session_id)
+    if not session_data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    session = ChatSession(**session_data)
+    ctx = session.context
+    messages = []
+    for msg in session.conversation:
+        messages.append({
+            "role": msg.role,
+            "content": msg.content,
+        })
+    return {
+        "session_id": session_id,
+        "category": ctx.category,
+        "project": ctx.project_name,
+        "status": session.status,
+        "progress": int(ctx.progress_percentage),
+        "messages": messages,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Chat History  (Cosmos index + ADLS full-transcript archive)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -615,6 +661,8 @@ class SessionSummary(BaseModel):
     category: Optional[str] = None
     project: Optional[str] = None
     progress: int = 0
+    title: Optional[str] = None        # Auto-generated from first user message
+    last_message: Optional[str] = None  # Preview of last assistant message
 
 
 @router.get("/history", response_model=List[SessionSummary])
@@ -629,6 +677,19 @@ async def list_chat_history(user_id: str = "demo_user", limit: int = 30):
     result = []
     for s in sessions:
         ctx = s.get("context") or {}
+        # Derive title + last_message preview from conversation if stored
+        conversation = s.get("conversation") or []
+        title: Optional[str] = None
+        last_message: Optional[str] = None
+        for msg in conversation:
+            if not title and msg.get("role") == "user":
+                raw = (msg.get("content") or "").strip()
+                title = raw[:60].rstrip(",. ") + ("\u2026" if len(raw) > 60 else "")
+        for msg in reversed(conversation):
+            if msg.get("role") == "assistant":
+                raw = (msg.get("content") or "").strip()
+                last_message = raw[:80].rstrip(",. ") + ("\u2026" if len(raw) > 80 else "")
+                break
         result.append(SessionSummary(
             session_id=s.get("session_id") or s.get("_id") or "",
             user_id=s.get("user_id"),
@@ -639,6 +700,8 @@ async def list_chat_history(user_id: str = "demo_user", limit: int = 30):
             category=ctx.get("category"),
             project=ctx.get("project_name"),
             progress=int(ctx.get("progress_percentage", 0)),
+            title=title,
+            last_message=last_message,
         ))
     return result
 
@@ -711,6 +774,76 @@ def _archive_session_to_adls(session: ChatSession, user_id: str):
         logger.info("Archived session %s to ADLS at %s", session.session_id, path)
     except Exception as exc:
         logger.warning("ADLS archive failed (non-fatal): %s", exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Follow-up Suggestions & Session Title Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _generate_suggestions(
+    response_text: str,
+    category: str,
+    partial_bom: Optional[Dict[str, Any]],
+    complete: bool,
+) -> List[str]:
+    """Return 3 contextual follow-up question strings for the user.
+
+    We use deterministic logic keyed on category/completion state — no extra AI
+    call needed, keeping latency and token cost low.
+    """
+    cat = (category or "").lower()
+
+    if complete and partial_bom:
+        items = partial_bom.get("line_items", [])
+        count = len(items)
+        return [
+            f"Analyze cost-saving opportunities across these {count} items",
+            "Export this BOM as CSV and generate an RFQ",
+            "What are the EOL risks in this BOM?",
+        ]
+
+    if "data center" in cat or "colo" in cat:
+        return [
+            "What power and cooling capacity do I need?",
+            "Add redundant networking components",
+            "Show me the rack unit (U) breakdown",
+        ]
+    if "sd-wan" in cat:
+        return [
+            "How many sites require dual WAN?",
+            "Compare Cisco vs Fortinet pricing for this deployment",
+            "Add LTE failover for remote sites",
+        ]
+    if "cybersecurity" in cat or "security" in cat:
+        return [
+            "What compliance frameworks does this cover (PCI, HIPAA, SOC 2)?",
+            "Add endpoint detection and response (EDR) tooling",
+            "Estimate the annual licensing cost",
+        ]
+    if "eol" in cat:
+        return [
+            "Show me the EOL timeline for each flagged SKU",
+            "Suggest modern replacements from the catalog",
+            "Generate a refresh plan with cost impact",
+        ]
+    # Generic BOM follow-ups
+    return [
+        "Add more items to this BOM",
+        "Analyze cost breakdown by category",
+        "Export as RFQ and send for approval",
+    ]
+
+
+def _session_title(session: "ChatSession") -> Optional[str]:
+    """Derive a human-readable title from the first user message."""
+    for msg in session.conversation:
+        if msg.role == "user":
+            raw = msg.content.strip()
+            title = raw[:60].rstrip(",. ")
+            if len(raw) > 60:
+                title += "…"
+            return title
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

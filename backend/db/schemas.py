@@ -105,8 +105,11 @@ class BOMTotals(BaseModel):
     bundled: float = 0.0
     subtotal: float = 0.0
     total_otc: float = 0.0
-    total_run_costs_annual: float = 0.0
+    arc_annual: float = 0.0           # Annual Recurring Cost
+    mrc_monthly: float = 0.0          # Monthly Recurring Cost
+    total_run_costs_annual: float = 0.0  # backwards compat — mirrors arc_annual
     tco_3year: float = 0.0
+    tco_5year: float = 0.0
 
 
 class BOMVersion(BaseModel):
@@ -178,6 +181,8 @@ class SessionContext(BaseModel):
     partial_bom: Optional[Dict[str, Any]] = None
     # Sprint 3 — BOM embedding pipeline
     bom_id: Optional[str] = None        # Scopes vector search to a specific indexed BOM
+    domain_preselected: bool = False    # True when user chose domain from the picker UI
+    agent_state: Dict[str, Any] = {}   # BOM extraction decision fields (Steps 1-8)
 
 
 class ChatSession(BaseModel):

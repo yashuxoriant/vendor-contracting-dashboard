@@ -12,7 +12,7 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
-# ── Natural-language ask ──────────────────────────────────────────────────────
+# ── Natural-language ask ─────────────────────────────────────────────
 
 class AskRequest(BaseModel):
     question: str
@@ -385,6 +385,7 @@ async def get_vendor_performance():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
 @router.post("/ask", response_model=AskResponse)
 async def ask_analytics(body: AskRequest):
     """
@@ -404,66 +405,3 @@ async def ask_analytics(body: AskRequest):
     except Exception as exc:
         logger.error("Analytics ask failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Analytics query failed: {exc}")
-
-
-@router.get("/patterns", response_model=PatternsResponse)
-async def get_patterns():
-    """
-    Get common patterns and bundles
-    TODO: Query real patterns from Cosmos DB
-    """
-    try:
-        # Dummy data
-        patterns = [
-            PatternData(
-                pattern_id="pat_001",
-                description="Cisco Nexus HA Pair",
-                frequency=23,
-                avg_cost=85000
-            ),
-            PatternData(
-                pattern_id="pat_002",
-                description="VMware + Veeam Bundle",
-                frequency=19,
-                avg_cost=125000
-            ),
-            PatternData(
-                pattern_id="pat_003",
-                description="Dell Server Cluster",
-                frequency=15,
-                avg_cost=95000
-            ),
-        ]
-        
-        return PatternsResponse(patterns=patterns)
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get patterns: {str(e)}"
-        )
-
-
-@router.get("/trends", response_model=TrendsResponse)
-async def get_trends():
-    """
-    Get spending trends over time
-    TODO: Query real data from Cosmos DB
-    """
-    try:
-        # Generate dummy 6-month trend
-        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]
-        spending = [420000, 380000, 450000, 520000, 480000, 550000]
-        
-        data = [
-            TrendDataPoint(month=month, spending=spend)
-            for month, spend in zip(months, spending)
-        ]
-        
-        return TrendsResponse(data=data)
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get trends: {str(e)}"
-        )

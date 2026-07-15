@@ -235,6 +235,13 @@ class MockCosmosDBClient:
         """Update BOM in mock storage"""
         return self.update_item("boms", bom_id, bom_data)
 
+    def delete_bom(self, bom_id: str) -> bool:
+        """Delete BOM from mock storage. Returns True if it existed."""
+        if bom_id in self.collections["boms"]:
+            del self.collections["boms"][bom_id]
+            return True
+        return False
+
     def list_boms(self, filters: Optional[dict] = None, limit: int = 100) -> List[dict]:
         """List BOMs from mock storage with optional dict filters"""
         items = list(self.collections["boms"].values())
