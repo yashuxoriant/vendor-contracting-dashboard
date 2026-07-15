@@ -1,0 +1,36 @@
+# Node
+frontend/node_modules
+frontend/.vite
+frontend/dist
+
+# Python
+backend/__pycache__
+backend/**/__pycache__
+backend/*.pyc
+backend/.pytest_cache
+backend/.venv
+backend/venv
+
+# Dev / IDE
+.git
+.gitignore
+.env
+*.env
+.vscode
+.idea
+
+# Logs & test output
+*.log
+coverage/
+.coverage
+
+# Docs
+*.md
+MASTER_PLAN.md
+IMPLEMENTATION_PLAN.md
+
+# Data files not needed in image
+quotes/
+*.json
+catalog_data.json
+*_analysis.json

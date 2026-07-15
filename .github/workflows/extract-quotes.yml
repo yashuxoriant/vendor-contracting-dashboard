@@ -1,0 +1,77 @@
+name: Extract & Validate Quotes
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Extraction mode'
+        required: true
+        default: 'hybrid'
+        type: choice
+        options:
+          - 'hybrid'   # Process B: parse → chunk → validate
+          - 'ai_only'  # Process A: LLM does everything
+  push:
+    paths:
+      - 'quotes/**'
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.G_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          cd extractor
+          pip install -r requirements.txt
+          # Web-scraping libs for benchmark prices
+          pip install beautifulsoup4 requests lxml duckduckgo-search
+
+      - name: Debug — show repo structure
+        run: |
+          echo "=== Working directory ==="
+          pwd
+          echo "=== Repo root ==="
+          ls -la
+          echo "=== quotes/ contents ==="
+          ls -la quotes/ || echo "❌ quotes/ not found at root"
+          echo "=== quotes/panasonic/ contents ==="
+          ls -la quotes/panasonic/ || echo "❌ quotes/panasonic/ not found"
+          echo "=== File count ==="
+          find quotes -type f 2>/dev/null | wc -l || echo "0"
+
+      - name: Run extraction pipeline
+        working-directory: ./extractor
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLAMA_API_KEY: ${{ secrets.LLAMA_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          G_TOKEN: ${{ secrets.G_TOKEN }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          SHAREPOINT_SITE_URL: ${{ secrets.SHAREPOINT_SITE_URL }}
+          EXTRACTION_MODE: ${{ inputs.mode || 'hybrid' }}
+          QUOTES_DIR: ../quotes
+        run: python main.py
+
+      - name: Commit catalog_data.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add catalog_data.json
+          git diff --cached --quiet || git commit -m "🤖 Auto-update catalog [${{ inputs.mode || 'hybrid' }}]"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.G_TOKEN }}
