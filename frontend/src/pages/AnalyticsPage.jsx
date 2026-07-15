@@ -1,13 +1,13 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useSelector } from 'react-redux'
 import { useNavigate } from 'react-router-dom'
 import {
   Box, Typography, Grid, Paper, Chip, Button, Table, TableBody, TableCell,
   TableContainer, TableHead, TableRow, Skeleton, IconButton, Tooltip,
-  LinearProgress, Select, MenuItem, FormControl, InputLabel,
+  LinearProgress, Select, MenuItem, FormControl, InputLabel, TextField, CircularProgress,
 } from '@mui/material'
 import {
-  Refresh, TrendingUp, TrendingDown, Analytics as AnalyticsIcon,
+  Refresh, TrendingUp, TrendingDown, Analytics as AnalyticsIcon, AutoAwesome, Send,
 } from '@mui/icons-material'
 import { Bar, Line, Doughnut } from 'react-chartjs-2'
 import {
@@ -62,6 +62,19 @@ export default function AnalyticsPage() {
   const [vendors, setVendors] = useState(null)
   const [trends, setTrends] = useState(null)
 
+  // AI Ask panel
+  const [nlQuery, setNlQuery] = useState('')
+  const [nlAnswer, setNlAnswer] = useState(null)
+  const [nlLoading, setNlLoading] = useState(false)
+  const [nlSuggestions, setNlSuggestions] = useState([
+    'Which vendor has the highest total spend?',
+    'How many BOMs are pending approval?',
+    'Which category has the most EOL risks?',
+    'Show me spend trends over the last 6 months.',
+    'What is the average BOM cycle time?',
+  ])
+  const nlInputRef = useRef(null)
+
   const load = async () => {
     setLoading(true)
     const results = await Promise.allSettled([
@@ -81,6 +94,21 @@ export default function AnalyticsPage() {
   }
 
   useEffect(() => { load() }, [period])
+
+  const handleNlAsk = async () => {
+    if (!nlQuery.trim() || nlLoading) return
+    setNlLoading(true)
+    setNlAnswer(null)
+    try {
+      const result = await analyticsApi.ask(nlQuery.trim())
+      setNlAnswer(result)
+      if (result.suggested_questions?.length) setNlSuggestions(result.suggested_questions)
+    } catch {
+      setNlAnswer({ answer: 'Sorry, the AI analysis service is unavailable right now. Try again in a moment.', suggested_questions: [] })
+    } finally {
+      setNlLoading(false)
+    }
+  }
 
   const activeKpi = kpi || FALLBACK_KPI
   const activeVendors = vendors || FALLBACK_VENDORS
@@ -343,6 +371,84 @@ export default function AnalyticsPage() {
               )
             })}
           </Grid>
+        </Paper>
+
+        {/* AI Spend Intelligence Panel */}
+        <Paper sx={{ p: 1.75, mb: 1.5, border: '1px solid #FFE5D0', background: 'linear-gradient(135deg, #FFFBF7 0%, #FFF5EE 100%)' }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.25 }}>
+            <AutoAwesome sx={{ fontSize: 16, color: '#D04A02' }} />
+            <Box sx={{ fontWeight: 700, fontSize: '0.82rem', color: '#1F2937' }}>Ask AI — Spend Intelligence</Box>
+            <Box sx={{ fontSize: '0.62rem', color: '#9CA3AF', ml: 'auto' }}>Powered by Claude · grounded in live BOM data</Box>
+          </Box>
+
+          {/* Suggested questions */}
+          {!nlAnswer && (
+            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mb: 1.25 }}>
+              {nlSuggestions.map((q) => (
+                <Chip
+                  key={q}
+                  label={q}
+                  size="small"
+                  onClick={() => { setNlQuery(q); setTimeout(() => nlInputRef.current?.focus(), 50) }}
+                  sx={{ fontSize: '0.62rem', bgcolor: '#FFF', border: '1px solid #FFD6BB', color: '#92400E', cursor: 'pointer', '&:hover': { bgcolor: '#FFF5EE' } }}
+                />
+              ))}
+            </Box>
+          )}
+
+          {/* Input row */}
+          <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-end' }}>
+            <TextField
+              inputRef={nlInputRef}
+              fullWidth
+              size="small"
+              placeholder="Ask anything about your BOM spend, vendors, cycle times…"
+              value={nlQuery}
+              onChange={e => setNlQuery(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && nlQuery.trim() && !nlLoading) { e.preventDefault(); handleNlAsk() } }}
+              variant="outlined"
+              sx={{ bgcolor: '#FFF', '& .MuiInputBase-input': { fontSize: '0.75rem' } }}
+              disabled={nlLoading}
+            />
+            <Button
+              variant="contained"
+              onClick={handleNlAsk}
+              disabled={!nlQuery.trim() || nlLoading}
+              startIcon={nlLoading ? <CircularProgress size={13} sx={{ color: '#fff' }} /> : <Send sx={{ fontSize: 14 }} />}
+              sx={{ bgcolor: '#D04A02', '&:hover': { bgcolor: '#B84000' }, fontSize: '0.72rem', whiteSpace: 'nowrap', minWidth: 90, height: 38 }}
+            >
+              {nlLoading ? 'Thinking…' : 'Ask AI'}
+            </Button>
+          </Box>
+
+          {/* Answer */}
+          {nlAnswer && (
+            <Box sx={{ mt: 1.5, p: 1.5, bgcolor: '#FFF', border: '1px solid #FFD6BB', borderRadius: 1.5 }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.75 }}>
+                <AutoAwesome sx={{ fontSize: 13, color: '#D04A02' }} />
+                <Box sx={{ fontSize: '0.62rem', fontWeight: 700, color: '#D04A02', textTransform: 'uppercase', letterSpacing: '0.6px' }}>AI Analysis</Box>
+              </Box>
+              <Box sx={{ fontSize: '0.75rem', color: '#1F2937', lineHeight: 1.65, whiteSpace: 'pre-line' }}>
+                {nlAnswer.answer}
+              </Box>
+              {nlAnswer.suggested_questions?.length > 0 && (
+                <Box sx={{ mt: 1.25 }}>
+                  <Box sx={{ fontSize: '0.6rem', color: '#9CA3AF', fontWeight: 700, textTransform: 'uppercase', mb: 0.5 }}>Follow-up questions</Box>
+                  <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                    {nlAnswer.suggested_questions.map(q => (
+                      <Chip
+                        key={q}
+                        label={q}
+                        size="small"
+                        onClick={() => { setNlQuery(q); setNlAnswer(null); setTimeout(() => nlInputRef.current?.focus(), 50) }}
+                        sx={{ fontSize: '0.6rem', bgcolor: '#FFF5EE', border: '1px solid #FFD6BB', color: '#92400E', cursor: 'pointer' }}
+                      />
+                    ))}
+                  </Box>
+                </Box>
+              )}
+            </Box>
+          )}
         </Paper>
 
       </Box>

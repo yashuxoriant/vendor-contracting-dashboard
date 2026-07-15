@@ -2,11 +2,24 @@
 Analytics API endpoints — Sprint 2
 All endpoints query real Cosmos DB data with fallback to seeded mock data.
 """
+import logging
+
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)
+
+# ── Natural-language ask ──────────────────────────────────────────────────────
+
+class AskRequest(BaseModel):
+    question: str
+
+class AskResponse(BaseModel):
+    answer: str
+    suggested_questions: List[str]
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
@@ -367,14 +380,30 @@ async def get_vendor_performance():
                 avg_delivery_time_days=18
             ),
         ]
-        
         return VendorPerformanceResponse(vendors=vendors)
-        
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get vendor performance: {str(e)}"
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/ask", response_model=AskResponse)
+async def ask_analytics(body: AskRequest):
+    """
+    Natural language spend analysis.
+    POST /api/analytics/ask  { "question": "..." }
+    Returns AI-generated answer grounded in live Cosmos BOM data.
+    """
+    if not body.question or not body.question.strip():
+        raise HTTPException(status_code=400, detail="question is required")
+    try:
+        from ai.agents.analytics_agent import AnalyticsAgent
+        result = AnalyticsAgent().ask(body.question.strip())
+        return AskResponse(
+            answer=result["answer"],
+            suggested_questions=result.get("suggested_questions", []),
         )
+    except Exception as exc:
+        logger.error("Analytics ask failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Analytics query failed: {exc}")
 
 
 @router.get("/patterns", response_model=PatternsResponse)

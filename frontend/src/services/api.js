@@ -110,6 +110,7 @@ export const analyticsApi = {
   vendors: () => apiClient.get('/api/analytics/vendors').then(r => r.data),
   patterns: () => apiClient.get('/api/analytics/patterns').then(r => r.data),
   trends: () => apiClient.get('/api/analytics/trends').then(r => r.data),
+  ask: (question) => apiClient.post('/api/analytics/ask', { question }).then(r => r.data),
 }
 
 // ── Audit API ─────────────────────────────────────────────────────────────
