@@ -1,0 +1,314 @@
+"""
+Azure Cognitive Search Service
+Manages the BOM embeddings index: creation, upsert, and semantic vector search.
+Falls back to an in-memory mock store when Azure Search credentials are absent
+(e.g. local development without Azure).
+
+Index schema mirrors ma-workstream-planner/ingest_backend/ingest.py but is
+scoped to BOMs:  bom_id, vendor, category, filename, chunk_text, chunk_index,
+                 embedding (3072-dim vector).
+"""
+import hashlib
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from services.embedding_service import EMBEDDING_DIM, embed_text
+
+logger = logging.getLogger(__name__)
+
+INDEX_NAME = "bom-embeddings"
+
+
+# ── Document model ─────────────────────────────────────────────────────────────
+
+@dataclass
+class BOMChunkDocument:
+    id: str                    # unique chunk ID (base64-url of bom_id+chunk_index)
+    bom_id: str
+    filename: str
+    vendor: str
+    category: str
+    chunk_index: int
+    chunk_text: str
+    embedding: List[float]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+# ── In-memory mock store (local dev / CI) ─────────────────────────────────────
+
+_mock_store: List[Dict[str, Any]] = []
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    return dot / (norm_a * norm_b + 1e-10)
+
+
+def _mock_upsert(docs: List[BOMChunkDocument]) -> int:
+    global _mock_store
+    ids = {d["id"] for d in _mock_store}
+    added = 0
+    for doc in docs:
+        entry = {
+            "id": doc.id,
+            "bom_id": doc.bom_id,
+            "filename": doc.filename,
+            "vendor": doc.vendor,
+            "category": doc.category,
+            "chunk_index": doc.chunk_index,
+            "chunk_text": doc.chunk_text,
+            "embedding": doc.embedding,
+            **doc.metadata,
+        }
+        if doc.id in ids:
+            _mock_store = [e if e["id"] != doc.id else entry for e in _mock_store]
+        else:
+            _mock_store.append(entry)
+            added += 1
+    return added
+
+
+def _mock_search(query_vector: List[float], top_k: int = 5, bom_id: Optional[str] = None) -> List[Dict]:
+    candidates = _mock_store
+    if bom_id:
+        candidates = [d for d in candidates if d["bom_id"] == bom_id]
+    scored = [
+        (d, _cosine_similarity(query_vector, d["embedding"]))
+        for d in candidates
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [
+        {**d, "score": round(s, 4)}
+        for d, s in scored[:top_k]
+        if s > 0.0
+    ]
+
+
+def _mock_delete_by_bom(bom_id: str) -> int:
+    global _mock_store
+    before = len(_mock_store)
+    _mock_store = [d for d in _mock_store if d["bom_id"] != bom_id]
+    return before - len(_mock_store)
+
+
+# ── Azure Search index management ─────────────────────────────────────────────
+
+def _chunk_doc_id(bom_id: str, chunk_index: int) -> str:
+    raw = f"{bom_id}::{chunk_index}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:40]
+
+
+def _get_search_clients():
+    """Return (SearchClient, SearchIndexClient) or (None, None) if unconfigured."""
+    try:
+        from config import get_settings
+        s = get_settings()
+        endpoint = s.azure_search_endpoint
+        key = s.azure_search_admin_key
+        if not endpoint or "dummy" in endpoint or not key or "dummy" in key:
+            return None, None
+
+        from azure.core.credentials import AzureKeyCredential
+        from azure.search.documents import SearchClient
+        from azure.search.documents.indexes import SearchIndexClient
+
+        cred = AzureKeyCredential(key)
+        idx_client = SearchIndexClient(endpoint=endpoint, credential=cred)
+        sc = SearchClient(endpoint=endpoint, index_name=INDEX_NAME, credential=cred)
+        return sc, idx_client
+    except Exception as exc:
+        logger.warning("SearchService: client init failed (%s) — using mock", exc)
+        return None, None
+
+
+def ensure_index() -> bool:
+    """
+    Create the Azure Search index if it doesn't exist.
+    Returns True if Azure Search is available, False if using mock.
+    """
+    _, idx_client = _get_search_clients()
+    if idx_client is None:
+        logger.info("SearchService: using in-memory mock index")
+        return False
+
+    try:
+        from azure.search.documents.indexes.models import (
+            HnswAlgorithmConfiguration,
+            SearchField,
+            SearchFieldDataType,
+            SearchIndex,
+            SearchableField,
+            SemanticConfiguration,
+            SemanticField,
+            SemanticPrioritizedFields,
+            SemanticSearch,
+            SimpleField,
+            VectorSearch,
+            VectorSearchProfile,
+        )
+
+        fields = [
+            SimpleField(name="id",          type=SearchFieldDataType.String, key=True),
+            SimpleField(name="bom_id",      type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="filename",    type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="vendor",      type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="category",    type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="chunk_index", type=SearchFieldDataType.Int32),
+            SearchableField(name="chunk_text", type=SearchFieldDataType.String),
+            SearchField(
+                name="embedding",
+                type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                searchable=True,
+                vector_search_dimensions=EMBEDDING_DIM,
+                vector_search_profile_name="hnsw-profile",
+            ),
+        ]
+
+        vector_search = VectorSearch(
+            algorithms=[HnswAlgorithmConfiguration(name="hnsw-algo")],
+            profiles=[VectorSearchProfile(name="hnsw-profile", algorithm_configuration_name="hnsw-algo")],
+        )
+
+        semantic_search = SemanticSearch(
+            configurations=[
+                SemanticConfiguration(
+                    name="bom-semantic",
+                    prioritized_fields=SemanticPrioritizedFields(
+                        content_fields=[SemanticField(field_name="chunk_text")]
+                    ),
+                )
+            ]
+        )
+
+        index = SearchIndex(
+            name=INDEX_NAME,
+            fields=fields,
+            vector_search=vector_search,
+            semantic_search=semantic_search,
+        )
+        idx_client.create_or_update_index(index)
+        logger.info("SearchService: Azure Search index '%s' ready", INDEX_NAME)
+        return True
+    except Exception as exc:
+        logger.error("ensure_index failed: %s", exc)
+        return False
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+def upsert_chunks(docs: List[BOMChunkDocument]) -> int:
+    """
+    Upload/merge BOM chunk documents into the search index.
+    Returns the number of documents upserted.
+    """
+    if not docs:
+        return 0
+
+    sc, _ = _get_search_clients()
+    if sc is None:
+        return _mock_upsert(docs)
+
+    try:
+        batch = [
+            {
+                "id":          doc.id,
+                "bom_id":      doc.bom_id,
+                "filename":    doc.filename,
+                "vendor":      doc.vendor,
+                "category":    doc.category,
+                "chunk_index": doc.chunk_index,
+                "chunk_text":  doc.chunk_text,
+                "embedding":   doc.embedding,
+                # NOTE: doc.metadata is NOT spread here — Azure Search index schema
+                # only contains the fields above; extra chunk metadata (e.g. "sheet")
+                # would cause a 400 from the service.
+            }
+            for doc in docs
+        ]
+        result = sc.merge_or_upload_documents(documents=batch)
+        succeeded = sum(1 for r in result if r.succeeded)
+        logger.info("SearchService: upserted %d/%d chunks", succeeded, len(docs))
+        return succeeded
+    except Exception as exc:
+        logger.error("upsert_chunks failed: %s", exc)
+        raise
+
+
+def search_bom_context(
+    query: str,
+    top_k: int = 5,
+    bom_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Semantic vector search over BOM chunks.
+    Returns a list of matching chunk dicts with a 'score' key.
+    Optionally scoped to a specific bom_id.
+    """
+    query_vec = embed_text(query)
+
+    sc, _ = _get_search_clients()
+    if sc is None:
+        return _mock_search(query_vec, top_k=top_k, bom_id=bom_id)
+
+    try:
+        from azure.search.documents.models import VectorizedQuery
+
+        vector_query = VectorizedQuery(
+            vector=query_vec,
+            k_nearest_neighbors=top_k,
+            fields="embedding",
+        )
+        filter_expr = f"bom_id eq '{bom_id}'" if bom_id else None
+
+        results = sc.search(
+            search_text=None,
+            vector_queries=[vector_query],
+            filter=filter_expr,
+            select=["id", "bom_id", "filename", "vendor", "category", "chunk_text", "chunk_index"],
+            top=top_k,
+        )
+        return [
+            {
+                "id":          r["id"],
+                "bom_id":      r["bom_id"],
+                "filename":    r["filename"],
+                "vendor":      r.get("vendor", ""),
+                "category":    r.get("category", ""),
+                "chunk_text":  r["chunk_text"],
+                "chunk_index": r.get("chunk_index", 0),
+                "score":       round(r.get("@search.score", 0.0), 4),
+            }
+            for r in results
+        ]
+    except Exception as exc:
+        logger.error("search_bom_context failed: %s", exc)
+        return []
+
+
+def delete_bom_chunks(bom_id: str) -> int:
+    """Remove all indexed chunks for a given BOM (e.g. on re-ingestion or deletion)."""
+    sc, _ = _get_search_clients()
+    if sc is None:
+        return _mock_delete_by_bom(bom_id)
+
+    try:
+        # Search for all chunks belonging to this bom_id
+        results = list(sc.search(
+            search_text="*",
+            filter=f"bom_id eq '{bom_id}'",
+            select=["id"],
+            top=1000,
+        ))
+        if not results:
+            return 0
+        keys = [{"id": r["id"]} for r in results]
+        sc.delete_documents(documents=keys)
+        logger.info("SearchService: deleted %d chunks for bom_id=%s", len(keys), bom_id)
+        return len(keys)
+    except Exception as exc:
+        logger.error("delete_bom_chunks failed: %s", exc)
+        return 0

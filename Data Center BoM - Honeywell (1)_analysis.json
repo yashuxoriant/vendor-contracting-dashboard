@@ -1,0 +1,79 @@
+{
+  "file": "Data Center BoM - Honeywell (1).xlsx",
+  "sheets": [
+    {
+      "name": "BoM Data Center",
+      "rows": 98,
+      "columns": [
+        "Product Code",
+        "Description",
+        "Term",
+        "Unit Price",
+        "Qty",
+        "OTC",
+        "Run Costs",
+        "Notes"
+      ],
+      "sample_data": [
+        {
+          "Product Code": "NETWORK EQUIPMENT AND MAINTENANCE",
+          "Description": "nan",
+          "Term": "nan",
+          "Unit Price": "nan",
+          "Qty": "nan",
+          "OTC": "nan",
+          "Run Costs": "nan",
+          "Notes": "nan"
+        },
+        {
+          "Product Code": "nan",
+          "Description": "\u00b7\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0 (4) AC Power Supply - 1400W for Server (200-240 VAC)",
+          "Term": "nan",
+          "Unit Price": "nan",
+          "Qty": "nan",
+          "OTC": "nan",
+          "Run Costs": "nan",
+          "Notes": "nan"
+        },
+        {
+          "Product Code": "nan",
+          "Description": "GRAND TOTAL",
+          "Term": "nan",
+          "Unit Price": "nan",
+          "Qty": "nan",
+          "OTC": "1228648.6099999999",
+          "Run Costs": "587321.6799999999",
+          "Notes": "nan"
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "Product Code",
+          "Description"
+        ],
+        "quantity": [
+          "Qty"
+        ],
+        "price": [
+          "Unit Price",
+          "Run Costs"
+        ]
+      }
+    },
+    {
+      "name": "Cabling Diagram",
+      "rows": 0,
+      "columns": [],
+      "sample_data": [],
+      "detected_fields": {}
+    },
+    {
+      "name": "Rack Diagram",
+      "rows": 0,
+      "columns": [],
+      "sample_data": [],
+      "detected_fields": {}
+    }
+  ],
+  "patterns": {}
+}
