@@ -451,6 +451,122 @@ _ATTACH_ALLOWED_TYPES = {
 _ATTACH_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SSE Streaming Chat  POST /api/bom/stream
+# ─────────────────────────────────────────────────────────────────────────────
+
+import asyncio as _asyncio
+import json as _j
+import re as _r
+from fastapi.responses import StreamingResponse
+
+
+@router.post("/stream")
+async def stream_message(request: ChatMessageRequest):
+    """
+    Server-Sent Events streaming chat endpoint.
+    Streams tokens as they arrive from the AI instead of waiting for the full
+    response. Falls back to the blocking /chat response when streaming is
+    unavailable (provider is not Anthropic).
+
+    SSE frame format:
+        data: {"token": "<text>", "done": false}   (per chunk)
+        data: {"token": "", "done": true, "complete": bool, "progress": int, "bom": <obj|null>}
+    """
+    cosmos_client = get_cosmos_client()
+    session_data = cosmos_client.get_session(request.session_id)
+    if not session_data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    session = ChatSession(**session_data)
+
+    session.conversation.append(ChatMessage(role="user", content=request.message))
+
+    # Build messages list for AI
+    from ai.prompts.system_base import get_system_prompt as _get_sys
+    try:
+        system_prompt = _get_sys(session.context.category or "Data Center / COLO")
+    except Exception:
+        system_prompt = BOM_SYSTEM_PROMPT
+
+    messages = [{"role": m.role if m.role != "ai" else "assistant", "content": m.content}
+                for m in session.conversation]
+
+    async def event_stream():
+        from ai.client import stream_ai, call_ai
+        import json as _j_
+        full_text = ""
+        had_content = False
+        gen = stream_ai(messages, system_prompt)
+
+        if gen is not None:
+            # Stream tokens chunk by chunk
+            for chunk in gen:
+                if chunk == "__STREAM_ERROR__":
+                    break
+                had_content = True
+                full_text += chunk
+                yield "data: " + _j_.dumps({"token": chunk, "done": False}) + "\n\n"
+        
+        # Fallback: non-streaming call
+        if not had_content:
+            try:
+                result = call_ai(messages, system_prompt)
+                if result:
+                    full_text = result
+                    yield "data: " + _j_.dumps({"token": result, "done": False}) + "\n\n"
+            except Exception:
+                # Ultimate fallback — rule based
+                from ai.agents.orchestrator import BOMOrchestrator
+                orch = BOMOrchestrator()
+                user_turns = sum(1 for m in session.conversation if m.role == "user")
+                full_text = orch._rule_based(
+                    session.context.category or "Data Center / COLO",
+                    session.context.current_phase or 1,
+                    request.message, user_turns,
+                )
+                yield "data: " + _j_.dumps({"token": full_text, "done": False}) + "\n\n"
+
+        # Detect BOM completion
+        bom_data = None
+        complete = False
+        match = _r.search(r"```json\s*([\s\S]*?)```", full_text)
+        if match:
+            try:
+                parsed = _j_.loads(match.group(1).strip())
+                if "line_items" in parsed and parsed["line_items"]:
+                    bom_data = parsed
+                    complete = True
+            except Exception:
+                pass
+
+        user_count = sum(1 for m in session.conversation if m.role == "user")
+        progress = 100 if complete else min(90, user_count * 12)
+
+        suggestions = _generate_suggestions(full_text, session.context.category, bom_data, complete)
+
+        yield "data: " + _j_.dumps({
+            "token": "", "done": True,
+            "complete": complete, "progress": progress,
+            "bom": bom_data,
+            "suggestions": suggestions,
+        }) + "\n\n"
+
+        # Persist to Cosmos
+        session.conversation.append(ChatMessage(role="assistant", content=full_text))
+        session.context.progress_percentage = float(progress)
+        session.updated_at = datetime.utcnow()
+        if complete:
+            session.status = "completed"
+        cosmos_client.update_session(request.session_id, session.model_dump(mode="json"))
+        _archive_session_to_adls(session, request.user_id or "demo_user")
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.post("/chat-with-attachment", response_model=ChatMessageResponse)
 async def send_message_with_attachment(
     background_tasks: BackgroundTasks,

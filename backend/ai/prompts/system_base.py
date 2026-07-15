@@ -256,3 +256,41 @@ CATEGORY_ADDENDA = {
         "Always include 3-year warranty + accidental damage protection per unit."
     ),
 }
+
+
+import os as _os
+import pathlib as _pathlib
+
+# Map category names → skill file names in backend/ai/skills/
+_SKILL_MAP: dict = {
+    "Network & Telecom": "Skill_Network_Telecom.md",
+    "SD-WAN": "Skill_Network_Telecom.md",
+    "Network Equipment": "Skill_Network_Telecom.md",
+    "WAN/SD-WAN": "Skill_Network_Telecom.md",
+}
+
+_SKILLS_DIR = _pathlib.Path(__file__).parent.parent / "skills"
+
+
+def _load_skill(category: str) -> str:
+    """Return the Markdown content of the skill file for this category, or empty string."""
+    fname = _SKILL_MAP.get(category, "")
+    if not fname:
+        return ""
+    path = _SKILLS_DIR / fname
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def get_system_prompt(category: str = "") -> str:
+    """Return the full system prompt, optionally appending a category-specific hint or full skill file."""
+    skill_content = _load_skill(category)
+    if skill_content:
+        return SYSTEM_BASE + f"\n\n{'━'*64}\nSPECIALIST SKILL — {category.upper()}\n{'━'*64}\n{skill_content}"
+    hint = CATEGORY_HINTS.get(category, "")
+    if hint:
+        return SYSTEM_BASE + f"\n\nCATEGORY FOCUS — {category}:\n{hint}"
+    return SYSTEM_BASE
+

@@ -11,6 +11,7 @@ import {
   Warning, Download, Map,
 } from '@mui/icons-material'
 import { saveBOM } from '../store/slices/bomSlice'
+import { ingestApi } from '../services/api'
 
 const fmt = (v) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(v)
 const SL = { fontSize: '0.58rem', fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.7px' }
@@ -90,13 +91,18 @@ export default function QuoteExtractorPage() {
   const [fileName, setFileName] = useState(null)
   const [targetBOMId, setTargetBOMId] = useState(currentBOM?.id || '')
   const [mapped, setMapped] = useState(false)
+  const [ingestId, setIngestId] = useState(null)
 
   const handleFile = (file) => {
     if (!file) return
-    setUploadError(null); setExtractedItems(null); setMapped(false)
+    setUploadError(null); setExtractedItems(null); setMapped(false); setIngestId(null)
     const ext = file.name.split('.').pop().toLowerCase()
     if (!['csv', 'json'].includes(ext)) { setUploadError('Only .csv and .json files are supported.'); return }
     setFileName(file.name); setUploading(true)
+    // Kick off backend ingest pipeline in parallel (best-effort)
+    ingestApi.uploadBom(file, { project_name: currentBOM?.name, category: currentBOM?.category })
+      .then(r => { if (r?.bom_id) setIngestId(r.bom_id) })
+      .catch(() => {}) // ingest failure is non-blocking
     const reader = new FileReader()
     reader.onload = (e) => {
       setTimeout(() => {

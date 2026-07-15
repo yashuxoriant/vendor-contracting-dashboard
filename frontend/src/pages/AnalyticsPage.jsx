@@ -7,7 +7,7 @@ import {
   LinearProgress, Select, MenuItem, FormControl, InputLabel, TextField, CircularProgress,
 } from '@mui/material'
 import {
-  Refresh, TrendingUp, TrendingDown, Analytics as AnalyticsIcon, AutoAwesome, Send,
+  Refresh, TrendingUp, TrendingDown, Analytics as AnalyticsIcon, AutoAwesome, Send, Download,
 } from '@mui/icons-material'
 import { Bar, Line, Doughnut } from 'react-chartjs-2'
 import {
@@ -167,6 +167,19 @@ export default function AnalyticsPage() {
             <Tooltip title="Refresh data">
               <IconButton size="small" onClick={load} disabled={loading} sx={{ color: '#6B7280' }}>
                 <Refresh sx={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="Export to CSV">
+              <IconButton size="small" onClick={() => {
+                const rows = [['Vendor', 'Total Spend', 'BOM Count', 'Avg Delivery (days)'],
+                  ...(vendors || []).map(v => [v.vendor, v.total_spend, v.bom_count, v.avg_delivery_time_days])]
+                const csv = rows.map(r => r.join(',')).join('\n')
+                const blob = new Blob([csv], { type: 'text/csv' })
+                const url = URL.createObjectURL(blob)
+                const a = document.createElement('a'); a.href = url; a.download = 'analytics-vendors.csv'; a.click()
+                URL.revokeObjectURL(url)
+              }} disabled={loading || !vendors} sx={{ color: '#6B7280' }}>
+                <Download sx={{ fontSize: 16 }} />
               </IconButton>
             </Tooltip>
           </Box>

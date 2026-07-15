@@ -62,6 +62,37 @@ export const chatApi = {
   /** Load full conversation transcript from ADLS / Cosmos */
   getTranscript: (sessionId, userId = 'demo_user') =>
     apiClient.get(`/api/bom/history/${sessionId}/transcript`, { params: { user_id: userId } }).then(r => r.data),
+  /**
+   * SSE streaming chat — returns an async generator of parsed SSE frames.
+   * Usage:
+   *   for await (const frame of chatApi.streamMessage(sid, text)) { ... }
+   * Each frame: { token, done, complete?, progress?, bom?, suggestions? }
+   */
+  streamMessage: async function* (sessionId, message, userId = 'demo_user') {
+    const base = import.meta.env.VITE_API_URL || ''
+    const token = localStorage.getItem('token')
+    const resp = await fetch(`${base}/api/bom/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ session_id: sessionId, message, user_id: userId }),
+    })
+    if (!resp.ok) throw new Error(`Stream failed: ${resp.status}`)
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() // keep incomplete line
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try { yield JSON.parse(line.slice(6)) } catch (_) {}
+        }
+      }
+    }
+  },
 }
 
 // ── BOM CRUD API ──────────────────────────────────────────────────────────
@@ -154,6 +185,26 @@ export const eolApi = {
     apiClient.get(`/api/bom/eol/check/${encodeURIComponent(sku)}`).then(r => r.data),
   checkBom: (lineItems) =>
     apiClient.post('/api/bom/eol/check-bom', { line_items: lineItems }).then(r => r.data),
+}
+
+export const notifyApi = {
+  sendEmail: ({ to, subject, body, bom_name }) =>
+    apiClient.post('/api/notify/email', { to, subject, body, bom_name }).then(r => r.data),
+}
+
+export const ingestApi = {
+  /**
+   * Upload a file (File object) and trigger the ingest pipeline.
+   * Returns { bom_id, message }.
+   */
+  uploadBom: (file, metadata = {}) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    if (metadata.project_name) fd.append('project_name', metadata.project_name)
+    if (metadata.category) fd.append('category', metadata.category)
+    return apiClient.post('/api/ingest/bom', fd, { headers: { 'Content-Type': 'multipart/form-data' } }).then(r => r.data)
+  },
+  status: (bomId) => apiClient.get(`/api/ingest/status/${bomId}`).then(r => r.data),
 }
 
 export default apiClient

@@ -611,6 +611,22 @@ export default function ChatPage() {
         chatApi.getHistory('demo_user', 50)
           .then(sessions => setChatHistory(filterSessions(sessions)))
           .catch(() => {})
+        // Restore last session across page refresh
+        const savedSid = sessionStorage.getItem('chat_session_id')
+        if (savedSid) {
+          setSessionId(savedSid)
+          const cached = loadConvCache(savedSid)
+          if (cached?.length) {
+            setMessages(cached)
+          } else {
+            chatApi.getMessages(savedSid).then(data => {
+              const restored = (data.messages || []).map((m, i) => ({
+                id: 'r_' + i, role: m.role === 'assistant' ? 'ai' : m.role, type: 'text', text: m.content || '',
+              }))
+              if (restored.length) setMessages(restored)
+            }).catch(() => {})
+          }
+        }
       }
     })
   }, [])
@@ -694,6 +710,10 @@ export default function ChatPage() {
     }
   }
 
+  // Initialise welcome message when no session is being restored
+  useEffect(() => {
+    const savedSid = sessionStorage.getItem('chat_session_id')
+    if (savedSid) return  // session restore already handled in the backend-ping useEffect
     const welcome = savedCurrentBOM
       ? { id: 1, role: 'ai', type: 'loaded', text: 'Loaded **"' + savedCurrentBOM.name + '"** (v' + savedCurrentBOM.version + ') - **' + savedCurrentBOM.lineItems.length + ' items**, ' + fmt(savedCurrentBOM.totalValue) + '. What would you like to do?', bom: savedCurrentBOM }
       : { id: 1, role: 'ai', type: 'help', text: 'Hello! I am your **AI BOM Assistant**.\n\nI can create, update, analyze and manage your Bills of Materials in real-time. Just describe what you need in plain English.', suggestions: ['Create a Data Center BOM for Panasonic', 'Create SD-WAN BOM for 30 sites', 'Create Cybersecurity BOM for Idemia', 'Show my BOMs'] }
@@ -783,37 +803,68 @@ export default function ChatPage() {
           const startResp = await chatApi.startSession(cat, proj)
           sid = startResp.session_id
           setSessionId(sid)
+          sessionStorage.setItem('chat_session_id', sid)
           // Store welcome — only show it if the next sendMessage doesn't produce a BOM
-          // (avoids showing "Hello! I am your AI..." immediately before a BOM creation msg)
           var pendingWelcome = startResp.message
         }
         let resp
+        let streamingSucceeded = false
+        const streamMsgId = Date.now() + Math.random()
         try {
-          // Use attachment endpoint when a file was captured
+          // Use attachment endpoint when a file was captured (no streaming for attachments)
           if (capturedFile) {
             resp = await chatApi.sendMessageWithAttachment(sid, userText, capturedFile, capturedCategory)
           } else {
-            resp = await chatApi.sendMessage(sid, userText)
+            // ── SSE streaming path ─────────────────────────────────────────
+            let streamingText = ''
+            let streamDone = false
+            // Add a placeholder AI message that will be updated in-place
+            setMessages(prev => [...prev, { id: streamMsgId, role: 'ai', type: 'text', text: '…', _streamId: streamMsgId }])
+            setIsTyping(false)
+            for await (const frame of chatApi.streamMessage(sid, userText)) {
+              if (!frame.done) {
+                streamingText += frame.token
+                setMessages(prev => prev.map(m => m._streamId === streamMsgId
+                  ? { ...m, text: streamingText }
+                  : m))
+              } else {
+                streamDone = true
+                streamingSucceeded = true
+                resp = { response: streamingText, progress: frame.progress || 0, complete: frame.complete || false, partial_bom: frame.bom || null, suggestions: frame.suggestions || [] }
+                setMessages(prev => prev.map(m => m._streamId === streamMsgId
+                  ? { ...m, text: streamingText, _streamId: undefined }
+                  : m))
+              }
+            }
+            if (!streamDone) throw new Error('Stream ended without done frame')
           }
         } catch (sendErr) {
-          // Session may have expired — reset and retry once
-          if (sendErr?.response?.status === 404 || sendErr?.response?.status === 422) {
-            setSessionId(null)
-            const cat  = detectCategory(userText) || ctx.category || 'Data Center / COLO'
-            const proj = detectProject(userText) || ctx.project || 'New Project'
-            const startResp = await chatApi.startSession(cat, proj)
-            sid = startResp.session_id
-            setSessionId(sid)
-            if (capturedFile) {
-              resp = await chatApi.sendMessageWithAttachment(sid, userText, capturedFile, capturedCategory)
+          // Streaming failed — fall back to blocking /chat
+          // Remove the streaming placeholder if it was added
+          setMessages(prev => prev.filter(m => m._streamId !== streamMsgId))
+          streamingSucceeded = false
+          try {
+            resp = capturedFile
+              ? await chatApi.sendMessageWithAttachment(sid, userText, capturedFile, capturedCategory)
+              : await chatApi.sendMessage(sid, userText)
+          } catch (fallbackErr) {
+            if (fallbackErr?.response?.status === 404 || fallbackErr?.response?.status === 422) {
+              setSessionId(null)
+              const cat  = detectCategory(userText) || ctx.category || 'Data Center / COLO'
+              const proj = detectProject(userText) || ctx.project || 'New Project'
+              const startResp = await chatApi.startSession(cat, proj)
+              sid = startResp.session_id
+              setSessionId(sid)
+              sessionStorage.setItem('chat_session_id', sid)
+              resp = capturedFile
+                ? await chatApi.sendMessageWithAttachment(sid, userText, capturedFile, capturedCategory)
+                : await chatApi.sendMessage(sid, userText)
             } else {
-              resp = await chatApi.sendMessage(sid, userText)
+              throw fallbackErr
             }
-          } else {
-            throw sendErr
           }
         }
-        setIsTyping(false)
+        setIsTyping(false)  // ensure spinner hidden (streaming sets it early; attachment path needs it here)
         setPhaseProgress(resp.progress || 0)
 
         // If BOM was generated by AI, convert and show it
@@ -858,16 +909,28 @@ export default function ChatPage() {
           )
         }
 
-        addMsg({
-          role: 'ai',
-          type: resp.complete ? 'bom_created' : 'text',
-          text: displayText,
-          bom: aiBOM,
-          actions: resp.complete && aiBOM ? ['library', 'rfq'] : undefined,
-          attachment: resp.attachment || null,
-          suggestions: resp.suggestions?.length ? resp.suggestions : undefined,
-          sessionTitle: resp.session_title || null,
-        })
+        // For streaming path: placeholder is already in the list, update it with final metadata.
+        // For attachment/fallback path: add a new message via addMsg.
+        if (streamingSucceeded) {
+          setMessages(prev => prev.map(m => m.id === streamMsgId ? {
+            ...m,
+            type: resp.complete ? 'bom_created' : 'text',
+            text: displayText,
+            bom: aiBOM || undefined,
+            actions: resp.complete && aiBOM ? ['library', 'rfq'] : undefined,
+            suggestions: resp.suggestions?.length ? resp.suggestions : undefined,
+          } : m))
+        } else {
+          addMsg({
+            role: 'ai',
+            type: resp.complete ? 'bom_created' : 'text',
+            text: displayText,
+            bom: aiBOM,
+            actions: resp.complete && aiBOM ? ['library', 'rfq'] : undefined,
+            attachment: resp.attachment || null,
+            suggestions: resp.suggestions?.length ? resp.suggestions : undefined,
+          })
+        }
         // When creating a new BOM while one already exists → session divider + reset session
         if (resp.complete && aiBOM && currentBOM) {
           addMsg({ role: 'divider', type: 'divider', prevBOM: currentBOM.name })
@@ -880,6 +943,10 @@ export default function ChatPage() {
           ))
         }
         if (resp.complete) refreshHistory()   // pull updated history from Cosmos/ADLS
+        // Persist conversation to localStorage cache for offline/refresh restore
+        if (sid) {
+          setMessages(prev => { saveConvCache(sid, prev); return prev })
+        }
         backendFailCount.current = 0   // reset failure counter on success
         sendingRef.current = false
         return
@@ -934,30 +1001,146 @@ export default function ChatPage() {
     }
   }
 
+  // ── Widget renderers ────────────────────────────────────────────────────────
+  // Render ```form { fields:[{label,type,value}] } ``` as a mini form card
+  const renderFormWidget = (jsonStr, key) => {
+    let data = {}
+    try { data = JSON.parse(jsonStr) } catch { return null }
+    const fields = Array.isArray(data.fields) ? data.fields : []
+    const title = data.title || 'Details'
+    return (
+      <Box key={key} sx={{ mt: 1, p: 1.25, borderRadius: 1.5, border: '1px solid #E0E7FF', bgcolor: '#F5F3FF' }}>
+        <Typography sx={{ fontSize: '0.68rem', fontWeight: 700, color: '#4F46E5', mb: 0.75, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+          {title}
+        </Typography>
+        {fields.map((f, i) => (
+          <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', py: 0.3, borderBottom: i < fields.length - 1 ? '1px solid #E0E7FF' : 'none' }}>
+            <Typography sx={{ fontSize: '0.7rem', color: '#6B7280', fontWeight: 500 }}>{f.label}</Typography>
+            <Typography sx={{ fontSize: '0.7rem', color: '#111827', fontWeight: 600 }}>{f.value ?? '—'}</Typography>
+          </Box>
+        ))}
+      </Box>
+    )
+  }
+
+  // Render ```actions [{label, action, variant?}] ``` as clickable buttons
+  const renderActionsWidget = (jsonStr, key) => {
+    let items = []
+    try { items = JSON.parse(jsonStr) } catch { return null }
+    if (!Array.isArray(items)) return null
+    return (
+      <Box key={key} sx={{ mt: 1, display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+        {items.map((item, i) => (
+          <Button key={i} size="small" variant={item.variant === 'primary' ? 'contained' : 'outlined'}
+            onClick={() => !isTyping && !sendingRef.current && handleSend(item.action || item.label)}
+            disabled={isTyping}
+            sx={{ fontSize: '0.68rem', textTransform: 'none', borderRadius: 1.5, px: 1.25, py: 0.25, minHeight: 28,
+              ...(item.variant === 'primary'
+                ? { bgcolor: '#D04A02', color: '#fff', border: 'none', '&:hover': { bgcolor: '#B03A00' } }
+                : { color: '#D04A02', borderColor: '#D04A02', '&:hover': { bgcolor: '#FDF3ED' } }) }}>
+            {item.label}
+          </Button>
+        ))}
+      </Box>
+    )
+  }
+
+  // Render ```steps [{label, done?}] ``` as a vertical checklist
+  const renderStepsWidget = (jsonStr, key) => {
+    let items = []
+    try { items = JSON.parse(jsonStr) } catch { return null }
+    if (!Array.isArray(items)) return null
+    const done = items.filter(s => s.done).length
+    const pct = Math.round((done / items.length) * 100)
+    return (
+      <Box key={key} sx={{ mt: 1, p: 1.25, borderRadius: 1.5, border: '1px solid #D1FAE5', bgcolor: '#F0FDF4' }}>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.75 }}>
+          <Typography sx={{ fontSize: '0.68rem', fontWeight: 700, color: '#065F46', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Steps</Typography>
+          <Typography sx={{ fontSize: '0.68rem', color: '#065F46', fontWeight: 600 }}>{done}/{items.length}</Typography>
+        </Box>
+        <LinearProgress variant="determinate" value={pct} sx={{ height: 4, borderRadius: 2, mb: 1, bgcolor: '#A7F3D0', '& .MuiLinearProgress-bar': { bgcolor: '#059669' } }} />
+        {items.map((s, i) => (
+          <Box key={i} sx={{ display: 'flex', alignItems: 'center', gap: 0.75, py: 0.2 }}>
+            <Box sx={{ width: 14, height: 14, borderRadius: '50%', bgcolor: s.done ? '#059669' : '#D1FAE5', border: `2px solid ${s.done ? '#059669' : '#6EE7B7'}`, flexShrink: 0 }} />
+            <Typography sx={{ fontSize: '0.7rem', color: s.done ? '#065F46' : '#374151', fontWeight: s.done ? 600 : 400, textDecoration: s.done ? 'line-through' : 'none' }}>
+              {s.label}
+            </Typography>
+          </Box>
+        ))}
+      </Box>
+    )
+  }
+
+  // Render ```progress {label, value, max?, color?} ``` as a progress bar card
+  const renderProgressWidget = (jsonStr, key) => {
+    let data = {}
+    try { data = JSON.parse(jsonStr) } catch { return null }
+    const pct = data.max ? Math.min(100, Math.round((data.value / data.max) * 100)) : Math.min(100, data.value || 0)
+    const color = data.color || '#D04A02'
+    return (
+      <Box key={key} sx={{ mt: 1, p: 1.25, borderRadius: 1.5, border: '1px solid #FDE68A', bgcolor: '#FFFBEB' }}>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
+          <Typography sx={{ fontSize: '0.7rem', fontWeight: 600, color: '#92400E' }}>{data.label || 'Progress'}</Typography>
+          <Typography sx={{ fontSize: '0.7rem', fontWeight: 700, color: '#92400E' }}>{pct}%</Typography>
+        </Box>
+        <LinearProgress variant="determinate" value={pct} sx={{ height: 6, borderRadius: 3, bgcolor: '#FDE68A', '& .MuiLinearProgress-bar': { bgcolor: color, borderRadius: 3 } }} />
+        {data.sublabel && <Typography sx={{ fontSize: '0.62rem', color: '#B45309', mt: 0.4 }}>{data.sublabel}</Typography>}
+      </Box>
+    )
+  }
+
+  // ── Main text renderer ───────────────────────────────────────────────────────
+  // Splits text on fenced widget blocks before passing remainder to markdown renderer.
   const renderText = (text) => {
     if (!text) return null
-    // Pre-process: strip raw ```json...``` fences entirely (should not reach here, but safety net)
+    // Split on fenced blocks: ```type\n...\n```
+    const FENCE_RE = /```(form|actions|steps|progress)\n([\s\S]*?)```/g
+    const elements = []
+    let last = 0
+    let match
+    let idx = 0
+    FENCE_RE.lastIndex = 0
+    while ((match = FENCE_RE.exec(text)) !== null) {
+      // Render any preceding markdown text
+      const before = text.slice(last, match.index).trim()
+      if (before) elements.push(...renderMarkdown(before, `md-${idx++}`))
+      // Render the widget
+      const [, blockType, blockContent] = match
+      const trimmed = blockContent.trim()
+      if (blockType === 'form') elements.push(renderFormWidget(trimmed, `fw-${idx++}`))
+      else if (blockType === 'actions') elements.push(renderActionsWidget(trimmed, `aw-${idx++}`))
+      else if (blockType === 'steps') elements.push(renderStepsWidget(trimmed, `sw-${idx++}`))
+      else if (blockType === 'progress') elements.push(renderProgressWidget(trimmed, `pw-${idx++}`))
+      last = match.index + match[0].length
+    }
+    // Remaining text after last widget (or all text if no widgets)
+    const tail = text.slice(last)
+    if (tail.trim()) elements.push(...renderMarkdown(tail, `md-${idx++}`))
+    return elements.filter(Boolean)
+  }
+
+  // ── Markdown-only renderer (extracted from original renderText) ──────────────
+  const renderMarkdown = (text, keyPrefix = 'md') => {
+    if (!text) return []
+    // Strip raw ```json/plain fences (safety net for non-widget fences)
     const cleaned = text.replace(/```json[\s\S]*?```/g, '').replace(/```[\s\S]*?```/g, '').trim()
     const lines = cleaned.split('\n')
     const elements = []
     let i = 0
     while (i < lines.length) {
       const line = lines[i]
-      // Heading 1/2
       if (/^#{1,2}\s/.test(line)) {
         elements.push(
-          <Typography key={i} sx={{ fontSize: '0.82rem', fontWeight: 700, color: 'inherit', mt: 0.5, lineHeight: 1.4 }}>
+          <Typography key={`${keyPrefix}-${i}`} sx={{ fontSize: '0.82rem', fontWeight: 700, color: 'inherit', mt: 0.5, lineHeight: 1.4 }}>
             {renderInline(line.replace(/^#+\s*/, ''))}
           </Typography>
         )
         i++; continue
       }
-      // Horizontal rule
       if (/^[\-=]{3,}$/.test(line.trim())) {
-        elements.push(<Box key={i} sx={{ borderTop: '1px solid rgba(0,0,0,0.12)', my: 0.5 }} />)
+        elements.push(<Box key={`${keyPrefix}-${i}`} sx={{ borderTop: '1px solid rgba(0,0,0,0.12)', my: 0.5 }} />)
         i++; continue
       }
-      // Bullet / numbered list
       if (/^[\-\*]\s/.test(line) || /^\d+\.\s/.test(line)) {
         const listItems = []
         while (i < lines.length && (/^[\-\*]\s/.test(lines[i]) || /^\d+\.\s/.test(lines[i]))) {
@@ -965,20 +1148,18 @@ export default function ChatPage() {
           i++
         }
         elements.push(
-          <Box key={'list-' + i} component="ul" sx={{ pl: 2, my: 0.25, '& li': { fontSize: '0.78rem', lineHeight: 1.7, color: 'inherit' } }}>
+          <Box key={`${keyPrefix}-list-${i}`} component="ul" sx={{ pl: 2, my: 0.25, '& li': { fontSize: '0.78rem', lineHeight: 1.7, color: 'inherit' } }}>
             {listItems.map((li, j) => <li key={j}>{renderInline(li)}</li>)}
           </Box>
         )
         continue
       }
-      // Empty line → small gap
       if (!line.trim()) {
-        elements.push(<Box key={i} sx={{ height: 4 }} />)
+        elements.push(<Box key={`${keyPrefix}-${i}`} sx={{ height: 4 }} />)
         i++; continue
       }
-      // Normal paragraph
       elements.push(
-        <Typography key={i} sx={{ fontSize: '0.78rem', lineHeight: 1.6, color: 'inherit' }}>
+        <Typography key={`${keyPrefix}-${i}`} sx={{ fontSize: '0.78rem', lineHeight: 1.6, color: 'inherit' }}>
           {renderInline(line)}
         </Typography>
       )

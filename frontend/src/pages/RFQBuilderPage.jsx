@@ -13,6 +13,7 @@ import {
   TrendingDown, Send, Build, Email, Schedule, Person,
 } from '@mui/icons-material'
 import { setCurrentBOM } from '../store/slices/bomSlice'
+import { notifyApi } from '../services/api'
 
 const fmt = (v) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(v)
 const SL = { fontSize: '0.58rem', fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.7px' }
@@ -120,19 +121,24 @@ export default function RFQBuilderPage() {
 
   const handleSendRFQ = async () => {
     setSending(true)
-    // Simulate sending — in production this would call a backend email API
-    await new Promise(r => setTimeout(r, 1200))
     const now = new Date().toISOString()
-    const newEntries = Object.entries(sendVendors)
-      .filter(([, checked]) => checked)
-      .map(([v]) => ({
-        vendor: v,
-        email: VENDOR_CONTACTS[v]?.email || `sales@${v.toLowerCase().replace(/\s+/g, '')}.com`,
-        contact: VENDOR_CONTACTS[v]?.contact || 'Accounts Team',
-        sentAt: now,
-        items: cart.filter(i => i.vendor === v).length,
-        total: fmt(cart.filter(i => i.vendor === v).reduce((s, i) => s + i.qty * i.targetPrice, 0)),
-      }))
+    const selectedVendors = Object.entries(sendVendors).filter(([, checked]) => checked).map(([v]) => v)
+    // Fire backend email notifications (best-effort — errors don't block UI)
+    await Promise.allSettled(selectedVendors.map(v => {
+      const info = VENDOR_CONTACTS[v] || {}
+      const vendorItems = cart.filter(i => i.vendor === v)
+      const total = vendorItems.reduce((s, i) => s + i.qty * i.targetPrice, 0)
+      const body = `Dear ${info.contact || 'Team'},\n\nPlease find the attached RFQ for ${vendorItems.length} item(s) totalling ${fmt(total)}.\n\nKindly respond within your standard turnaround of ${info.turnaround || '3-5 days'}.\n\nRegards,\nIT Procurement`
+      return notifyApi.sendEmail({ to: info.email || `sales@${v.toLowerCase().replace(/\s+/g, '')}.com`, subject: `RFQ — ${currentBOM?.name || 'IT Procurement'}`, body, bom_name: currentBOM?.name })
+    }))
+    const newEntries = selectedVendors.map(v => ({
+      vendor: v,
+      email: VENDOR_CONTACTS[v]?.email || `sales@${v.toLowerCase().replace(/\s+/g, '')}.com`,
+      contact: VENDOR_CONTACTS[v]?.contact || 'Accounts Team',
+      sentAt: now,
+      items: cart.filter(i => i.vendor === v).length,
+      total: fmt(cart.filter(i => i.vendor === v).reduce((s, i) => s + i.qty * i.targetPrice, 0)),
+    }))
     setSentLog(prev => [...prev, ...newEntries])
     setSending(false)
     setSendOpen(false)
