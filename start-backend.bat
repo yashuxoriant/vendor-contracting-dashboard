@@ -5,4 +5,4 @@ echo Backend will run at: http://localhost:8001
 echo API docs will be at: http://localhost:8001/api/docs
 echo.
 cd backend
-python -m uvicorn main:app --reload --port 8001
+"C:\Users\singh_y\workspace\ma-workstream-planner\.venv\Scripts\python.exe" -m uvicorn main:app --reload --port 8001

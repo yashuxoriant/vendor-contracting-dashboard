@@ -9,7 +9,7 @@ import re
 from typing import Dict, Any, Optional, Tuple
 
 from ai.client import call_ai
-from ai.prompts.system_base import SYSTEM_BASE, CATEGORY_ADDENDA
+from ai.prompts.system_base import get_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -61,28 +61,48 @@ class BOMOrchestrator:
         requirements = context.get("requirements", {})
         history = session.get("conversation", [])
 
-        # Build system prompt: base + category addendum + current state
-        addendum = CATEGORY_ADDENDA.get(category, "")
+        # Load skill-aware system prompt (loads skill Markdown file if one exists for
+        # this category, otherwise falls back to base + category hint)
+        base_prompt = get_system_prompt(category)
 
         # Retrieve relevant BOM chunks from the embedding index (best-effort)
         bom_id = context.get("bom_id")  # if session is scoped to a specific BOM
         bom_context = _retrieve_bom_context(message, bom_id=bom_id)
 
         system = (
-            SYSTEM_BASE
+            base_prompt
             + f"\n\n{'═'*60}\nCURRENT SESSION\n{'═'*60}\n"
             + f"Category: {category}\n"
             + f"Project: {requirements.get('project', 'New Project')}\n"
             + f"Current Phase: {phase}/10\n"
             + f"Phase data collected: {json.dumps(phase_data, default=str)}\n"
             + f"Requirements: {json.dumps(requirements, default=str)}\n"
-            + (f"\nCategory guidance: {addendum}" if addendum else "")
             + bom_context  # ← injected BOM embedding context
         )
 
         # Build conversation history (last 14 messages)
-        msgs = [{"role": m["role"], "content": m["content"]}
-                for m in history[-14:]]
+        # Normalise role: frontend stores AI messages as "ai" but Claude API requires "assistant"
+        # Also ensure strict user/assistant alternation (drop consecutive same-role messages)
+        raw_history = history[-14:]
+        msgs = []
+        for m in raw_history:
+            role = m.get("role", "user")
+            if role == "ai":
+                role = "assistant"
+            if role not in ("user", "assistant"):
+                continue
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            # Enforce alternation: skip if same role as last
+            if msgs and msgs[-1]["role"] == role:
+                if role == "assistant":
+                    msgs[-1]["content"] += "\n" + content  # merge consecutive assistant messages
+                continue
+            msgs.append({"role": role, "content": content})
+        # Claude requires first message to be user; strip leading assistant if needed
+        while msgs and msgs[0]["role"] == "assistant":
+            msgs.pop(0)
 
         # Call AI
         response_text = call_ai(msgs, system=system)
@@ -115,15 +135,66 @@ class BOMOrchestrator:
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _extract_bom(self, text: str) -> Tuple[Optional[Dict], bool]:
+        """
+        Extract BOM JSON from AI response text.
+        Handles both default schema (line_items) and skill file format (bom_line_items).
+        Also normalises per-item field aliases so the frontend receives a consistent shape.
+        """
         match = re.search(r"```json\s*([\s\S]*?)```", text)
-        if match:
-            try:
-                data = json.loads(match.group(1).strip())
-                if "line_items" in data and len(data["line_items"]) > 0:
-                    return data, True
-            except json.JSONDecodeError:
-                pass
-        return None, False
+        if not match:
+            return None, False
+        try:
+            data = json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            return None, False
+
+        # Normalise top-level key: skill files use "bom_line_items"
+        if "bom_line_items" in data and data["bom_line_items"]:
+            data["line_items"] = data.pop("bom_line_items")
+
+        items = data.get("line_items", [])
+        if not items:
+            return None, False
+
+        # Normalise each line item so frontend backendBOMtoFrontend always gets consistent fields
+        normalised = []
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            # qty / quantity alias
+            qty = item.get("qty") or item.get("quantity") or 1
+            # price fields — skill file may emit null for pricing_required items
+            unit_price = item.get("unit_price") or 0
+            ext_price = (
+                item.get("extended_price")
+                or item.get("ext_price")
+                or (unit_price * qty if unit_price else 0)
+            )
+            normalised.append({
+                "line_number":    item.get("line_number") or i + 1,
+                "category":       item.get("category", "Network Equipment"),
+                "description":    item.get("description", ""),
+                "sku":            item.get("sku") or item.get("part_number", ""),
+                "qty":            qty,
+                "quantity":       qty,
+                "unit":           item.get("unit", "/unit"),
+                "unit_price":     unit_price,
+                "extended_price": ext_price,
+                "ext_price":      ext_price,
+                "vendor":         item.get("vendor", ""),
+                "term":           item.get("term", "one-time"),
+                "order_sequence": item.get("order_sequence") or item.get("order_seq", ""),
+                "eol_flag":       bool(item.get("eol_flag", False)),
+                "eol_warning":    item.get("eol_warning", ""),
+                "notes":          item.get("notes", ""),
+                "ha_role":        item.get("ha_role", ""),
+                "site_name":      item.get("site_name", ""),
+                "price_basis":    item.get("price_basis", "budgetary_assumption"),
+                "quantity_basis": item.get("quantity_basis", ""),
+                "recommendation_status": item.get("recommendation_status", ""),
+            })
+        data["line_items"] = normalised
+        return data, True
 
     def _detect_phase_advance(self, response: str, current_phase: int, message: str) -> int:
         """Simple heuristic: if AI mentions 'Phase X' in response, advance to that phase."""

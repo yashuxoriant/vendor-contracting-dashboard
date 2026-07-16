@@ -607,29 +607,54 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
     row += 1
 
     # ── Line items ──
-    raw_items = bom_data.get("line_items", [])
+    raw_items = bom_data.get("line_items", bom_data.get("bom_line_items", []))
 
     def _get(item, key, default=""):
-        """Works for both dict and Pydantic object."""
+        """Works for both dict and Pydantic object. Handles field aliases."""
         if isinstance(item, dict):
             return item.get(key, default)
         return getattr(item, key, default)
+
+    def _qty(item):
+        """Handle qty / quantity alias."""
+        v = _get(item, "qty", None)
+        if v is None:
+            v = _get(item, "quantity", 1)
+        return v or 1
+
+    def _price(item, key):
+        """Return price as float; treat null/None as 0 (pricing_required items)."""
+        v = _get(item, key, None)
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     for i, item in enumerate(raw_items):
         fill = grey_fill if i % 2 == 0 else PatternFill("solid", fgColor=WHITE)
         eol  = bool(_get(item, "eol_flag", False))
         row_fill = warn_fill if eol else fill
+        unit_price = _price(item, "unit_price")
+        ext_price  = _price(item, "extended_price") or _price(item, "ext_price") or (unit_price * _qty(item))
+        notes      = str(_get(item, "notes", ""))
+        # Append extra skill-file fields to notes column
+        quantity_basis = str(_get(item, "quantity_basis", ""))
+        price_basis    = str(_get(item, "price_basis", ""))
+        ha_role        = str(_get(item, "ha_role", ""))
+        extra_note = " | ".join(filter(None, [quantity_basis, f"Price: {price_basis}" if price_basis else "", f"HA: {ha_role}" if ha_role else ""]))
+        if extra_note:
+            notes = (notes + (" | " if notes else "") + extra_note).strip(" |")
         vals = [
             _get(item, "line_number", i + 1),
             _get(item, "category", ""),
-            _get(item, "description", ""),
-            _get(item, "sku", ""),
-            _get(item, "qty", 1),
+            _get(item, "description", "") + (" [" + str(_get(item, "site_name", "")) + "]" if _get(item, "site_name", "") else ""),
+            _get(item, "sku", "") or _get(item, "part_number", ""),
+            _qty(item),
             _get(item, "unit", "/unit"),
-            _get(item, "unit_price", 0),
-            _get(item, "extended_price", 0),
+            unit_price,
+            ext_price,
             _get(item, "term", "one-time"),
-            _get(item, "order_sequence", ""),
+            _get(item, "order_sequence", "") or _get(item, "order_seq", ""),
         ]
         for col_idx, val in enumerate(vals, start=1):
             c = ws.cell(row=row, column=col_idx, value=val)
@@ -640,10 +665,21 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
                 c.alignment = center
             if col_idx in (7, 8):
                 c.number_format = '"$"#,##0.00'
+                if not val:
+                    c.value = "TBD"
+                    c.number_format = "@"
             if col_idx == 3:
                 c.alignment = wrap
         if eol:
             ws.cell(row=row, column=3).value = "⚠ EOL: " + str(_get(item, "description", ""))
+        # Notes in a merged annotation row when present
+        if notes:
+            row += 1
+            ws.merge_cells(f"B{row}:J{row}")
+            ann = ws[f"B{row}"]
+            ann.value = "  ↳ " + notes
+            ann.font = Font(name="Calibri", size=8, italic=True, color="6B7280")
+            ann.fill = row_fill
         row += 1
 
     # ── Totals row ──

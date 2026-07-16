@@ -7,9 +7,12 @@ from fastapi import APIRouter, HTTPException, status, BackgroundTasks, File, For
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+import logging
 import uuid
 import json
 import re
+
+logger = logging.getLogger(__name__)
 
 from db import get_cosmos_client, get_adls_client, ChatSession, ChatMessage, SessionContext
 from config import get_settings
@@ -397,11 +400,14 @@ async def send_message(request: ChatMessageRequest):
     if complete:
         session.status = "completed"
         session.completed_at = datetime.utcnow()
+        if partial_bom:
+            _save_bom_to_cosmos(cosmos_client, partial_bom, session, request.user_id or "demo_user")
 
     cosmos_client.update_session(request.session_id, session.model_dump(mode="json"))
 
-    # Archive full conversation to ADLS (best-effort — non-blocking, fails silently)
-    _archive_session_to_adls(session, request.user_id or "demo_user")
+    # Archive to ADLS via background task (non-blocking)
+    background_tasks = BackgroundTasks()
+    background_tasks.add_task(_archive_session_to_adls, session, request.user_id or "demo_user")
 
     try:
         from api.audit import log_action
@@ -465,9 +471,9 @@ from fastapi.responses import StreamingResponse
 async def stream_message(request: ChatMessageRequest):
     """
     Server-Sent Events streaming chat endpoint.
-    Streams tokens as they arrive from the AI instead of waiting for the full
-    response. Falls back to the blocking /chat response when streaming is
-    unavailable (provider is not Anthropic).
+
+    Uses the full BOMOrchestrator pipeline (RAG retrieval + phase state machine +
+    skill-file system prompt) for streaming, identical to /chat but token-by-token.
 
     SSE frame format:
         data: {"token": "<text>", "done": false}   (per chunk)
@@ -477,86 +483,125 @@ async def stream_message(request: ChatMessageRequest):
     session_data = cosmos_client.get_session(request.session_id)
     if not session_data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-    session = ChatSession(**session_data)
+
+    # Use model_validate for proper alias handling
+    try:
+        session = ChatSession.model_validate(session_data)
+    except Exception as exc:
+        logger.error("Session hydration failed in stream: %s", exc)
+        raise HTTPException(status_code=500, detail="Session data corrupt")
 
     session.conversation.append(ChatMessage(role="user", content=request.message))
 
-    # Build messages list for AI
-    from ai.prompts.system_base import get_system_prompt as _get_sys
-    try:
-        system_prompt = _get_sys(session.context.category or "Data Center / COLO")
-    except Exception:
-        system_prompt = BOM_SYSTEM_PROMPT
+    # ── Build full orchestrator system prompt (skill file + RAG + session) ─
+    from ai.agents.orchestrator import BOMOrchestrator, _retrieve_bom_context
+    from ai.prompts.system_base import get_system_prompt
 
-    messages = [{"role": m.role if m.role != "ai" else "assistant", "content": m.content}
-                for m in session.conversation]
+    orch = BOMOrchestrator()
+    session_dict = session.model_dump(mode="json")
+    context = session_dict.get("context", {})
+    category = context.get("category") or "Data Center / COLO"
+    phase = context.get("current_phase", 1)
+    phase_data = context.get("phase_data", {})
+    requirements = context.get("requirements", {})
+
+    # get_system_prompt loads the skill Markdown file when available
+    base_prompt = get_system_prompt(category)
+    bom_id = context.get("bom_id")
+    bom_context = _retrieve_bom_context(request.message, bom_id=bom_id)
+
+    system_prompt = (
+        base_prompt
+        + f"\n\n{'═'*60}\nCURRENT SESSION\n{'═'*60}\n"
+        + f"Category: {category}\n"
+        + f"Project: {requirements.get('project', 'New Project')}\n"
+        + f"Current Phase: {phase}/10\n"
+        + f"Phase data collected: {json.dumps(phase_data, default=str)}\n"
+        + f"Requirements: {json.dumps(requirements, default=str)}\n"
+        + bom_context
+    )
+
+    # Last 14 messages — normalise roles and enforce user/assistant alternation
+    raw_conv = session.conversation[-14:]
+    messages = []
+    for m in raw_conv:
+        role = m.role if m.role != "ai" else "assistant"
+        if role not in ("user", "assistant"):
+            continue
+        content = (m.content or "").strip()
+        if not content:
+            continue
+        if messages and messages[-1]["role"] == role:
+            if role == "assistant":
+                messages[-1]["content"] += "\n" + content
+            continue
+        messages.append({"role": role, "content": content})
+    while messages and messages[0]["role"] == "assistant":
+        messages.pop(0)
 
     async def event_stream():
         from ai.client import stream_ai, call_ai
-        import json as _j_
         full_text = ""
         had_content = False
         gen = stream_ai(messages, system_prompt)
 
         if gen is not None:
-            # Stream tokens chunk by chunk
             for chunk in gen:
                 if chunk == "__STREAM_ERROR__":
                     break
                 had_content = True
                 full_text += chunk
-                yield "data: " + _j_.dumps({"token": chunk, "done": False}) + "\n\n"
-        
-        # Fallback: non-streaming call
+                yield "data: " + json.dumps({"token": chunk, "done": False}) + "\n\n"
+
+        # Fallback: non-streaming call (same orchestrator system prompt)
         if not had_content:
-            try:
-                result = call_ai(messages, system_prompt)
-                if result:
-                    full_text = result
-                    yield "data: " + _j_.dumps({"token": result, "done": False}) + "\n\n"
-            except Exception:
-                # Ultimate fallback — rule based
-                from ai.agents.orchestrator import BOMOrchestrator
-                orch = BOMOrchestrator()
-                user_turns = sum(1 for m in session.conversation if m.role == "user")
-                full_text = orch._rule_based(
-                    session.context.category or "Data Center / COLO",
-                    session.context.current_phase or 1,
-                    request.message, user_turns,
-                )
-                yield "data: " + _j_.dumps({"token": full_text, "done": False}) + "\n\n"
+            result = call_ai(messages, system_prompt)
+            if result:
+                full_text = result
+                had_content = True
+                yield "data: " + json.dumps({"token": result, "done": False}) + "\n\n"
 
-        # Detect BOM completion
-        bom_data = None
-        complete = False
-        match = _r.search(r"```json\s*([\s\S]*?)```", full_text)
-        if match:
-            try:
-                parsed = _j_.loads(match.group(1).strip())
-                if "line_items" in parsed and parsed["line_items"]:
-                    bom_data = parsed
-                    complete = True
-            except Exception:
-                pass
+        # Ultimate fallback: rule-based
+        if not had_content:
+            user_turns = sum(1 for m in session.conversation if m.role == "user")
+            full_text = orch._rule_based(category, phase, request.message, user_turns)
+            yield "data: " + json.dumps({"token": full_text, "done": False}) + "\n\n"
 
-        user_count = sum(1 for m in session.conversation if m.role == "user")
-        progress = 100 if complete else min(90, user_count * 12)
+        # ── Post-stream: parse BOM + advance phase ─────────────────────────
+        bom_data, complete = orch._extract_bom(full_text)
 
-        suggestions = _generate_suggestions(full_text, session.context.category, bom_data, complete)
+        # Strip raw JSON block from displayed text if BOM was extracted
+        display_text = full_text
+        if bom_data:
+            display_text = _r.sub(r"```json[\s\S]*?```", "", full_text).strip()
+            if not display_text:
+                display_text = "BOM generated. See the panel on the right for all line items."
 
-        yield "data: " + _j_.dumps({
+        new_phase = orch._detect_phase_advance(full_text, phase, request.message)
+        context["current_phase"] = new_phase
+        progress = orch._phase_to_progress(new_phase, complete)
+
+        suggestions = _generate_suggestions(display_text, category, bom_data, complete)
+
+        yield "data: " + json.dumps({
             "token": "", "done": True,
             "complete": complete, "progress": progress,
             "bom": bom_data,
             "suggestions": suggestions,
         }) + "\n\n"
 
-        # Persist to Cosmos
-        session.conversation.append(ChatMessage(role="assistant", content=full_text))
+        # ── Persist to Cosmos ──────────────────────────────────────────────
+        session.conversation.append(ChatMessage(role="assistant", content=display_text))
         session.context.progress_percentage = float(progress)
+        session.context.current_phase = new_phase
         session.updated_at = datetime.utcnow()
         if complete:
             session.status = "completed"
+            session.completed_at = datetime.utcnow()
+            # Save standalone BOM to boms container if complete
+            if bom_data:
+                _save_bom_to_cosmos(cosmos_client, bom_data, session, request.user_id or "demo_user")
+
         cosmos_client.update_session(request.session_id, session.model_dump(mode="json"))
         _archive_session_to_adls(session, request.user_id or "demo_user")
 
@@ -681,6 +726,10 @@ async def send_message_with_attachment(
         logger.error("Session hydration failed: %s", exc)
         raise HTTPException(status_code=500, detail="Session data corrupt")
 
+    # ── Scope future vector searches to this uploaded BOM ─────────────────
+    if attachment_info.get("bom_id"):
+        session.context.bom_id = attachment_info["bom_id"]
+
     # Store original user message (not the enriched one) in conversation history
     display_message = message or f"📎 Uploaded: {file.filename if file else 'file'}"
     session.conversation.append(ChatMessage(role="user", content=display_message))
@@ -693,9 +742,11 @@ async def send_message_with_attachment(
     if complete:
         session.status = "completed"
         session.completed_at = datetime.utcnow()
+        if partial_bom:
+            _save_bom_to_cosmos(cosmos_client, partial_bom, session, user_id)
 
     cosmos_client.update_session(session_id, session.model_dump(mode="json"))
-    _archive_session_to_adls(session, user_id)
+    background_tasks.add_task(_archive_session_to_adls, session, user_id)
 
     suggestions = _generate_suggestions(response_text, session.context.category, partial_bom, complete)
     session_title = _session_title(session)
@@ -814,7 +865,7 @@ async def list_chat_history(user_id: str = "demo_user", limit: int = 30):
             updated_at=s.get("updated_at"),
             message_count=s.get("message_count", 0),
             category=ctx.get("category"),
-            project=ctx.get("project_name"),
+            project=ctx.get("requirements", {}).get("project") or ctx.get("project_name"),
             progress=int(ctx.get("progress_percentage", 0)),
             title=title,
             last_message=last_message,
@@ -854,6 +905,35 @@ async def get_session_transcript(session_id: str, user_id: str = "demo_user"):
 # ─────────────────────────────────────────────────────────────────────────────
 # ADLS Archive helper
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _save_bom_to_cosmos(cosmos_client, bom_data: dict, session: ChatSession, user_id: str):
+    """Persist a completed BOM as a standalone document in the boms container."""
+    try:
+        bom_id = session.context.bom_id or f"bom_{uuid.uuid4().hex[:12]}"
+        project = (
+            session.context.requirements.get("project")
+            or session.context.phase_data.get("project_name")
+            or "New Project"
+        )
+        doc = {
+            "_id": bom_id,
+            "id": bom_id,
+            "user_id": user_id,
+            "session_id": session.session_id,
+            "category": session.context.category,
+            "project": project,
+            "status": "draft",
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+            "line_items": bom_data.get("line_items", []),
+            "totals": bom_data.get("totals", {}),
+            "metadata": bom_data,
+        }
+        cosmos_client.create_bom(doc)
+        logger.info("Saved BOM %s to Cosmos (session=%s)", bom_id, session.session_id)
+    except Exception as exc:
+        logger.warning("_save_bom_to_cosmos failed (non-fatal): %s", exc)
+
 
 def _archive_session_to_adls(session: ChatSession, user_id: str):
     """Write full conversation JSON to ADLS chat-history container (best-effort)."""
@@ -977,8 +1057,7 @@ async def _process_message(session: ChatSession, message: str) -> tuple:
         session.context.current_phase = session_dict.get("context", {}).get("current_phase", 1)
         return response_text, partial_bom, progress, complete
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Orchestrator error: {e} — falling back")
+        logger.warning("Orchestrator error: %s — falling back", e)
         return await _rule_based_fallback(session, message)
 
 

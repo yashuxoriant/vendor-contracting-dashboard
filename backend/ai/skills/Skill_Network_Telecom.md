@@ -1,327 +1,275 @@
-# Skill: Network & Telecom BOM Construction
-
-<!--
-Categories: Network & Telecom, LAN, Wireless/WLAN, Firewall, WAN/SD-WAN, Data Center/Colo Network, Cloud Network, Voice/UCaaS
-Invoked by: BOM Agent Step 9 when workstream_category resolves to Network & Telecom
-Purpose: Convert validated M&A/TSA context into adaptive network qualification, reference-BOM mapping, count/multiplier derivation, and a human-reviewable draft BOM.
--->
+# Skill: Network & Telecom
+<!-- Categories: SD-WAN, Network Equipment, Access Points, WAN, LAN, Wireless, Voice -->
+<!-- Invoked by: BOMAgent Step 9 when workstream_category is Network & Telecom, SD-WAN, Network Equipment, or Access Points -->
 
 ## Purpose
 
-Act as a **Network & Telecom BOM SME decision engine** for M&A separation, TSA Exit, cutover, and standalone-build scenarios.
-
-The objective is not to design a complete network by default.
-
-The objective is to:
-
-1. Identify the specific network BOM scope.
-2. Understand the deployment/site context.
-3. Ask only the technical questions required for that scope.
-4. Derive units, counts, and multipliers from confirmed inputs.
-5. Use a reference BOM as the preferred starting point for SKU-level line-item bundles.
-6. Surface assumptions and missing information explicitly.
-7. Generate a draft BOM for human validation before RFQ/vendor submission.
-
-The skill covers:
-
-- Full Office Network
-- LAN — Wired
-- Wireless / WLAN
-- Firewall / Network Security
-- WAN / SD-WAN
-- Data Center / Colocation Network
-- Cloud Network
-- Voice / UCaaS
+Produce a complete, vendor-ready BOM for network and telecom infrastructure in M&A Day-1 / TSA Exit scenarios.
+Covers: LAN switching, WAN/SD-WAN routers, wireless access points, firewalls (network layer), voice/UCaaS, and OOB management.
 
 ---
 
-## Core Operating Rules
+## Decision Rules — Enforce Before Every BOM
 
-### Rule 1 — Do Not Assume Full Network Scope
-
-Invocation of this skill does **not** mean LAN, WLAN, firewall, WAN, voice, and OOB are all required.
-
-The BOM scope must be explicitly resolved before technical sizing begins.
-
-### Rule 2 — Do Not Re-Ask Orchestrator Fields
-
-Consume these values from the BOM Agent handoff package when present:
-
-- M&A phase
-- triggering event
-- site/entity scope
-- shared vs. dedicated classification
-- site size classification
-- site criticality
-- conveyance status
-- asset lifecycle status
-- required-by / Day 1 date
-- vendor preference
-- existing inventory reference
-- reference BOM reference
-- assumptions already approved
-
-Never re-ask a known field.
-
-### Rule 3 — Input Dependency Rule
-
-A technical sizing rule may execute only when every input required by that rule is available from:
-
-1. the orchestrator handoff,
-2. conversation history,
-3. uploaded/current-state inventory,
-4. reference BOM data, or
-5. an explicit user-approved assumption.
-
-If an input is missing:
-- do not silently infer it,
-- do not select a model that depends on it,
-- do not calculate a quantity that depends on it,
-- do not silently apply an industry default,
-- return the missing input through `open_questions`.
-
-### Rule 4 — Maximum Three Questions Per Turn
-
-Return no more than three numbered questions in one conversational response.
-
-Prioritize questions that unlock the largest number of downstream sizing decisions.
-
-### Rule 5 — Reference BOM First
-
-A reference BOM is the preferred starting point for SKU-level BOM generation.
-
-If `reference_bom_ref` is available:
-- inspect the reference BOM pattern,
-- identify the relevant component bundle,
-- preserve known hardware/software/support relationships,
-- modify counts and multipliers based on current requirements,
-- remove components that are demonstrably out of scope,
-- flag material deviations for human review.
-
-If no reference BOM is available:
-- technical requirement sizing may proceed,
-- category/component recommendations may proceed,
-- exact SKU/model output must be marked `recommendation_status: "reference_or_vendor_validation_required"`,
-- BOM maturity cannot exceed `budgetary`.
-
-### Rule 6 — No Silent Assumptions
-
-Every assumption must be presented to the user and explicitly accepted before it is used for sizing, or left unresolved in `open_questions`.
-
-### Rule 7 — Human Validation Is Mandatory
-
-Present a concise technical decision/assumption summary before generating the BOM. Explicit confirmation is required.
-
----
-
-## Network Scope Resolution
-
-Before technical qualification, resolve exactly one primary `bom_scope`:
-
-- `full_office_network`
-- `lan_wired`
-- `wireless_wlan`
-- `firewall`
-- `wan_sdwan`
-- `datacenter_colo_network`
-- `cloud_network`
-- `voice_ucaas`
-
----
-
-## Scope-Specific Qualification and Sizing
-
-### A. Full Office Network
-
-Qualify each layer independently: LAN/wired, WLAN, firewall, WAN/SD-WAN. Voice included only when confirmed. OOB evaluated separately.
-
-**Initial questions (ask only missing inputs, max 3 per turn):**
-1. What is the user/headcount or endpoint count per site or site-size group?
-2. Which layers are required: wired LAN, Wi-Fi, firewall, WAN/SD-WAN?
-3. Are there IP phones, cameras, IoT/OT devices, or other PoE endpoints?
-
-### B. LAN — Wired
-
-**Required inputs:** site scope, wired-endpoint count, PoE endpoint counts, uplink speed, redundancy, existing inventory, vendor preference.
-
-**Access switch quantity formula:**
-```
-required_ports = wired_user_ports + AP_ports + phone_ports + camera_ports + IoT_ports + other_ports
-ports_with_headroom = required_ports × 1.20
-switch_count = ceil(ports_with_headroom / usable_ports_per_switch)
-```
-
-**PoE budget validation:**
-```
-Estimated PoE load =
-  (phones × 7.5W) + (APs × 15.4W) + (standard cameras × 12W) + (PTZ cameras × 30W)
-```
-Load should remain below 80% of rated switch PoE capacity.
-
-### C. Wireless / WLAN
-
-**Required inputs:** AP-sizing basis (concurrent users OR floor area OR reference BOM), high-density areas, indoor/outdoor, controller/cloud management, vendor preference, PoE availability.
-
-**Density guidance (budgetary ratios only):**
-- General office: ~1 AP per 30 concurrent users
-- High-density: ~1 AP per 15 concurrent users
-- Warehouse/outdoor: ~1 AP per 5,000 sq ft
-
-If no RF site survey exists, flag as HIGH assumption requiring validation.
-
-### D. Firewall / Network Security
-
-**Required inputs:** deployment locations, throughput, concurrent sessions, SSL/TLS inspection, remote-access VPN users, site-to-site VPN/tunnels, HA requirement, compliance constraints, physical/virtual/cloud deployment, vendor preference.
-
-**Deterministic HA rules:**
-- `site_criticality = critical` → HA pair mandatory
-- Compliance mandate → HA pair
-- Standard sites without confirmed requirement → ask
-
-**BOM bundle evaluation:** appliance/entitlement, HA peer if required, security subscriptions (IPS/IDS, URL filtering, malware, SSL inspection), support/maintenance, interfaces/modules, optics, power/accessories.
-
-### E. WAN / SD-WAN
-
-**Required inputs:** site count/groups, bandwidth per group, primary connectivity type, redundancy requirement, active/active vs. active/passive, secondary circuit, existing carrier contracts, conveyance status, cloud/DC connectivity, vendor preference.
-
-**WAN edge sizing:**
-```
-sizing_throughput = peak_measured_utilization × approved_utilization_headroom × approved_growth_headroom
-```
-
-**BOM bundle evaluation:** WAN edge device, HA peer if required, SD-WAN subscription, support/maintenance, WAN modules/interfaces, optics, primary circuit, secondary circuit if required, implementation/cutover services.
-
-**Carrier circuits:** flag as HIGH-priority — circuit provisioning may be a long-lead dependency (weeks to months depending on carrier/location).
-
-### F. Data Center / Colocation Network
-
-**Required inputs:** DC/colo location count, rack count, conveying vs. net-new, EOL/EOS status, server/storage connectivity, east-west bandwidth, north-south/edge bandwidth, redundancy, topology/reference architecture, interconnect requirements.
-
-**Topology hierarchy:**
-```
-Rack → Top-of-Rack switch → Leaf layer → Spine layer → Edge/WAN/Internet/Cloud
-```
-
-### G. Cloud Network
-
-**Required inputs:** cloud provider and regions, conveyed vs. net-new, connectivity requirements, native vs. third-party firewall, traffic/throughput, HA/zone requirements, subscription/run-rate model, reference architecture.
-
-Cloud services are generally recurring/run-rate. Do not model as owned hardware unless the solution contains hardware. Do not invent monthly costs without a pricing source.
-
-### H. Voice / UCaaS
-
-Voice included only when explicitly in scope.
-
-**Required inputs:** users/phones count, calling platform, concurrent-call requirement, PSTN/SIP model, survivability, existing call manager/SBC/gateway reuse, vendor preference.
-
-Recalculate LAN PoE when physical IP phones are added.
-
----
-
-## OOB Management
-
-Evaluate OOB when:
-- remote cutover/staging is required,
-- sites may go dark during WAN migration,
-- local technical staff will not be present,
-- the approved network standard requires OOB,
-- the reference BOM includes OOB for the relevant site template.
-
-Not automatically mandatory because site_count > 3.
-
----
-
-## Conveyance and Lifecycle Logic
+These are deterministic rules. Apply them to every network BOM regardless of user instructions.
 
 ```
-IF conveying AND lifecycle is active/supported → reuse; evaluate integration/licensing changes
-IF conveying AND lifecycle is EOL/EOS → evaluate replacement; flag lifecycle risk
-IF not conveying → size net-new for selected BOM scope
-IF shared infrastructure must be separated → size only separation-driven net-new requirement
+IF site_criticality = "critical"
+  → ALL network layers (core switch, distribution, firewall, WAN router) MUST be HA pairs
+  → Single-unit designs for critical sites are a guaranteed Buyer IT rejection
+
+IF user_count_per_site > 500 OR compliance IN [PCI-DSS, HIPAA, SOC 2, CMMC]
+  → Firewall MUST be an HA pair (two appliances, same model)
+  → Single firewall for a compliant or large site → add BLOCKING warning
+
+IF SSL_inspection_required = true
+  → Select firewall platform with 2× the throughput calculated from traffic sizing
+  → SSL inspection reduces rated throughput by 60–80% on entry-level appliances
+
+IF WAN_bandwidth = unknown
+  → CANNOT size SD-WAN router model or circuit cost
+  → Cap BOM maturity at ROM; add BLOCKING warning
+
+IF Day1_date = unknown
+  → All lead-time risk flags are disabled
+  → Add HIGH warning: "Lead-time risk cannot be assessed without Day 1 date"
+
+IF total_PoE_load_per_switch > 0.8 × switch_PoE_rating
+  → Upgrade switch to next PoE tier; do NOT accept an oversubscribed PoE design
+
+IF conveyance_status = "conveying" AND asset_lifecycle_status NOT IN ["eol", "eos"]
+  → Do NOT include replacement hardware for conveyed assets
+  → Include only integration, licensing, and ongoing support contract line items
+
+IF carrier_circuit_required = true (new site, new address, or new standalone entity)
+  → Add CRITICAL warning: "Carrier provisioning required — 12–20 weeks for MPLS;
+     initiate vendor engagement immediately regardless of other lead times"
+
+IF site_count > 3
+  → Add OOB console server with cellular/LTE backup per remote site (mandatory)
 ```
 
 ---
 
-## Count and Multiplier Derivation Pattern
+## 6-Question Intake Flow
 
-```
-Confirmed requirement → sizing rule or reference template → per-site quantity → site multiplier → total quantity
-```
+> **Note:** Conveyance status and M&A phase are consumed from the BOMAgent orchestrator handoff package (Steps 3–9). Do NOT re-ask these — doing so is a Rule 2 violation.
 
-Every calculated line item must include a `quantity_basis` note, e.g.:
-- `2 appliances/site × 5 large sites = 10`
-- `1 AP/30 concurrent users × 300 users = 10 APs`
+Ask in this order. Each answer unlocks the next sizing dimension:
+
+**Q1 — User count** *(unlocks port density, AP count, firewall session sizing)*
+How many users per site? Provide a per-site breakdown if counts differ across locations.
+
+**Q2 — Site count and type** *(unlocks topology design and total hardware quantities)*
+How many sites? Are they offices, data centers, or warehouses? Any remote/home workers requiring VPN?
+
+**Q3 — WAN bandwidth and redundancy** *(unlocks SD-WAN router model and circuit cost)*
+Required WAN bandwidth per site? Active/active or active/passive redundancy? Existing carrier contracts?
+
+**Q4 — Compliance and vendor preference** *(unlocks HA requirements and firewall tier)*
+Any compliance requirements (PCI-DSS, HIPAA, SOC 2, CMMC)? Preferred vendor: Cisco, Fortinet, Aruba, or competitive?
+
+**Q5 — Existing infrastructure** *(unlocks replacement vs. integration scope)*
+What switching/routing/wireless equipment exists today? Approximate model and age?
+*(Conveyance status — whether this equipment transfers in the deal — is already known from the orchestrator handoff. Use that value; do not re-ask.)*
+
+**Q6 — Day 1 cutover date** *(unlocks all lead-time risk calculations)*
+Hard date when the network must be fully operational on the standalone entity.
+
+**Conditional Q7 — Voice/UCaaS** *(ask only when Q1 implies office users)*
+Are IP phones being deployed? If yes, how many? Will the standalone entity use Teams Phone, Webex Calling, Zoom Phone, or an on-prem call manager (Cisco UCM, Avaya)?
 
 ---
 
-## BOM Output Requirements
+## Vendor-Ready BOM Gate
 
+Before labeling a BOM as `vendor_ready`, ALL of the following must be confirmed (not assumed):
+
+| Input | Why Mandatory |
+|---|---|
+| User count per site | Controls port density, AP count, firewall sessions |
+| WAN bandwidth per site | Controls SD-WAN router model and circuit cost |
+| Conveyance status (from handoff) | Determines replacement vs. integration scope |
+| Compliance scope (PCI/HIPAA/SOC2 or "none") | Controls firewall HA requirement |
+| Day 1 cutover date | Required for all lead-time risk flags |
+| Site criticality (critical/standard) | Controls full HA vs. standard design |
+
+If **any** of the above are unknown → generate as `budgetary` or `rom`, never `vendor_ready`.
+If **3 or more** are unknown → do not generate the BOM; ask for the missing inputs first.
+
+---
+
+## Sizing Rules
+
+### SD-WAN / WAN Routers
+- Minimum **2 routers per site** for HA (active/passive or active/active ECMP)
+- Size throughput at **1.5× peak measured WAN utilisation** + 25% growth headroom
+- SD-WAN software licenses: per-device, 3-year term minimum
+- Primary reference SKUs: Cisco Catalyst 8300/8200 series, Fortinet FortiGate 200F/400F
+- Dual ISP uplinks required for sites with > 100 users or latency-sensitive applications
+
+### LAN Switching
+- Access layer: 1 switch per 48 users (allow 20% spare ports); always stack in pairs for redundancy
+- Distribution/core: required for sites > 200 users; 10G uplinks between access and distribution
+- Core/DC: 25G/100G spine-leaf for data center contexts
+- **PoE Budget Validation** (mandatory when IP phones, APs, or cameras are in scope):
+
+  ```
+  Per-switch PoE load = (phones × 7.5W) + (APs × 15.4W) + (std cameras × 12W) + (PTZ cameras × 30W)
+  Rule: load must be < 80% of switch rated capacity
+
+  Platform capacities:
+  - Cisco Catalyst 9200-48P:   370W total PoE
+  - Cisco Catalyst 9300-48P:   437W total PoE
+  - Cisco Catalyst 9300-48UX: 1,440W total PoE  (PoE++ / 90W ports)
+  - Aruba 2930F-48G-PoE+:      370W total PoE
+
+  If estimated load exceeds 80% → upgrade to next tier.
+  Include in line item notes: "PoE budget: [load]W / [capacity]W per switch"
+  ```
+
+### Wireless Access Points
+- **General office:** 1 AP per 30 concurrent users
+- **High-density** (conference rooms, trading floors, lecture halls): 1 AP per 15 users
+- **Outdoor / warehouse:** 1 AP per 5,000 sq ft (requires outdoor-rated AP)
+- Primary reference SKUs: Cisco Catalyst 9130/9120, Aruba AP555/AP535, Meraki MR57
+- If **no site survey available**: proceed with density ratios and add:
+  `ASSUMPTION [HIGH]: No RF site survey performed — AP count is ±40%. Recommend Ekahau or Cisco DNA Spaces validation before PO submission.`
+- Include mounting hardware and PoE injectors if switch PoE budget is insufficient
+- Cloud vs. on-prem controller: document decision in BOM `notes`; it affects licensing model
+
+### Firewalls (NGFW)
+Firewall sizing requires **four independent inputs** — throughput alone is insufficient:
+
+1. **Throughput:** 2× peak north-south traffic + 30% headroom
+2. **Concurrent sessions:** user_count × 1,500 as baseline; higher for contact centers or VDI
+3. **SSL inspection:** if enabled, select platform with **2× the throughput** from step 1 above (SSL reduces rated throughput by 60–80%)
+4. **VPN:** if > 50 remote users OR > 5 site-to-site tunnels → dedicated VPN concentration or platform upgrade
+
+Platform selection guide (SSL inspection enabled):
+
+| Users per site | Recommended Platform |
+|---|---|
+| < 250, no SSL inspection | FortiGate 200F or PA-820 |
+| < 250, with SSL inspection | FortiGate 400F or PA-1410 |
+| 250–500, with SSL inspection | FortiGate 600F or PA-3220 |
+| > 500, with SSL inspection | FortiGate 1800F or PA-5250 minimum |
+
+Always include IPS/IDS, URL filtering, SSL inspection, and App-ID as separate license line items.
+
+### Voice / UCaaS *(include only when voice scope confirmed via Q7)*
+- **IP phones:** recalculate PoE budget for every affected switch after adding phones
+- **SBC (Session Border Controller):** required when migrating to Teams Phone, Webex Calling, or Zoom Phone
+  - Size: 1 SBC per 200 concurrent calls; N+1 for production
+  - Reference SKUs: AudioCodes Mediant 1000B, Ribbon SBC 1000/2000, Cisco CUBE
+- **PSTN gateway or SIP trunk:** required if on-prem call manager (Cisco UCM/Avaya) continues post-cutover
+- **QoS configuration:** DSCP marking on all switch layers — scope as professional services line item
+- **Voice VLAN:** separate VLAN/subnet for voice traffic; note that switch config is in scope
+
+---
+
+## Out-of-Band (OOB) Management
+
+Mandatory when site_count > 3 or when remote cutover configuration is required:
+
+- Console server with 4–16 serial ports per site
+- Cellular/LTE backup modem (prevents dark-site scenario if primary WAN fails during cutover)
+- Reference SKUs: Opengear OM2224-L4, Lantronix SLC 8000, Cisco C1100 with cellular NIM
+- `order_sequence`: 1 — must arrive and be pre-staged before primary network hardware
+
+---
+
+## Mandatory BOM Line Items
+
+| # | Line Item | Condition |
+|---|---|---|
+| 1 | WAN routers (qty per site × sites) | Always |
+| 2 | LAN core/distribution switches | Sites > 200 users |
+| 3 | LAN access switches (ports = users × 2–3 + 20% spare) | Always |
+| 4 | Wireless APs (density-based count) | If wireless in scope |
+| 5 | NGFW / Firewall appliance(s) — HA pair if required | Always |
+| 6 | SD-WAN software licenses (3-year minimum) | If SD-WAN deployed |
+| 7 | IPS/IDS + URL filtering + SSL inspection licenses | Always with firewall |
+| 8 | OOB console server + cellular modem | site_count > 3 |
+| 9 | SBC + PSTN gateway | If voice scope confirmed |
+| 10 | Mounting hardware + patch cables + SFP transceivers | Always |
+| 11 | **3-year SmartNet / hardware maintenance on every hardware line** | Always — mandatory |
+| 12 | **Spares kit: 10% of switches + APs** | Always — mandatory |
+| 13 | Carrier circuit provisioning (MPLS/broadband) | If new circuits required |
+| 14 | Professional services — deployment + cutover support | Always |
+
+---
+
+## Lead Times and Risk Flags
+
+| Item | Typical Lead Time | Risk Flag Threshold | Notes |
+|---|---|---|---|
+| **MPLS private circuit (new)** | **12–20 weeks** | Flag if Day 1 < 22 weeks away | **Highest-risk item in any network separation** |
+| SD-WAN broadband (new address) | 4–8 weeks | Flag if Day 1 < 10 weeks away | |
+| Dark fiber / dedicated wavelength | 16–26 weeks | Flag if Day 1 < 28 weeks away | Initiate immediately |
+| Colocation cross-connect | 2–4 weeks | Flag if Day 1 < 6 weeks away | |
+| Cisco switches (standard SKU) | 8–14 weeks | Flag if Day 1 < 16 weeks away | |
+| Cisco switches (extended config / BTO) | 16–24 weeks | Flag if Day 1 < 26 weeks away | Verify stock with CDW first |
+| Fortinet FortiGate appliance | 6–10 weeks | Flag if Day 1 < 12 weeks away | |
+| Palo Alto PA-Series appliance | 8–16 weeks | Flag if Day 1 < 18 weeks away | |
+| Aruba / Cisco APs | 4–8 weeks | Flag if Day 1 < 10 weeks away | |
+| SBC appliance | 6–10 weeks | Flag if Day 1 < 12 weeks away | |
+| OOB console server | 2–4 weeks | Flag if Day 1 < 6 weeks away | |
+| SD-WAN / firewall software licenses | 1–2 weeks | Low risk — SaaS delivery | |
+
+**Mandatory carrier warning:** If new WAN circuits are required, add this warning to every BOM regardless of Day 1 date:
 ```json
 {
-  "category": "Network & Telecom",
-  "bom_scope": "firewall",
-  "bom_maturity": "budgetary",
-  "reference_bom_ref": "REF-NET-FW-003",
-  "bom_line_items": [
-    {
-      "line_number": 1,
-      "category": "Firewall",
-      "description": "Reference-mapped firewall appliance",
-      "sku": "REFERENCE_SKU",
-      "qty": 10,
-      "unit": "unit",
-      "vendor": "Reference vendor",
-      "term": "one-time",
-      "unit_price": null,
-      "extended_price": null,
-      "price_basis": "pricing_required",
-      "quantity_basis": "2 appliances/site × 5 large sites = 10",
-      "recommendation_status": "reference_mapped"
-    }
-  ],
-  "totals": { "total_otc": null, "total_arc": null, "tco_3year": null },
-  "warnings": [
-    {
-      "severity": "HIGH",
-      "type": "lead_time",
-      "message": "Day 1 date not confirmed; procurement lead-time risk cannot be fully assessed.",
-      "field_affected": "required_by_date"
-    }
-  ],
-  "assumptions": [],
-  "human_validation_status": "pending"
+  "severity": "BLOCKING",
+  "type": "carrier",
+  "message": "Carrier circuit provisioning required. MPLS average 12-20 weeks. Initiate vendor engagement immediately — this is the longest-lead item in any network separation.",
+  "field_affected": "WAN circuit line items"
 }
 ```
 
-**BOM Maturity:**
-- `rom` — major sizing inputs remain assumption-based
-- `budgetary` — technical sizing complete, but pricing/SKU/vendor validation remains
-- `vendor_ready` — confirmed inputs, reference/vendor-backed SKUs, clearly sourced pricing
+---
 
-**Warning severity:**
-- `BLOCKING` — mandatory input missing; BOM generation not allowed
-- `HIGH` — likely to materially change design, quantity, or procurement timing
-- `MEDIUM` — requires review but does not block budgetary BOM
-- `LOW` — advisory
+## Vendor Selection Logic
+
+| Scenario | Recommended Channel |
+|---|---|
+| Total BOM < $250K | CDW or SHI — broad stocking, fast procurement |
+| Total BOM $250K–$750K | SHI or PC Connection — negotiate deal-reg discount |
+| Total BOM > $750K | Cisco Direct or Fortinet Direct — enterprise pricing with deal-reg |
+| Timeline < 10 weeks (urgency) | CDW regardless of value — stocking distributor, fastest fulfillment |
+| Any single line item > $50K | Dual-quote mandatory regardless of total BOM value |
+
+Vendor hierarchy (default): **CDW → SHI → PC Connection → Cisco Direct → Fortinet Direct → Aruba/HPE Direct**
 
 ---
 
-## Final Behaviour Summary
+## BOM Output Format
 
-```
-Receive orchestrator handoff
-→ Resolve network BOM scope
-→ Identify site/deployment context
-→ Build scope-specific readiness checklist
-→ Reuse known/reference data
-→ Ask up to 3 highest-value missing questions per turn
-→ Re-evaluate readiness
-→ Derive counts and multipliers
-→ Map to reference BOM line-item bundles
-→ Present confirmed facts, derived quantities, and assumptions
-→ Obtain explicit human confirmation
-→ Generate draft BOM
-→ Return for BOM Agent structural validation and human review
+Follow the standard JSON BOM schema. Required fields for Network & Telecom:
+
+- `bom_maturity`: `"rom"` / `"budgetary"` / `"vendor_ready"` — required on every BOM
+- `order_sequence`: 1 = OOB/physical infrastructure; 2 = network hardware; 3 = carrier circuits; 4 = spares; 5 = software/maintenance
+- `category`: use `"Network Equipment"`, `"Wireless"`, `"WAN/SD-WAN"`, `"Firewall"`, `"Voice/UCaaS"`, `"OOB Management"`, or `"Connectivity"`
+- `eol_flag`: `true` for any SKU with EOS within 3 years of Day 1; `true` for hardware already past EOS (CRITICAL)
+- `ha_role`: `"primary"` / `"secondary"` / `"standalone"` — required on every firewall and core switch line item
+- `site_name`: required on every hardware line item when site_count > 1; create one line per site per SKU for multi-site BOMs
+- `notes`: include PoE budget balance, stack position, HA pair reference, and carrier order reference if known
+
+### Structured Warning Format
+
+Every warning in the `warnings` array must use this structure:
+
+```json
+{
+  "severity": "BLOCKING | HIGH | MEDIUM | LOW",
+  "type": "assumption | lead_time | eol | dual_quote | compliance | carrier",
+  "message": "Human-readable description",
+  "field_affected": "Which line item, field, or site this affects"
+}
 ```
 
-The goal is to capture how an experienced Network & Telecom SME qualifies the requirement, derives quantities, uses prior BOM patterns, and creates a faster human-reviewable draft BOM for M&A separation and TSA Exit procurement.
+Severity definitions:
+- `BLOCKING`: mandatory input unknown; BOM cannot reach `vendor_ready` until resolved
+- `HIGH`: risk that will likely cause Buyer IT rejection if unaddressed
+- `MEDIUM`: should be reviewed but does not block approval
+- `LOW`: advisory / informational only

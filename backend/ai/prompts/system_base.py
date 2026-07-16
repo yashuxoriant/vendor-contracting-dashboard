@@ -14,14 +14,18 @@ RESPONSE FORMAT RULES — FOLLOW EXACTLY
 2. Ask MAXIMUM 3 questions per response. Number them clearly (1. 2. 3.)
 3. When the user says "create BOM", "generate", "build it", "skip questions", "just create it",
    or similar — IMMEDIATELY generate the full BOM JSON without asking any more questions.
+   EXCEPTION: if a Specialist Skill is active, the skill's readiness gate rules take precedence —
+   the skill may require additional qualification inputs before BOM generation is allowed.
 4. After you have asked Phase 1 questions and the user has answered, ADVANCE — do not repeat.
-5. If the user has answered 1 or more rounds of questions, generate the BOM immediately.
+5. Default flow (no specialist skill): generate the BOM after the user has answered 1+ rounds.
+   Specialist skill active: follow the skill's multi-stage qualification sequence instead.
 6. DO NOT produce filler phrases like "Great question!" or "Certainly!" — be direct and professional.
 7. Use **bold** for key terms. Use numbered lists for steps. Use bullet points for options.
 8. In conversational mode: 1–3 sentences acknowledgement + up to 3 numbered questions.
 9. In BOM generation mode: emit the JSON block FIRST, then a 4–6 sentence plain-English summary.
-10. NEVER say "I cannot" or "I am unable" — if you lack a detail, make a reasonable industry-standard
-    assumption, note it in the BOM's "notes" field, and proceed.
+10. NEVER say "I cannot" or "I am unable". If a Specialist Skill is active, surface missing inputs
+    via open_questions. Otherwise make a reasonable industry-standard assumption, note it in the
+    BOM's "notes" field, and proceed.
 11. Always tie lead-time warnings back to the Day 1 cutover date when it is known.
 12. Format currency as $X,XXX,XXX (commas, no decimals for integers > $1K).
 
@@ -264,9 +268,13 @@ import pathlib as _pathlib
 # Map category names → skill file names in backend/ai/skills/
 _SKILL_MAP: dict = {
     "Network & Telecom": "Skill_Network_Telecom.md",
-    "SD-WAN": "Skill_Network_Telecom.md",
+    "SD-WAN":            "Skill_Network_Telecom.md",
     "Network Equipment": "Skill_Network_Telecom.md",
-    "WAN/SD-WAN": "Skill_Network_Telecom.md",
+    "WAN/SD-WAN":        "Skill_Network_Telecom.md",
+    "LAN":               "Skill_Network_Telecom.md",
+    "Wireless/WLAN":     "Skill_Network_Telecom.md",
+    "Firewall":          "Skill_Network_Telecom.md",
+    "Voice/UCaaS":       "Skill_Network_Telecom.md",
 }
 
 _SKILLS_DIR = _pathlib.Path(__file__).parent.parent / "skills"
@@ -285,10 +293,25 @@ def _load_skill(category: str) -> str:
 
 
 def get_system_prompt(category: str = "") -> str:
-    """Return the full system prompt, optionally appending a category-specific hint or full skill file."""
+    """Return the full system prompt with skill file appended when available.
+
+    When a Specialist Skill is present its rules override the default SYSTEM_BASE
+    interaction rules (e.g. multi-stage qualification replaces the 1-round BOM trigger).
+    A clear precedence notice is injected so the LLM follows the skill, not SYSTEM_BASE rule 5.
+    """
     skill_content = _load_skill(category)
     if skill_content:
-        return SYSTEM_BASE + f"\n\n{'━'*64}\nSPECIALIST SKILL — {category.upper()}\n{'━'*64}\n{skill_content}"
+        return (
+            SYSTEM_BASE
+            + f"\n\n{'━'*64}\n"
+            f"SPECIALIST SKILL ACTIVE — {category.upper()}\n"
+            f"{'━'*64}\n"
+            f"The following Specialist Skill rules OVERRIDE SYSTEM_BASE rules 3, 5, and 10 "
+            f"for this category. Follow the skill's qualification sequence, readiness gates, "
+            f"open_questions format, and BOM generation trigger exactly as specified.\n"
+            f"{'━'*64}\n"
+            + skill_content
+        )
     hint = CATEGORY_HINTS.get(category, "")
     if hint:
         return SYSTEM_BASE + f"\n\nCATEGORY FOCUS — {category}:\n{hint}"
