@@ -1,0 +1,109 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyc
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-link
+.installed.cfg
+MANIFEST
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env.bak
+*.env.local
+
+# ── Environment / Secrets ────────────────────────────────────────────────────
+# .env is tracked ONLY as .env.example — never commit real credentials
+.env
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+secrets/
+credentials/
+
+# ── Node / Frontend ───────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp
+.pnp.js
+frontend/dist/
+frontend/.vite/
+dist/
+.cache/
+*.tsbuildinfo
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/settings.json
+.vscode/launch.json
+.vscode/*.code-workspace
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Testing ──────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.tox/
+.nox/
+nosetests.xml
+test-results/
+junit*.xml
+
+# ── Logs & Runtime ───────────────────────────────────────────────────────────
+*.log
+logs/
+*.pid
+*.seed
+*.pid.lock
+
+# ── Local storage (dev mock data — not for prod) ─────────────────────────────
+backend/local_storage/chat-history/*.json
+backend/local_storage/processed-boms/*.json
+backend/local_storage/raw-boms/*
+backend/local_storage/exports/*
+
+# ── Uploads / temp ───────────────────────────────────────────────────────────
+uploads/
+tmp/
+temp/
+*.tmp
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+desktop.ini
