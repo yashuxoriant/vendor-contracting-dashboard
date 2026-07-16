@@ -67,30 +67,44 @@ export const chatApi = {
    * Usage:
    *   for await (const frame of chatApi.streamMessage(sid, text)) { ... }
    * Each frame: { token, done, complete?, progress?, bom?, suggestions? }
+   * Aborts with an error if no data arrives within 45 seconds (prevents infinite hang).
    */
   streamMessage: async function* (sessionId, message, userId = 'demo_user') {
     const base = import.meta.env.VITE_API_URL || ''
     const token = localStorage.getItem('token')
-    const resp = await fetch(`${base}/api/bom/stream`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-      body: JSON.stringify({ session_id: sessionId, message, user_id: userId }),
-    })
-    if (!resp.ok) throw new Error(`Stream failed: ${resp.status}`)
-    const reader = resp.body.getReader()
-    const decoder = new TextDecoder()
-    let buf = ''
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() // keep incomplete line
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try { yield JSON.parse(line.slice(6)) } catch (_) {}
+    const controller = new AbortController()
+    // 45-second hard timeout — resets on each chunk received
+    let timeoutId = setTimeout(() => controller.abort(), 45000)
+    const resetTimeout = () => {
+      clearTimeout(timeoutId)
+      timeoutId = setTimeout(() => controller.abort(), 45000)
+    }
+    try {
+      const resp = await fetch(`${base}/api/bom/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ session_id: sessionId, message, user_id: userId }),
+        signal: controller.signal,
+      })
+      if (!resp.ok) throw new Error(`Stream failed: ${resp.status}`)
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        resetTimeout()
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop() // keep incomplete line
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try { yield JSON.parse(line.slice(6)) } catch (_) {}
+          }
         }
       }
+    } finally {
+      clearTimeout(timeoutId)
     }
   },
 }

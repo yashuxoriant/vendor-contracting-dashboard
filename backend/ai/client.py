@@ -6,11 +6,49 @@ Priority order:
   3. Azure OpenAI (standard GPT)      — if USE_AZURE_OPENAI=true
   4. Direct OpenAI API                — if OPENAI_API_KEY set
   5. Rule-based fallback              — when no credentials available
+
+DNS reachability is checked before building clients (cached 5 min) so a dead
+endpoint does not add a 10-second connection timeout to every user message.
 """
 import logging
+import socket
+import time
 from typing import List, Dict, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
+
+# ── DNS reachability cache ────────────────────────────────────────────────────
+# Maps hostname → (reachable: bool, checked_at: float)
+# Re-checks after DNS_CACHE_TTL seconds so a VPN reconnect is picked up.
+_DNS_CACHE: Dict[str, Tuple[bool, float]] = {}
+_DNS_CACHE_TTL = 300  # 5 minutes
+
+
+def _is_host_reachable(url: str) -> bool:
+    """
+    Return True if the hostname in *url* resolves in DNS.
+    Uses a short-lived in-process cache to avoid blocking every request.
+    """
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or url
+    except Exception:
+        host = url
+
+    cached = _DNS_CACHE.get(host)
+    if cached is not None:
+        reachable, ts = cached
+        if time.monotonic() - ts < _DNS_CACHE_TTL:
+            return reachable
+
+    try:
+        socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        _DNS_CACHE[host] = (True, time.monotonic())
+        return True
+    except OSError:
+        _DNS_CACHE[host] = (False, time.monotonic())
+        logger.warning("AI provider unreachable (DNS failed): %s — skipping", host)
+        return False
 
 # ── Provider type tag passed alongside client so call_ai knows how to invoke ──
 # "anthropic" → client.messages.create(system=..., messages=...)
@@ -29,7 +67,9 @@ def get_ai_client() -> _ClientPair:
     # ── 1. Azure AI Foundry Anthropic proxy ──────────────────────────────────
     endpoint = settings.azure_openai_chat_endpoint
     api_key  = settings.azure_openai_api_key
-    if endpoint and "services.ai.azure.com" in endpoint and api_key and "dummy" not in api_key:
+    if (endpoint and "services.ai.azure.com" in endpoint
+            and api_key and "dummy" not in api_key
+            and _is_host_reachable(endpoint)):
         try:
             import anthropic
             client = anthropic.Anthropic(

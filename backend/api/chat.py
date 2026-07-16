@@ -11,6 +11,8 @@ import logging
 import uuid
 import json
 import re
+import asyncio
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,58 @@ from config import get_settings
 
 router = APIRouter(prefix="/api/bom", tags=["chat"])
 settings = get_settings()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-session asyncio locks — prevent concurrent writes to the same session.
+# Key: session_id → asyncio.Lock
+# Without this: two concurrent requests load the same session state and the
+# second write silently overwrites the first (last-writer-wins race condition).
+# ─────────────────────────────────────────────────────────────────────────────
+_SESSION_LOCKS: Dict[str, asyncio.Lock] = {}
+
+def _get_session_lock(session_id: str) -> asyncio.Lock:
+    if session_id not in _SESSION_LOCKS:
+        _SESSION_LOCKS[session_id] = asyncio.Lock()
+    return _SESSION_LOCKS[session_id]
+
+
+def _msg_fingerprint(role: str, content: str) -> str:
+    """SHA-256 fingerprint of (role, first 200 chars) for deduplication."""
+    key = f"{role}:{content[:200]}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _dedup_conversation(conversation: List[ChatMessage]) -> List[ChatMessage]:
+    """Remove back-to-back duplicate messages (same role + same content prefix)."""
+    seen = set()
+    result = []
+    for msg in conversation:
+        fp = _msg_fingerprint(msg.role, msg.content)
+        if fp not in seen:
+            seen.add(fp)
+            result.append(msg)
+    return result
+
+
+def _append_user_message_if_new(
+    conversation: List[ChatMessage],
+    content: str,
+) -> bool:
+    """
+    Append a user message ONLY if it is not a duplicate of the last user message.
+    Returns True if the message was appended, False if skipped (duplicate).
+
+    Real-world scenario: streaming client disconnects mid-stream; on retry the
+    same user message would be appended again, creating a duplicate.
+    """
+    fp = _msg_fingerprint("user", content)
+    # Check last few messages for duplicates (not just the very last)
+    for msg in reversed(conversation[-4:]):
+        if msg.role == "user" and _msg_fingerprint("user", msg.content) == fp:
+            logger.debug("Skipped duplicate user message (fingerprint=%s)", fp)
+            return False
+    conversation.append(ChatMessage(role="user", content=content))
+    return True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10-PHASE BOM SYSTEM PROMPT
@@ -378,55 +432,52 @@ async def start_session(request: StartSessionRequest):
 
 
 @router.post("/chat", response_model=ChatMessageResponse)
-async def send_message(request: ChatMessageRequest):
+async def send_message(request: ChatMessageRequest, background_tasks: BackgroundTasks):
     """Send a message in an active BOM creation session."""
     cosmos_client = get_cosmos_client()
-    session_data = cosmos_client.get_session(request.session_id)
-    if not session_data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
-    try:
-        session = ChatSession.model_validate(session_data)
-    except Exception as exc:
-        logger.error("Session hydration failed: %s", exc)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Session data corrupt")
-    session.conversation.append(ChatMessage(role="user", content=request.message))
+    async with _get_session_lock(request.session_id):
+        session_data = cosmos_client.get_session(request.session_id)
+        if not session_data:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
-    response_text, partial_bom, progress, complete = await _process_message(session, request.message)
+        try:
+            session = ChatSession.model_validate(session_data)
+        except Exception as exc:
+            logger.error("Session hydration failed: %s", exc)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Session data corrupt")
 
-    session.conversation.append(ChatMessage(role="assistant", content=response_text))
-    session.context.progress_percentage = float(progress)
-    session.updated_at = datetime.utcnow()
-    if complete:
-        session.status = "completed"
-        session.completed_at = datetime.utcnow()
-        if partial_bom:
-            _save_bom_to_cosmos(cosmos_client, partial_bom, session, request.user_id or "demo_user")
+        appended = _append_user_message_if_new(session.conversation, request.message)
+        if not appended:
+            logger.info("Duplicate user message detected for session %s — skipped", request.session_id)
 
-    cosmos_client.update_session(request.session_id, session.model_dump(mode="json"))
+        response_text, partial_bom, progress, complete = await _process_message(session, request.message)
 
-    # Archive to ADLS via background task (non-blocking)
-    background_tasks = BackgroundTasks()
+        session.conversation.append(ChatMessage(role="assistant", content=response_text))
+        session.conversation = _dedup_conversation(session.conversation)
+        session.context.progress_percentage = float(progress)
+        session.updated_at = datetime.utcnow()
+        if complete:
+            session.status = "completed"
+            session.completed_at = datetime.utcnow()
+            if partial_bom:
+                _save_bom_to_cosmos(cosmos_client, partial_bom, session, request.user_id or "demo_user")
+
+        cosmos_client.update_session(request.session_id, session.model_dump(mode="json"))
+
+    # Archive to ADLS outside the lock (non-blocking)
     background_tasks.add_task(_archive_session_to_adls, session, request.user_id or "demo_user")
 
-    try:
-        from api.audit import log_action
-        log_action(
-            user_id=request.user_id,
-            action="chat_message",
-            resource_type="session",
-            resource_id=request.session_id,
-            details={"progress": progress, "complete": complete, "has_bom": partial_bom is not None},
-        )
-    except Exception:
-        pass
+    _emit_audit_event(
+        user_id=request.user_id or "demo_user",
+        action="chat_message",
+        session_id=request.session_id,
+        details={"progress": progress, "complete": complete, "has_bom": partial_bom is not None},
+    )
 
-    # Generate contextual follow-up suggestions (best-effort)
     suggestions = _generate_suggestions(
         response_text, session.context.category, partial_bom, complete
     )
-
-    # Auto-generate session title from first user message
     session_title = _session_title(session)
 
     return ChatMessageResponse(
@@ -461,149 +512,216 @@ _ATTACH_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 # SSE Streaming Chat  POST /api/bom/stream
 # ─────────────────────────────────────────────────────────────────────────────
 
-import asyncio as _asyncio
-import json as _j
 import re as _r
 from fastapi.responses import StreamingResponse
 
 
 @router.post("/stream")
-async def stream_message(request: ChatMessageRequest):
+async def stream_message(request: ChatMessageRequest, background_tasks: BackgroundTasks):
     """
     Server-Sent Events streaming chat endpoint.
 
-    Uses the full BOMOrchestrator pipeline (RAG retrieval + phase state machine +
-    skill-file system prompt) for streaming, identical to /chat but token-by-token.
+    Fix history:
+    - Session lock prevents concurrent writes (race condition fix)
+    - User message written to Cosmos ATOMICALLY before streaming begins
+      → on client disconnect, session is still consistent
+    - Deduplication prevents duplicate user messages on retry
+    - Fallback to rule-based uses the new orchestrator state machine
 
     SSE frame format:
         data: {"token": "<text>", "done": false}   (per chunk)
         data: {"token": "", "done": true, "complete": bool, "progress": int, "bom": <obj|null>}
     """
     cosmos_client = get_cosmos_client()
-    session_data = cosmos_client.get_session(request.session_id)
-    if not session_data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
-    # Use model_validate for proper alias handling
-    try:
-        session = ChatSession.model_validate(session_data)
-    except Exception as exc:
-        logger.error("Session hydration failed in stream: %s", exc)
-        raise HTTPException(status_code=500, detail="Session data corrupt")
+    # ── PHASE 1: Atomic user-message write (inside lock) ──────────────────
+    # This runs BEFORE the stream generator starts. If the client disconnects
+    # mid-stream, the user message is already persisted correctly.
+    session: ChatSession
+    session_dict_for_ai: dict
+    messages_for_ai: list
+    system_prompt: str
 
-    session.conversation.append(ChatMessage(role="user", content=request.message))
+    lock = _get_session_lock(request.session_id)
+    async with lock:
+        session_data = cosmos_client.get_session(request.session_id)
+        if not session_data:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        try:
+            session = ChatSession.model_validate(session_data)
+        except Exception as exc:
+            logger.error("Session hydration failed in stream: %s", exc)
+            raise HTTPException(status_code=500, detail="Session data corrupt")
 
-    # ── Build full orchestrator system prompt (skill file + RAG + session) ─
-    from ai.agents.orchestrator import BOMOrchestrator, _retrieve_bom_context
+        # Dedup: skip if this exact user message was already appended (retry case)
+        appended = _append_user_message_if_new(session.conversation, request.message)
+        if appended:
+            # Save user message immediately — consistent even if stream is interrupted
+            session.updated_at = datetime.utcnow()
+            cosmos_client.update_session(request.session_id, session.model_dump(mode="json"))
+            logger.debug("User message committed to Cosmos before stream (session=%s)", request.session_id)
+
+    # ── PHASE 2: Build AI context (outside lock — read-only) ──────────────
+    from ai.agents.orchestrator import BOMOrchestrator, _retrieve_bom_context, _phase_addendum, BOMPhase, _PHASE_ORDER, _PHASE_PROGRESS, _extract_fields_from_message, _detect_phase_transition
     from ai.prompts.system_base import get_system_prompt
 
     orch = BOMOrchestrator()
-    session_dict = session.model_dump(mode="json")
-    context = session_dict.get("context", {})
+    session_dict_for_ai = session.model_dump(mode="json")
+    context = session_dict_for_ai.get("context", {})
     category = context.get("category") or "Data Center / COLO"
-    phase = context.get("current_phase", 1)
-    phase_data = context.get("phase_data", {})
-    requirements = context.get("requirements", {})
+    agent_state = context.get("agent_state", {})
+    phase_str = context.get("current_phase_name", BOMPhase.INTAKE.value)
+    try:
+        current_phase = BOMPhase(phase_str)
+    except ValueError:
+        current_phase = BOMPhase.INTAKE
 
-    # get_system_prompt loads the skill Markdown file when available
+    requirements = context.get("requirements", {})
+    project = requirements.get("project", "New Project")
+
+    # Extract fields deterministically from user message
+    agent_state = _extract_fields_from_message(request.message, agent_state)
+    if category and not agent_state.get("workstream_category"):
+        agent_state["workstream_category"] = category
+
     base_prompt = get_system_prompt(category)
     bom_id = context.get("bom_id")
-    bom_context = _retrieve_bom_context(request.message, bom_id=bom_id)
+    bom_rag = _retrieve_bom_context(request.message, bom_id=bom_id)
 
     system_prompt = (
         base_prompt
-        + f"\n\n{'═'*60}\nCURRENT SESSION\n{'═'*60}\n"
-        + f"Category: {category}\n"
-        + f"Project: {requirements.get('project', 'New Project')}\n"
-        + f"Current Phase: {phase}/10\n"
-        + f"Phase data collected: {json.dumps(phase_data, default=str)}\n"
-        + f"Requirements: {json.dumps(requirements, default=str)}\n"
-        + bom_context
+        + "\n\n" + "=" * 60 + "\nACTIVE SESSION\n" + "=" * 60
+        + f"\nProject: {project}"
+        + f"\nCategory: {category}"
+        + f"\nPhase: {current_phase.value.upper()}"
+        + f"\nAgent State: {json.dumps(agent_state, default=str)}"
+        + _phase_addendum(current_phase, agent_state)
+        + bom_rag
     )
 
-    # Last 14 messages — normalise roles and enforce user/assistant alternation
-    raw_conv = session.conversation[-14:]
-    messages = []
+    # Build conversation history — strict user/assistant alternation, deduped
+    raw_conv = session.conversation[-16:]
+    messages_for_ai = []
     for m in raw_conv:
-        role = m.role if m.role != "ai" else "assistant"
+        role = m.role if m.role not in ("ai", "AI") else "assistant"
         if role not in ("user", "assistant"):
             continue
         content = (m.content or "").strip()
         if not content:
             continue
-        if messages and messages[-1]["role"] == role:
+        if messages_for_ai and messages_for_ai[-1]["role"] == role:
             if role == "assistant":
-                messages[-1]["content"] += "\n" + content
-            continue
-        messages.append({"role": role, "content": content})
-    while messages and messages[0]["role"] == "assistant":
-        messages.pop(0)
+                messages_for_ai[-1]["content"] += "\n" + content
+            continue  # skip duplicate user messages
+        messages_for_ai.append({"role": role, "content": content})
+    while messages_for_ai and messages_for_ai[0]["role"] == "assistant":
+        messages_for_ai.pop(0)
 
+    # ── PHASE 3: Stream generator (stateless from here) ───────────────────
     async def event_stream():
         from ai.client import stream_ai, call_ai
+        import asyncio
         full_text = ""
         had_content = False
-        gen = stream_ai(messages, system_prompt)
+        gen = stream_ai(messages_for_ai, system_prompt)
 
         if gen is not None:
-            for chunk in gen:
+            # Run synchronous Anthropic streaming in a thread pool so the
+            # asyncio event loop is not blocked between chunks.
+            loop = asyncio.get_event_loop()
+            sentinel = object()
+            while True:
+                try:
+                    chunk = await loop.run_in_executor(None, next, gen, sentinel)
+                except StopIteration:
+                    break
+                if chunk is sentinel:
+                    break
                 if chunk == "__STREAM_ERROR__":
+                    logger.warning("Stream error signal for session %s", request.session_id)
                     break
                 had_content = True
                 full_text += chunk
                 yield "data: " + json.dumps({"token": chunk, "done": False}) + "\n\n"
 
-        # Fallback: non-streaming call (same orchestrator system prompt)
+        # Fallback: non-streaming call
         if not had_content:
-            result = call_ai(messages, system_prompt)
+            result = call_ai(messages_for_ai, system_prompt)
             if result:
                 full_text = result
                 had_content = True
                 yield "data: " + json.dumps({"token": result, "done": False}) + "\n\n"
 
-        # Ultimate fallback: rule-based
+        # Rule-based fallback
         if not had_content:
             user_turns = sum(1 for m in session.conversation if m.role == "user")
-            full_text = orch._rule_based(category, phase, request.message, user_turns)
+            full_text = orch._rule_based(category, current_phase, request.message, agent_state, user_turns)
             yield "data: " + json.dumps({"token": full_text, "done": False}) + "\n\n"
 
-        # ── Post-stream: parse BOM + advance phase ─────────────────────────
-        bom_data, complete = orch._extract_bom(full_text)
+        # ── Post-stream: extract BOM, advance phase ────────────────────────
+        bom_data, bom_found = orch._extract_bom(full_text)
 
-        # Strip raw JSON block from displayed text if BOM was extracted
         display_text = full_text
         if bom_data:
             display_text = _r.sub(r"```json[\s\S]*?```", "", full_text).strip()
             if not display_text:
-                display_text = "BOM generated. See the panel on the right for all line items."
+                n = len(bom_data.get("line_items", []))
+                display_text = f"BOM generated: **{n} line items** — see the panel on the right."
 
-        new_phase = orch._detect_phase_advance(full_text, phase, request.message)
-        context["current_phase"] = new_phase
-        progress = orch._phase_to_progress(new_phase, complete)
+        # Phase transition
+        new_phase = _detect_phase_transition(full_text, current_phase, agent_state, bom_found)
+        new_phase_num = _PHASE_ORDER.index(new_phase) + 1
+        progress = _PHASE_PROGRESS.get(new_phase, 10)
+        complete = bom_found and new_phase.value in ("validate", "complete")
 
         suggestions = _generate_suggestions(display_text, category, bom_data, complete)
+        session_title = _session_title(session)
 
         yield "data: " + json.dumps({
             "token": "", "done": True,
-            "complete": complete, "progress": progress,
+            "complete": complete,
+            "progress": progress,
             "bom": bom_data,
             "suggestions": suggestions,
+            "session_title": session_title,
         }) + "\n\n"
 
-        # ── Persist to Cosmos ──────────────────────────────────────────────
-        session.conversation.append(ChatMessage(role="assistant", content=display_text))
-        session.context.progress_percentage = float(progress)
-        session.context.current_phase = new_phase
-        session.updated_at = datetime.utcnow()
-        if complete:
-            session.status = "completed"
-            session.completed_at = datetime.utcnow()
-            # Save standalone BOM to boms container if complete
-            if bom_data:
-                _save_bom_to_cosmos(cosmos_client, bom_data, session, request.user_id or "demo_user")
+        # ── PHASE 4: Persist assistant message + state (inside lock) ──────
+        async with _get_session_lock(request.session_id):
+            # Re-load to get latest state (user message was already persisted in Phase 1)
+            latest_data = cosmos_client.get_session(request.session_id)
+            if latest_data:
+                try:
+                    latest_session = ChatSession.model_validate(latest_data)
+                except Exception:
+                    latest_session = session
+            else:
+                latest_session = session
 
-        cosmos_client.update_session(request.session_id, session.model_dump(mode="json"))
-        _archive_session_to_adls(session, request.user_id or "demo_user")
+            latest_session.conversation.append(ChatMessage(role="assistant", content=display_text))
+            latest_session.conversation = _dedup_conversation(latest_session.conversation)
+            latest_session.context.progress_percentage = float(progress)
+            latest_session.context.current_phase = new_phase_num
+            latest_session.context.current_phase_name = new_phase.value  # type: ignore[attr-defined]
+            latest_session.context.agent_state = agent_state  # type: ignore[attr-defined]
+            latest_session.updated_at = datetime.utcnow()
+
+            if complete:
+                latest_session.status = "completed"
+                latest_session.completed_at = datetime.utcnow()
+                if bom_data:
+                    _save_bom_to_cosmos(cosmos_client, bom_data, latest_session, request.user_id or "demo_user")
+
+            cosmos_client.update_session(request.session_id, latest_session.model_dump(mode="json"))
+
+        background_tasks.add_task(_archive_session_to_adls, latest_session, request.user_id or "demo_user")
+        _emit_audit_event(
+            user_id=request.user_id or "demo_user",
+            action="stream_message",
+            session_id=request.session_id,
+            details={"phase": new_phase.value, "progress": progress, "complete": complete, "bom_items": len(bom_data.get("line_items", []) if bom_data else [])},
+        )
+        logger.info("Stream complete: session=%s phase=%s progress=%d complete=%s", request.session_id, new_phase.value, progress, complete)
 
     return StreamingResponse(
         event_stream(),
@@ -804,10 +922,15 @@ async def get_session_messages(session_id: str):
             "role": msg.role,
             "content": msg.content,
         })
+    project = (
+        ctx.requirements.get("project")
+        or (ctx.phase_data or {}).get("project_name")
+        or (ctx.phase_data or {}).get("project")
+    )
     return {
         "session_id": session_id,
         "category": ctx.category,
-        "project": ctx.project_name,
+        "project": project,
         "status": session.status,
         "progress": int(ctx.progress_percentage),
         "messages": messages,
@@ -857,6 +980,16 @@ async def list_chat_history(user_id: str = "demo_user", limit: int = 30):
                 raw = (msg.get("content") or "").strip()
                 last_message = raw[:80].rstrip(",. ") + ("\u2026" if len(raw) > 80 else "")
                 break
+        project = ctx.get("requirements", {}).get("project") or ctx.get("project_name")
+        category_label = ctx.get("category")
+        # Fallback title: first user message or project+category
+        if not title:
+            if project and category_label:
+                title = f"{project} — {category_label}"
+            elif project:
+                title = project
+            elif category_label:
+                title = category_label
         result.append(SessionSummary(
             session_id=s.get("session_id") or s.get("_id") or "",
             user_id=s.get("user_id"),
@@ -864,8 +997,8 @@ async def list_chat_history(user_id: str = "demo_user", limit: int = 30):
             created_at=s.get("created_at"),
             updated_at=s.get("updated_at"),
             message_count=s.get("message_count", 0),
-            category=ctx.get("category"),
-            project=ctx.get("requirements", {}).get("project") or ctx.get("project_name"),
+            category=category_label,
+            project=project,
             progress=int(ctx.get("progress_percentage", 0)),
             title=title,
             last_message=last_message,
@@ -933,6 +1066,21 @@ def _save_bom_to_cosmos(cosmos_client, bom_data: dict, session: ChatSession, use
         logger.info("Saved BOM %s to Cosmos (session=%s)", bom_id, session.session_id)
     except Exception as exc:
         logger.warning("_save_bom_to_cosmos failed (non-fatal): %s", exc)
+
+
+def _emit_audit_event(user_id: str, action: str, session_id: str, details: dict = None):
+    """Write a structured audit log entry.  Best-effort — never raises."""
+    try:
+        from api.audit import log_action
+        log_action(
+            user_id=user_id,
+            action=action,
+            resource_type="session",
+            resource_id=session_id,
+            details=details or {},
+        )
+    except Exception as exc:
+        logger.debug("Audit log skipped (non-fatal): %s", exc)
 
 
 def _archive_session_to_adls(session: ChatSession, user_id: str):
@@ -1170,11 +1318,10 @@ async def _rule_based_fallback(session: ChatSession, message: str) -> tuple:
         return q, None, progress, False
     bom = _generate_fallback_bom(category, session.context.requirements)
     summary = (
-        f"Based on your inputs, here is a **{category}** BOM draft with "
-        f"**{len(bom['line_items'])} line items** totalling "
-        f"**${bom['totals']['total_otc']:,.0f}** OTC.\n\n"
-        "Note: This is a rule-based template estimate. "
-        "Connect Azure OpenAI credentials for AI-powered precision sizing."
+        f"Based on your inputs, here is a **{category}** BOM for "
+        f"**{bom.get('project', 'your project')}**.\n\n"
+        f"**{len(bom['line_items'])} line items** — estimated total: "
+        f"**${bom['totals']['total_otc']:,.0f}** OTC."
     )
     return summary, bom, 100, True
 

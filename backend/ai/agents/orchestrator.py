@@ -1,12 +1,30 @@
-"""
-BOM Orchestrator — Sprint 2
-Routes conversation to the correct specialist agent based on category and current phase.
-Entry point called by backend/api/chat.py → _process_message().
+﻿"""
+BOM Orchestrator — Full State Machine (LangGraph-style, no external dependency)
+
+Architecture:
+  User message
+    → SessionState loaded from context
+    → Phase gate: check what data is missing for current phase
+    → Build system prompt (skill file + RAG context + phase instructions)
+    → Call AI
+    → Post-process: extract BOM, validate, detect phase transition
+    → Return (response_text, partial_bom, progress, complete, new_state)
+
+Phases:
+  INTAKE    → M&A context: phase (Day1/TSA/Integration), category, project name
+  QUALIFY   → Conveying/shared/dedicated, EOL status, Day 1 date
+  SCOPE     → Sites, users, HA requirements, vendor preference
+  SIZING    → Compute quantities, multipliers, PoE budgets
+  GENERATE  → Build the full BOM with all SKU bundles
+  VALIDATE  → EOL check, PoE, HA, lead-time warnings
+  COMPLETE  → BOM ready for human review
 """
 import logging
 import json
 import re
-from typing import Dict, Any, Optional, Tuple
+import hashlib
+from typing import Dict, Any, Optional, Tuple, List
+from enum import Enum
 
 from ai.client import call_ai
 from ai.prompts.system_base import get_system_prompt
@@ -14,12 +32,49 @@ from ai.prompts.system_base import get_system_prompt
 logger = logging.getLogger(__name__)
 
 
+# ── Phase State Machine ──────────────────────────────────────────────────────
+
+class BOMPhase(str, Enum):
+    INTAKE   = "intake"     # Gather M&A phase, category, project name
+    QUALIFY  = "qualify"    # Conveying/shared/dedicated, EOL status
+    SCOPE    = "scope"      # Sites, users, Day 1 date, vendor preference
+    SIZING   = "sizing"     # Compute quantities, multipliers, configs
+    GENERATE = "generate"   # Build full BOM with SKU bundles
+    VALIDATE = "validate"   # EOL, PoE, HA, lead-time validation
+    COMPLETE = "complete"   # BOM finalized
+
+
+# Fields checked at each phase gate (what must be known before advancing)
+_PHASE_GATES: Dict[BOMPhase, List[str]] = {
+    BOMPhase.INTAKE:   [],                                                          # Always enter
+    BOMPhase.QUALIFY:  ["ma_phase", "workstream_category"],                         # Need M&A + category
+    BOMPhase.SCOPE:    ["conveyance_status"],                                       # Need conveying decision
+    BOMPhase.SIZING:   ["site_count"],                                              # Need site count
+    BOMPhase.GENERATE: ["site_count", "required_by_date"],                         # Need count + date
+    BOMPhase.VALIDATE: [],                                                          # Auto after generate
+    BOMPhase.COMPLETE: [],                                                          # Auto after validate
+}
+
+# Phase → progress percentage
+_PHASE_PROGRESS: Dict[BOMPhase, int] = {
+    BOMPhase.INTAKE:   10,
+    BOMPhase.QUALIFY:  25,
+    BOMPhase.SCOPE:    40,
+    BOMPhase.SIZING:   60,
+    BOMPhase.GENERATE: 80,
+    BOMPhase.VALIDATE: 90,
+    BOMPhase.COMPLETE: 100,
+}
+
+# Ordered phase list for transition logic
+_PHASE_ORDER = [
+    BOMPhase.INTAKE, BOMPhase.QUALIFY, BOMPhase.SCOPE,
+    BOMPhase.SIZING, BOMPhase.GENERATE, BOMPhase.VALIDATE, BOMPhase.COMPLETE,
+]
+
+
 def _retrieve_bom_context(query: str, bom_id: Optional[str] = None, top_k: int = 5) -> str:
-    """
-    Search the Azure Search BOM index for chunks semantically similar to the query.
-    Returns a formatted string to inject into the system prompt, or empty string if
-    the search service is unavailable or returns no results.
-    """
+    """Search indexed BOMs for relevant chunks to inject into the system prompt."""
     try:
         from services.search_service import search_bom_context
         results = search_bom_context(query=query, top_k=top_k, bom_id=bom_id)
@@ -31,8 +86,8 @@ def _retrieve_bom_context(query: str, bom_id: Optional[str] = None, top_k: int =
             for r in results
         ]
         return (
-            "\n\n" + "═" * 60 + "\nRELEVANT BOM DATA (retrieved from indexed BOMs)\n"
-            + "═" * 60 + "\n"
+            "\n\n" + "=" * 60 + "\nREFERENCE BOM DATA (from indexed library)\n"
+            + "=" * 60 + "\n"
             + "\n\n".join(lines)
         )
     except Exception as exc:
@@ -40,10 +95,249 @@ def _retrieve_bom_context(query: str, bom_id: Optional[str] = None, top_k: int =
         return ""
 
 
+def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
+    """
+    Deterministically extract intake fields from a user message.
+    Updates agent_state in-place; returns updated dict.
+    Real-life example: user says "TSA exit for 10 sites, Cisco standard, Day 1 March 15"
+    """
+    m = message.lower()
+
+    # M&A Phase
+    if not agent_state.get("ma_phase"):
+        if re.search(r"day.?1|day one|closing|close", m):
+            agent_state["ma_phase"] = "Day-1 Readiness"
+        elif re.search(r"tsa.?exit|exit\s+tsa|cutover|migration", m):
+            agent_state["ma_phase"] = "TSA Exit / Cutover"
+        elif re.search(r"integration|standalone|post.tsa|steady.state", m):
+            agent_state["ma_phase"] = "Full Integration / Standalone"
+
+    # Category detection
+    if not agent_state.get("workstream_category"):
+        cat_patterns = [
+            (r"data.?cent|colo|colocation",         "Data Center / COLO"),
+            (r"sd.?wan|wan.router|branch.router",    "SD-WAN"),
+            (r"network.?&.?tel|lan|wlan|wireless|switch|access.point", "Network & Telecom"),
+            (r"cyber|firewall|siem|edr|soc.?2|pci|hipaa", "Cybersecurity"),
+            (r"m365|office.365|teams|sharepoint|power.bi", "M365 & Power Platform"),
+            (r"cloud|azure|aws|gcp|expressroute",   "Cloud Infrastructure"),
+            (r"eol|end.of.life|end.of.support|eos", "EOL Replacement"),
+            (r"laptop|end.user|euc|vdi",            "End User Computing"),
+        ]
+        for pat, cat in cat_patterns:
+            if re.search(pat, m):
+                agent_state["workstream_category"] = cat
+                break
+
+    # Conveyance
+    if not agent_state.get("conveyance_status"):
+        if re.search(r"not.convey|not.transfer|stay\s+with|msp.own|leased|shared", m):
+            agent_state["conveyance_status"] = "not_conveying"
+        elif re.search(r"convey|transfer|coming.with|brings.with|inheriting", m):
+            if re.search(r"eol|end.of.life|eos|end.of.support|outdated|old", m):
+                agent_state["conveyance_status"] = "conveying_eol"
+            else:
+                agent_state["conveyance_status"] = "conveying_active"
+        elif re.search(r"shared|multi.tenant|common.infra", m):
+            agent_state["conveyance_status"] = "shared"
+
+    # Site count
+    if not agent_state.get("site_count"):
+        sm = re.search(r"(\d+)\s*(?:site|location|branch|office|data.cent)", m)
+        if sm:
+            agent_state["site_count"] = int(sm.group(1))
+
+    # User count
+    if not agent_state.get("user_count"):
+        um = re.search(r"(\d+)\s*(?:user|employee|seat|staff|person)", m)
+        if um:
+            agent_state["user_count"] = int(um.group(1))
+
+    # Day 1 / Required-by date
+    if not agent_state.get("required_by_date"):
+        dm = re.search(
+            r"(?:day.?1|deadline|required.by|go.live|cutover|by)\s*[-–:]?\s*"
+            r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march"
+            r"|april|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?",
+            m, re.I
+        )
+        if dm:
+            agent_state["required_by_date"] = dm.group(0)
+        else:
+            dm2 = re.search(r"\b(20\d{2})[-/](0?\d|1[0-2])[-/](0?\d|[12]\d|3[01])\b", message)
+            if dm2:
+                agent_state["required_by_date"] = dm2.group(0)
+
+    # Vendor preference
+    if not agent_state.get("vendor_standard"):
+        if re.search(r"\bcisco\b", m):
+            agent_state["vendor_standard"] = "Cisco"
+        elif re.search(r"\bfortinet\b|\bfortigate\b", m):
+            agent_state["vendor_standard"] = "Fortinet"
+        elif re.search(r"\baruba\b", m):
+            agent_state["vendor_standard"] = "Aruba"
+        elif re.search(r"\bjuniper\b|\bjunos\b", m):
+            agent_state["vendor_standard"] = "Juniper"
+        elif re.search(r"\bpalo.alto\b|\bpan-os\b|\bprisma\b", m):
+            agent_state["vendor_standard"] = "Palo Alto"
+
+    # HA / criticality
+    if not agent_state.get("site_criticality"):
+        if re.search(r"\bcritical\b|\bha\s*pair\b|\bhigh.avail|\bactive.active\b|\bactive.passive\b", m):
+            agent_state["site_criticality"] = "critical"
+        elif re.search(r"\bstandard\b|\bnon.critical\b|\boffice\b|\bbranch\b", m):
+            agent_state["site_criticality"] = "standard"
+
+    return agent_state
+
+
+def _detect_phase_transition(
+    response_text: str,
+    current_phase: BOMPhase,
+    agent_state: Dict,
+    bom_found: bool,
+) -> BOMPhase:
+    """
+    Determine what phase to move to after the AI responds.
+    Priority:
+      1. BOM JSON found → VALIDATE (or COMPLETE if valid enough)
+      2. All gate fields present → advance to next phase
+      3. AI explicitly names a phase → use that
+      4. Stay in current phase
+    """
+    if bom_found:
+        return BOMPhase.VALIDATE
+
+    # Check if all gates for NEXT phase are met
+    idx = _PHASE_ORDER.index(current_phase) if current_phase in _PHASE_ORDER else 0
+    for next_phase in _PHASE_ORDER[idx + 1:]:
+        gates = _PHASE_GATES.get(next_phase, [])
+        if all(agent_state.get(g) for g in gates):
+            return next_phase
+        else:
+            break  # can't skip — must satisfy gates in order
+
+    # Scan AI text for explicit phase names
+    phase_keywords = {
+        BOMPhase.QUALIFY:  ["conveyance", "conveying", "dedicated", "shared"],
+        BOMPhase.SCOPE:    ["how many sites", "site count", "user count", "required by"],
+        BOMPhase.SIZING:   ["sizing", "compute", "port density", "poe budget"],
+        BOMPhase.GENERATE: ["building the bom", "generating", "here is your bom"],
+    }
+    text_lower = response_text.lower()
+    for phase, kws in phase_keywords.items():
+        if any(kw in text_lower for kw in kws):
+            # Only advance if not going backwards
+            if _PHASE_ORDER.index(phase) > _PHASE_ORDER.index(current_phase):
+                return phase
+
+    return current_phase  # stay put
+
+
+def _phase_addendum(phase: BOMPhase, agent_state: Dict) -> str:
+    """Return phase-specific instructions to inject into the system prompt."""
+    known = {k: v for k, v in agent_state.items() if v}
+
+    if phase == BOMPhase.INTAKE:
+        return (
+            "\n\n[CURRENT PHASE: INTAKE]\n"
+            "Ask ONLY these questions — one message, no more:\n"
+            "1. What is the M&A phase? (Day-1 Readiness / TSA Exit / Full Integration)\n"
+            "2. What category? (Data Center/COLO, Network & Telecom, SD-WAN, Cybersecurity, M365, Cloud, EOL)\n"
+            "3. Project name / client name?\n"
+            "Do NOT ask about sites, vendors, or conveyance yet. Collect category first."
+        )
+
+    if phase == BOMPhase.QUALIFY:
+        cat = known.get("workstream_category", "Network & Telecom")
+        return (
+            f"\n\n[CURRENT PHASE: QUALIFICATION — {cat}]\n"
+            "Apply the Conveying/Shared/Dedicated Decision Tree:\n"
+            "STEP 1: Is the infrastructure shared (multi-tenant / MSP-owned) or dedicated?\n"
+            "  → Shared: buy NET NEW for all layers. Skip to SCOPE.\n"
+            "  → Dedicated: go to STEP 2.\n"
+            "STEP 2: Is dedicated equipment conveying (transferring in deal)?\n"
+            "  → Not conveying: buy NET NEW.\n"
+            "  → Conveying: go to STEP 3.\n"
+            "STEP 3: Is conveying equipment EOL/EOS?\n"
+            "  → EOL/EOS: generate REPLACEMENT bundle.\n"
+            "  → Active: scope = integration only (licenses, maintenance, config changes).\n"
+            f"KNOWN SO FAR: {json.dumps(known, default=str)}"
+        )
+
+    if phase == BOMPhase.SCOPE:
+        return (
+            "\n\n[CURRENT PHASE: SCOPE]\n"
+            "Collect (ask in one message):\n"
+            "1. Number of sites (this is the MULTIPLIER for all quantities)\n"
+            "2. Users per site (controls port density, AP count, firewall sessions)\n"
+            "3. Hard Day-1 cutover date (drives all lead-time warnings)\n"
+            "4. Vendor standard (Cisco / Fortinet / Aruba / Juniper / Palo Alto)\n"
+            "5. Site criticality (critical = HA pair mandatory, standard = HA at firewall only)\n"
+            f"KNOWN SO FAR: {json.dumps(known, default=str)}"
+        )
+
+    if phase == BOMPhase.SIZING:
+        sites = known.get("site_count", "?")
+        users = known.get("user_count", "?")
+        return (
+            f"\n\n[CURRENT PHASE: SIZING — {sites} sites, {users} users/site]\n"
+            "Compute EXACT quantities now. Use the bundle formulas:\n"
+            "- Access switches: CEIL(users/48) per site, stack in pairs\n"
+            "- APs: CEIL(users/30) per site (office), 1 per 15 (high-density)\n"
+            "- WAN routers: 2 per HA site, 1 per standard site\n"
+            "- Firewalls: 2 per site (HA pair always for >250 users or compliance)\n"
+            "- quantity_basis: annotate every line as '[qty] per site × [N] sites = [total]'\n"
+            f"KNOWN SO FAR: {json.dumps(known, default=str)}"
+        )
+
+    if phase == BOMPhase.GENERATE:
+        vendor = known.get("vendor_standard", "Cisco")
+        sites = known.get("site_count", 1)
+        criticality = known.get("site_criticality", "standard")
+        return (
+            f"\n\n[CURRENT PHASE: BOM GENERATION — {vendor}, {sites} sites, {criticality}]\n"
+            "EXPAND EVERY COMPONENT TO ITS FULL SKU BUNDLE NOW.\n"
+            "Rule: A single hardware line is ALWAYS wrong. Every component expands to:\n"
+            "  Router  → 8 lines  (chassis + IOS + DNA subscription + SmartNet + WAN NIM + SFP + cables + rack kit)\n"
+            "  Firewall → 10 lines (appliance + IPS + URL + SSL + AMP + HA peer + support + rack + SFPs + PS)\n"
+            "  Switch  → 5 lines  (chassis + license + stacking + SmartNet + SFP uplinks)\n"
+            "  AP      → 4 lines  (unit + PoE injector + cloud license + mounting)\n"
+            "Output ONLY valid JSON inside ```json...``` fences.\n"
+            "Each line item MUST include: quantity_basis, ha_role (if HA pair), price_basis, order_sequence.\n"
+            "NEVER output a single 'Cisco Router' line — that fails the Vendor-Ready BOM Gate.\n"
+            f"KNOWN SO FAR: {json.dumps(known, default=str)}"
+        )
+
+    if phase == BOMPhase.VALIDATE:
+        return (
+            "\n\n[CURRENT PHASE: VALIDATION]\n"
+            "Check and annotate:\n"
+            "1. EOL/EOS: flag any SKU where EOS date < Day1 + 3 years\n"
+            "2. PoE budget: sum (phones×7.5W + APs×15.4W) vs switch capacity\n"
+            "3. HA completeness: critical sites must have HA pair on ALL layers\n"
+            "4. Lead-time warnings: flag MPLS (12-20wk), switching (16-26wk), firewalls (8-16wk)\n"
+            "5. Dual-quote flag: any line item >$50K needs two vendor quotes\n"
+            "After validation, output the FINAL BOM JSON with all warnings populated.\n"
+        )
+
+    return ""
+
+
 class BOMOrchestrator:
     """
-    Stateless orchestrator — all state lives in the SessionContext dict.
-    Call process(session_dict, user_message) → (response_text, partial_bom, progress, complete)
+    Stateless orchestrator — all state in SessionContext.agent_state dict.
+    Implements a 7-phase LangGraph-style state machine without external dependencies.
+
+    Real-world flow (Chetan's model):
+      Cisco router for 10 sites
+        → INTAKE: identify category=Network&Telecom, ma_phase=TSA Exit
+        → QUALIFY: dedicated+not-conveying → buy net new
+        → SCOPE: 10 sites, 200 users/site, Day1=Q2, Cisco standard, critical
+        → SIZING: 2 routers/site × 10 = 20; 10 access switches × 5 lines each...
+        → GENERATE: expand to full 8-line bundles → 80 line items total
+        → VALIDATE: flag lead times, PoE budgets, SmartNet mandatory
+        → COMPLETE: vendor-ready BOM
     """
 
     def process(
@@ -52,103 +346,134 @@ class BOMOrchestrator:
         message: str,
     ) -> Tuple[str, Optional[Dict], int, bool]:
         """
-        Main entry point. Returns (response_text, partial_bom, progress_pct, complete).
+        Main entry. Returns (response_text, partial_bom, progress_pct, complete).
+        Mutates session["context"]["agent_state"] and session["context"]["current_phase"].
         """
         context = session.get("context", {})
         category = context.get("category") or "Data Center / COLO"
-        phase = context.get("current_phase", 1)
-        phase_data = context.get("phase_data", {})
-        requirements = context.get("requirements", {})
-        history = session.get("conversation", [])
+        agent_state = context.get("agent_state", {})
+        phase_str = context.get("current_phase_name", BOMPhase.INTAKE.value)
 
-        # Load skill-aware system prompt (loads skill Markdown file if one exists for
-        # this category, otherwise falls back to base + category hint)
+        try:
+            current_phase = BOMPhase(phase_str)
+        except ValueError:
+            current_phase = BOMPhase.INTAKE
+
+        # ── Extract fields deterministically from this message ─────────────
+        agent_state = _extract_fields_from_message(message, agent_state)
+        # Also use category from session context as ground truth
+        if category and not agent_state.get("workstream_category"):
+            agent_state["workstream_category"] = category
+
+        # ── Build system prompt ────────────────────────────────────────────
         base_prompt = get_system_prompt(category)
+        bom_id = context.get("bom_id")
+        bom_rag = _retrieve_bom_context(message, bom_id=bom_id)
 
-        # Retrieve relevant BOM chunks from the embedding index (best-effort)
-        bom_id = context.get("bom_id")  # if session is scoped to a specific BOM
-        bom_context = _retrieve_bom_context(message, bom_id=bom_id)
+        requirements = context.get("requirements", {})
+        project = requirements.get("project", "New Project")
+        old_phase_num = context.get("current_phase", 1)
 
         system = (
             base_prompt
-            + f"\n\n{'═'*60}\nCURRENT SESSION\n{'═'*60}\n"
-            + f"Category: {category}\n"
-            + f"Project: {requirements.get('project', 'New Project')}\n"
-            + f"Current Phase: {phase}/10\n"
-            + f"Phase data collected: {json.dumps(phase_data, default=str)}\n"
-            + f"Requirements: {json.dumps(requirements, default=str)}\n"
-            + bom_context  # ← injected BOM embedding context
+            + "\n\n" + "=" * 60 + "\nACTIVE SESSION\n" + "=" * 60
+            + f"\nProject: {project}"
+            + f"\nCategory: {category}"
+            + f"\nPhase: {current_phase.value.upper()}"
+            + f"\nAgent State: {json.dumps(agent_state, default=str)}"
+            + _phase_addendum(current_phase, agent_state)
+            + bom_rag
         )
 
-        # Build conversation history (last 14 messages)
-        # Normalise role: frontend stores AI messages as "ai" but Claude API requires "assistant"
-        # Also ensure strict user/assistant alternation (drop consecutive same-role messages)
-        raw_history = history[-14:]
-        msgs = []
-        for m in raw_history:
+        # ── Build message history (strict user/assistant alternation) ──────
+        history = session.get("conversation", [])
+        raw = history[-16:]  # last 16 = 8 back-and-forths
+        msgs: List[Dict] = []
+        for m in raw:
             role = m.get("role", "user")
-            if role == "ai":
+            if role in ("ai", "AI"):
                 role = "assistant"
             if role not in ("user", "assistant"):
                 continue
             content = (m.get("content") or "").strip()
             if not content:
                 continue
-            # Enforce alternation: skip if same role as last
             if msgs and msgs[-1]["role"] == role:
                 if role == "assistant":
-                    msgs[-1]["content"] += "\n" + content  # merge consecutive assistant messages
+                    msgs[-1]["content"] += "\n" + content
+                # For duplicate user messages: SKIP the duplicate (dedup)
                 continue
             msgs.append({"role": role, "content": content})
-        # Claude requires first message to be user; strip leading assistant if needed
+        # Claude requires messages to start with user
         while msgs and msgs[0]["role"] == "assistant":
             msgs.pop(0)
 
-        # Call AI
+        # ── Call AI ────────────────────────────────────────────────────────
         response_text = call_ai(msgs, system=system)
         if response_text is None:
-            # Rule-based fallback — pass history length so it knows if user is answering
-            # user_turn_count = number of user messages already in history
             user_turns = sum(1 for m in history if m.get("role") == "user")
-            response_text = self._rule_based(category, phase, message, user_turns)
+            response_text = self._rule_based(category, current_phase, message, agent_state, user_turns)
 
-        # Parse BOM JSON if present
-        partial_bom, complete = self._extract_bom(response_text)
+        # ── Post-process ───────────────────────────────────────────────────
+        partial_bom, bom_found = self._extract_bom(response_text)
 
-        # Remove the raw ```json block from the text the user sees — the BOM is
-        # already extracted into partial_bom and will be rendered by the frontend.
+        # Strip JSON block from display text
+        display_text = response_text
         if partial_bom:
-            response_text = re.sub(r"```json[\s\S]*?```", "", response_text).strip()
-            # If stripping leaves only whitespace, put a clean summary line
-            if not response_text:
-                response_text = "BOM generated. See the panel on the right for all line items."
+            display_text = re.sub(r"```json[\s\S]*?```", "", response_text).strip()
+            if not display_text:
+                display_text = (
+                    f"BOM generated: **{len(partial_bom.get('line_items', []))} line items**"
+                    f" — see the panel on the right for full details."
+                )
 
-        # Advance phase heuristically (AI confirms progress in text)
-        new_phase = self._detect_phase_advance(response_text, phase, message)
-        context["current_phase"] = new_phase
+        # ── Phase transition ───────────────────────────────────────────────
+        # Also extract fields the AI mentioned in its response
+        agent_state = _extract_fields_from_message(response_text, agent_state)
+        new_phase = _detect_phase_transition(response_text, current_phase, agent_state, bom_found)
 
-        # Progress 0–100%: phases 1–7 = 70%, phase 8 = 85%, 9 = 95%, 10 = 100%
-        progress = self._phase_to_progress(new_phase, complete)
+        # ── Persist state back to session context ──────────────────────────
+        context["agent_state"] = agent_state
+        context["current_phase_name"] = new_phase.value
+        context["current_phase"] = _PHASE_ORDER.index(new_phase) + 1  # keep numeric compat
 
-        return response_text, partial_bom, progress, complete
+        complete = (new_phase == BOMPhase.COMPLETE) or (bom_found and new_phase == BOMPhase.VALIDATE)
+        progress = _PHASE_PROGRESS.get(new_phase, 10)
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+        if complete and partial_bom:
+            # Inject final enrichments
+            partial_bom["project"] = project
+            partial_bom["category"] = category
+            partial_bom["ma_phase"] = agent_state.get("ma_phase", "")
+            partial_bom["vendor_standard"] = agent_state.get("vendor_standard", "")
+            partial_bom["site_count"] = agent_state.get("site_count")
+            partial_bom["conveyance_status"] = agent_state.get("conveyance_status", "")
+
+        logger.info(
+            "Orchestrator: project=%s category=%s phase=%s→%s complete=%s bom_items=%d",
+            project, category, current_phase.value, new_phase.value,
+            complete, len(partial_bom.get("line_items", []) if partial_bom else []),
+        )
+
+        return display_text, partial_bom, progress, complete
+
+    # ── BOM extraction ────────────────────────────────────────────────────
 
     def _extract_bom(self, text: str) -> Tuple[Optional[Dict], bool]:
         """
-        Extract BOM JSON from AI response text.
-        Handles both default schema (line_items) and skill file format (bom_line_items).
-        Also normalises per-item field aliases so the frontend receives a consistent shape.
+        Extract and normalise BOM JSON from AI response.
+        Returns (bom_dict, found_flag).
         """
         match = re.search(r"```json\s*([\s\S]*?)```", text)
         if not match:
             return None, False
         try:
             data = json.loads(match.group(1).strip())
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            logger.warning("BOM JSON parse failed: %s", exc)
             return None, False
 
-        # Normalise top-level key: skill files use "bom_line_items"
+        # Normalise top-level key: skill files emit "bom_line_items"
         if "bom_line_items" in data and data["bom_line_items"]:
             data["line_items"] = data.pop("bom_line_items")
 
@@ -156,14 +481,11 @@ class BOMOrchestrator:
         if not items:
             return None, False
 
-        # Normalise each line item so frontend backendBOMtoFrontend always gets consistent fields
         normalised = []
         for i, item in enumerate(items):
             if not isinstance(item, dict):
                 continue
-            # qty / quantity alias
             qty = item.get("qty") or item.get("quantity") or 1
-            # price fields — skill file may emit null for pricing_required items
             unit_price = item.get("unit_price") or 0
             ext_price = (
                 item.get("extended_price")
@@ -172,7 +494,7 @@ class BOMOrchestrator:
             )
             normalised.append({
                 "line_number":    item.get("line_number") or i + 1,
-                "category":       item.get("category", "Network Equipment"),
+                "category":       item.get("category", ""),
                 "description":    item.get("description", ""),
                 "sku":            item.get("sku") or item.get("part_number", ""),
                 "qty":            qty,
@@ -193,11 +515,225 @@ class BOMOrchestrator:
                 "quantity_basis": item.get("quantity_basis", ""),
                 "recommendation_status": item.get("recommendation_status", ""),
             })
+
+        # Recompute totals
+        total_otc = sum(
+            (n["unit_price"] or 0) * (n["qty"] or 1)
+            for n in normalised
+        )
+        if "totals" not in data or not data["totals"]:
+            data["totals"] = {}
+        data["totals"]["total_otc"] = data["totals"].get("total_otc") or total_otc
+
         data["line_items"] = normalised
         return data, True
 
+    # ── Rule-based fallback ───────────────────────────────────────────────
+
+    def _rule_based(
+        self,
+        category: str,
+        phase: BOMPhase,
+        message: str,
+        agent_state: Dict,
+        user_turns: int = 0,
+    ) -> str:
+        """
+        Rule-based responses when AI is unavailable.
+        Real-world template: mirrors Chetan's question hierarchy.
+        """
+        known = {k: v for k, v in agent_state.items() if v}
+        project = known.get("project_name", "your project")
+
+        if phase == BOMPhase.INTAKE:
+            return (
+                f"I'll help you build a **{category}** BOM for **{project}**.\n\n"
+                "To get started, I need three things:\n\n"
+                "1. **M&A Phase** — Is this for *Day-1 Readiness*, *TSA Exit*, or *Full Integration*?\n"
+                "2. **Project / Client name**\n"
+                "3. **Scope confirmation** — new build or replacing existing infrastructure?\n\n"
+                "*Say __\"skip\" or \"create the BOM now\"__ to generate a template immediately.*"
+            )
+
+        if phase == BOMPhase.QUALIFY:
+            return (
+                "**Qualification — Conveying & Shared/Dedicated**\n\n"
+                "For the network infrastructure:\n\n"
+                "1. Is the equipment **shared** (multi-tenant, MSP-owned) or **dedicated** to this entity?\n"
+                "2. If dedicated — is it **conveying** (transferring in the deal) or staying with the seller?\n"
+                "3. If conveying — is any of it **EOL or EOS** (end of life / end of support)?\n\n"
+                "Your answers control what I put in the BOM:\n"
+                "- Shared → buy net new\n"
+                "- Dedicated, not conveying → buy net new\n"
+                "- Conveying, active → integration costs only\n"
+                "- Conveying, EOL → replacement bundle"
+            )
+
+        if phase == BOMPhase.SCOPE:
+            return (
+                "**Scope — Sites, Users, and Timeline**\n\n"
+                "1. How many **sites**? (This multiplies all quantities)\n"
+                "2. **Users per site**? (Controls switch port density, AP count, firewall sizing)\n"
+                "3. **Day-1 cutover date**? (Required for lead-time warnings)\n"
+                "4. **Vendor standard**? (Cisco, Fortinet, Aruba, Juniper, Palo Alto)\n"
+                "5. **Site criticality**? (Critical = mandatory HA pairs on all layers)\n\n"
+                "*Example: 10 sites, 200 users each, Day 1 March 15, Cisco standard, critical.*"
+            )
+
+        # For any later phase with no AI: generate template BOM
+        if user_turns >= 1 or phase in (BOMPhase.GENERATE, BOMPhase.SIZING, BOMPhase.VALIDATE):
+            bom = self._build_template_bom(category, project, agent_state)
+            bom_json = json.dumps(bom, indent=2)
+            n = len(bom.get("line_items", []))
+            total = bom.get("totals", {}).get("total_otc", 0)
+            return (
+                f"Here is your **{category}** BOM for **{project}**.\n\n"
+                f"**{n} line items** — estimated total: **${total:,.0f}**\n\n"
+                f"```json\n{bom_json}\n```"
+            )
+
+        return (
+            f"Tell me more about your **{category}** requirements, "
+            "or type **\"create the BOM\"** to generate a complete template now."
+        )
+
+    def _build_template_bom(self, category: str, project: str, agent_state: Dict) -> dict:
+        """Return a vendor-ready template BOM dict for the given category."""
+        sites = agent_state.get("site_count", 1)
+        vendor = agent_state.get("vendor_standard", "Cisco")
+
+        def s(qty, per_site=True):
+            """Scale quantity by site count."""
+            return qty * sites if per_site else qty
+
+        templates: Dict[str, list] = {
+            "Data Center / COLO": [
+                {"description": "Dell PowerEdge R750 (2x Xeon Gold 6330, 512GB RAM, 2x25G NIC)", "category": "Compute", "qty": s(4), "unit_price": 28500, "vendor": "Dell Technologies", "term": "one-time", "order_sequence": 3},
+                {"description": "Dell PowerEdge R750 SmartNet 3yr NBD", "category": "Support Contract", "qty": s(4), "unit_price": 5100, "vendor": "Dell Technologies", "term": "3-year", "order_sequence": 6},
+                {"description": "NetApp AFF A400 All-Flash (50TB raw, dual controller)", "category": "Storage", "qty": 1, "unit_price": 125000, "vendor": "NetApp", "term": "one-time", "order_sequence": 3},
+                {"description": "NetApp Support Gold 3yr", "category": "Support Contract", "qty": 1, "unit_price": 22500, "vendor": "NetApp", "term": "3-year", "order_sequence": 6},
+                {"description": "Cisco Nexus 93180YC-FX ToR Switch (48x25G+6x100G)", "category": "Network", "qty": s(2), "unit_price": 18750, "vendor": "Cisco", "term": "one-time", "order_sequence": 2},
+                {"description": "Cisco Nexus 93180YC SmartNet 3yr", "category": "Support Contract", "qty": s(2), "unit_price": 3375, "vendor": "Cisco", "term": "3-year", "order_sequence": 6},
+                {"description": "APC Smart-UPS SRT 10kVA UPS N+1", "category": "Power & Physical", "qty": s(2), "unit_price": 9800, "vendor": "APC / Schneider", "term": "one-time", "order_sequence": 1},
+                {"description": "42U Server Rack with Blanking Panels + Cable Mgmt", "category": "Power & Physical", "qty": s(4), "unit_price": 3200, "vendor": "Panduit", "term": "one-time", "order_sequence": 1},
+                {"description": "VMware vSphere Enterprise Plus (per CPU, 3yr)", "category": "Software License", "qty": s(8), "unit_price": 5500, "vendor": "VMware / Broadcom", "term": "3-year", "order_sequence": 5},
+                {"description": "Veeam Backup Enterprise (per VM, 50 VMs)", "category": "Software License", "qty": 1, "unit_price": 12000, "vendor": "Veeam", "term": "3-year", "order_sequence": 5},
+                {"description": "Spares Kit: drives, NICs, PSUs (10% of hardware)", "category": "Spares", "qty": 1, "unit_price": 15000, "vendor": "Dell / Cisco", "term": "one-time", "order_sequence": 4},
+                {"description": "Deployment & Commissioning Professional Services", "category": "Professional Services", "qty": 1, "unit_price": 45000, "vendor": "NTT Data", "term": "one-time", "order_sequence": 7},
+            ],
+            "Network & Telecom": [
+                # WAN Routers (Bundle 1 — Cisco SD-WAN 8-line bundle)
+                {"description": f"Cisco Catalyst 8300-1N1S-4T2X SD-WAN Router (chassis)", "category": "WAN Router", "qty": s(2), "unit_price": 12500, "vendor": vendor, "term": "one-time", "order_sequence": 2, "quantity_basis": f"2 per site × {sites} sites = {s(2)}", "ha_role": "active/standby"},
+                {"description": "Cisco IOS XE SD-WAN Software License", "category": "Software License", "qty": s(2), "unit_price": 2400, "vendor": vendor, "term": "3-year", "order_sequence": 5},
+                {"description": "Cisco DNA Advantage SD-WAN Subscription (per device, 3yr)", "category": "SaaS/Subscription", "qty": s(2), "unit_price": 1800, "vendor": vendor, "term": "3-year", "order_sequence": 5},
+                {"description": "Cisco SmartNet SNTC-8X5XNBD Catalyst 8300 (3yr)", "category": "Support Contract", "qty": s(2), "unit_price": 2250, "vendor": vendor, "term": "3-year", "order_sequence": 6, "notes": "MANDATORY — 3yr SmartNet on every hardware unit"},
+                {"description": "NIM-2T WAN Interface Module (T1/E1 or SFP)", "category": "Interface Module", "qty": s(2), "unit_price": 850, "vendor": vendor, "term": "one-time", "order_sequence": 2},
+                {"description": "GLC-LH-SMD SFP Transceiver (per WAN port)", "category": "Transceiver", "qty": s(4), "unit_price": 95, "vendor": vendor, "term": "one-time", "order_sequence": 2},
+                {"description": "Console Cable + Power Cord Set (per router)", "category": "Accessories", "qty": s(2), "unit_price": 45, "vendor": "CDW", "term": "one-time", "order_sequence": 1},
+                {"description": "ACS-1900-RM-19 Rack Mount Kit (per router)", "category": "Accessories", "qty": s(2), "unit_price": 75, "vendor": "CDW", "term": "one-time", "order_sequence": 1},
+                # Access Switches (Bundle 3 — 5-line bundle)
+                {"description": "Cisco Catalyst C9300-48P-A Access Switch (48P PoE+)", "category": "LAN Switch", "qty": s(2), "unit_price": 8200, "vendor": vendor, "term": "one-time", "order_sequence": 2, "quantity_basis": f"2 per site × {sites} sites = {s(2)}", "notes": "Stack in pairs for redundancy"},
+                {"description": "C9300 Network Advantage License", "category": "Software License", "qty": s(2), "unit_price": 1200, "vendor": vendor, "term": "3-year", "order_sequence": 5},
+                {"description": "STACK-T1-50CM Stacking Cable Pair", "category": "Accessories", "qty": s(1), "unit_price": 220, "vendor": vendor, "term": "one-time", "order_sequence": 2},
+                {"description": "Cisco SmartNet CON-3SNT-C93 (3yr, access switch)", "category": "Support Contract", "qty": s(2), "unit_price": 1476, "vendor": vendor, "term": "3-year", "order_sequence": 6},
+                {"description": "SFP-10G-SR Uplink Transceivers ×2 per switch", "category": "Transceiver", "qty": s(4), "unit_price": 125, "vendor": vendor, "term": "one-time", "order_sequence": 2},
+                # Firewall (Bundle 2 — condensed 5 key lines)
+                {"description": "FortiGate 200F NGFW Appliance (HA pair)", "category": "Firewall", "qty": s(2), "unit_price": 14500, "vendor": "Fortinet", "term": "one-time", "order_sequence": 2, "ha_role": "active/standby"},
+                {"description": "FortiGuard Enterprise Protection 3yr (IPS+URL+SSL+AppCtrl)", "category": "Security License", "qty": s(2), "unit_price": 3200, "vendor": "Fortinet", "term": "3-year", "order_sequence": 5},
+                {"description": "FortiCare Premium Support 3yr (per unit)", "category": "Support Contract", "qty": s(2), "unit_price": 2600, "vendor": "Fortinet", "term": "3-year", "order_sequence": 6},
+                {"description": "Deployment & Cutover Professional Services", "category": "Professional Services", "qty": 1, "unit_price": 25000, "vendor": "NTT Data", "term": "one-time", "order_sequence": 7},
+            ],
+            "SD-WAN": [
+                {"description": "Cisco Catalyst 8300-1N1S-4T2X SD-WAN Router", "category": "WAN Router", "qty": s(2), "unit_price": 12500, "vendor": "Cisco", "term": "one-time", "order_sequence": 2, "quantity_basis": f"2 per site × {sites} sites = {s(2)}"},
+                {"description": "Cisco IOS XE SD-WAN License", "category": "Software License", "qty": s(2), "unit_price": 2400, "vendor": "Cisco", "term": "3-year", "order_sequence": 5},
+                {"description": "Cisco DNA Advantage Subscription (3yr)", "category": "SaaS/Subscription", "qty": s(2), "unit_price": 1800, "vendor": "Cisco", "term": "3-year", "order_sequence": 5},
+                {"description": "Cisco SmartNet 3yr NBD (per router)", "category": "Support Contract", "qty": s(2), "unit_price": 2250, "vendor": "Cisco", "term": "3-year", "order_sequence": 6},
+                {"description": "NIM-2T WAN Interface Module", "category": "Interface Module", "qty": s(2), "unit_price": 850, "vendor": "Cisco", "term": "one-time", "order_sequence": 2},
+                {"description": "GLC-LH-SMD SFP Transceiver (×2 per router)", "category": "Transceiver", "qty": s(4), "unit_price": 95, "vendor": "Cisco", "term": "one-time", "order_sequence": 2},
+                {"description": "Console Cable + Power Cord (per router)", "category": "Accessories", "qty": s(2), "unit_price": 45, "vendor": "CDW", "term": "one-time", "order_sequence": 1},
+                {"description": "ACS-1900-RM-19 Rack Mount Kit", "category": "Accessories", "qty": s(2), "unit_price": 75, "vendor": "CDW", "term": "one-time", "order_sequence": 1},
+                {"description": "MPLS Circuit 100Mbps Primary (monthly per site)", "category": "Carrier Circuit", "qty": s(1), "unit_price": 1800, "vendor": "AT&T / NTT", "term": "/month"},
+                {"description": "Broadband 500Mbps Secondary Circuit (monthly)", "category": "Carrier Circuit", "qty": s(1), "unit_price": 350, "vendor": "Comcast / ISP", "term": "/month"},
+                {"description": "OOB Console Server + LTE Modem (per remote site)", "category": "OOB Management", "qty": s(1), "unit_price": 1400, "vendor": "Opengear", "term": "one-time", "order_sequence": 1, "notes": "Mandatory: order_sequence=1 — must arrive before routers"},
+                {"description": "SD-WAN Deployment Professional Services", "category": "Professional Services", "qty": 1, "unit_price": 35000, "vendor": "NTT Data", "term": "one-time", "order_sequence": 7},
+            ],
+            "Cybersecurity": [
+                {"description": "Palo Alto PA-1410 NGFW (HA pair per site)", "category": "Firewall", "qty": s(2), "unit_price": 28000, "vendor": "Palo Alto Networks", "term": "one-time", "order_sequence": 2},
+                {"description": "PA-1410 Threat Prevention + URL Filtering 3yr", "category": "Security License", "qty": s(2), "unit_price": 6500, "vendor": "Palo Alto Networks", "term": "3-year", "order_sequence": 5},
+                {"description": "PAN-SVC-PREM-1410-3YR Premium Support", "category": "Support Contract", "qty": s(2), "unit_price": 5100, "vendor": "Palo Alto Networks", "term": "3-year", "order_sequence": 6},
+                {"description": "CrowdStrike Falcon Complete (EDR, per endpoint/yr)", "category": "EDR", "qty": 500, "unit_price": 180, "vendor": "CrowdStrike", "term": "1-year"},
+                {"description": "Splunk Enterprise Security (10GB/day indexing)", "category": "SIEM", "qty": 1, "unit_price": 95000, "vendor": "Splunk", "term": "1-year"},
+                {"description": "Okta Identity Cloud SSO + MFA (per user/yr)", "category": "IAM", "qty": 500, "unit_price": 72, "vendor": "Okta", "term": "1-year"},
+                {"description": "Tenable.io VM (500 assets)", "category": "Vulnerability Mgmt", "qty": 1, "unit_price": 28000, "vendor": "Tenable", "term": "1-year"},
+                {"description": "Security Awareness Training KnowBe4 (per user/yr)", "category": "Training", "qty": 500, "unit_price": 15, "vendor": "KnowBe4", "term": "1-year"},
+                {"description": "Incident Response Retainer (40 hrs/yr)", "category": "Managed Services", "qty": 1, "unit_price": 18500, "vendor": "NTT Data", "term": "1-year"},
+                {"description": "Firewall Ruleset Migration PS", "category": "Professional Services", "qty": 1, "unit_price": 15000, "vendor": "NTT Data", "term": "one-time"},
+            ],
+        }
+
+        # Use the first matching category template
+        items_raw = templates.get(category)
+        if not items_raw:
+            # Try partial match
+            for k, v in templates.items():
+                if k.lower() in category.lower() or category.lower() in k.lower():
+                    items_raw = v
+                    break
+        if not items_raw:
+            items_raw = templates["Data Center / COLO"]
+
+        items = []
+        for i, t in enumerate(items_raw):
+            qty = t.get("qty", 1)
+            price = t.get("unit_price", 0)
+            items.append({
+                "line_number": i + 1,
+                "description": t["description"],
+                "category": t.get("category", "General"),
+                "sku": "",
+                "qty": qty,
+                "quantity": qty,
+                "unit": t.get("unit", "/unit"),
+                "unit_price": price,
+                "extended_price": price * qty,
+                "ext_price": price * qty,
+                "vendor": t.get("vendor", "CDW"),
+                "term": t.get("term", "one-time"),
+                "order_sequence": t.get("order_sequence", ""),
+                "ha_role": t.get("ha_role", ""),
+                "quantity_basis": t.get("quantity_basis", f"1 per site × {sites} sites = {sites}"),
+                "notes": t.get("notes", ""),
+                "price_basis": "budgetary_assumption",
+                "eol_flag": False,
+            })
+
+        total = sum(i["unit_price"] * i["qty"] for i in items)
+        return {
+            "name": f"{project} — {category} BOM",
+            "project": project,
+            "category": category,
+            "revision": 1,
+            "bom_maturity": "budgetary",
+            "line_items": items,
+            "totals": {
+                "hardware": total * 0.6,
+                "software": total * 0.25,
+                "services": total * 0.15,
+                "total_otc": total,
+                "tco_3year": total * 1.4,
+            },
+            "warnings": [
+                "TEMPLATE BOM: Prices are budgetary estimates only. Validate with vendor quotes before submission.",
+                "All hardware line items require SmartNet/maintenance — verify 3yr coverage.",
+                "Lead-time risk: confirm Day-1 date against longest lead-time items.",
+            ],
+            "approvals_required": ["Buyer IT", "Seller IT", "SI Technical Team"],
+        }
+
+    # ── Deprecated shims (keep for backward compat with stream endpoint) ────
+
     def _detect_phase_advance(self, response: str, current_phase: int, message: str) -> int:
-        """Simple heuristic: if AI mentions 'Phase X' in response, advance to that phase."""
+        """Shim: numeric phase advance for backward compat with stream_message."""
         for p in range(current_phase + 1, 11):
             if f"Phase {p}" in response or f"phase {p}" in response:
                 return p
@@ -208,237 +744,3 @@ class BOMOrchestrator:
             return 100
         phase_map = {1: 5, 2: 15, 3: 25, 4: 35, 5: 45, 6: 55, 7: 70, 8: 80, 9: 90, 10: 95}
         return phase_map.get(phase, 5)
-
-    def _rule_based(self, category: str, phase: int, message: str, user_turns: int = 0) -> str:
-        """
-        Rule-based fallback when AI is unavailable.
-        - Phase 1 questions first turn (user_turns == 0).
-        - Phase 2 questions second turn (user_turns == 1) for DC/COLO; other cats skip to BOM.
-        - Explicit creation intent at ANY turn → generate immediately.
-        - After user has answered 2+ rounds (user_turns >= 2) → generate BOM.
-        """
-        import re
-
-        msg = message.lower()
-
-        # ── Detect project name from message ─────────────────────────────
-        project_map = {
-            "panasonic": "Panasonic", "idemia": "Idemia", "tenneco": "Tenneco",
-            "honeywell": "Honeywell", "pwc": "PwC", "cisco": "Cisco",
-            "microsoft": "Microsoft", "oracle": "Oracle", "aon": "Aon",
-        }
-        project = next((v for k, v in project_map.items() if k in msg), "New Project")
-
-        # ── Detect explicit BOM creation intent ──────────────────────────
-        create_pat = re.compile(
-            r"\b(create|build|generate|make|prepare|draft|give me|show me)\b.{0,30}\bbom\b"
-            r"|\bnew bom\b|\bgenerate bom\b|\bjust create\b|\bskip\b.{0,20}\bquestion",
-            re.I,
-        )
-        explicit_create = bool(create_pat.search(msg))
-
-        # ── Detect info answers (numbers, dates, yes/no) ─────────────────
-        has_answer = bool(re.search(
-            r"\d+\s*(rack|server|site|node|user|vm|tb|gb|core|vcpu|watt|kw|mw)"
-            r"|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"      # date pattern
-            r"|\byes\b|\bno\b|\bvmware\b|\bhyper.?v\b|\baws\b|\bazure\b"
-            r"|\bmpls\b|\bdia\b|\bfibre\b|\binternet\b",
-            msg, re.I
-        ))
-
-        # ── Decision: generate BOM now? ───────────────────────────────────
-        # Generate when: explicit intent, phase advanced, or enough turns collected
-        # For non-DC categories use a lower threshold (5-question flow is faster)
-        is_dc = "data center" in category.lower() or "colo" in category.lower()
-        turn_threshold = 2 if is_dc else 1   # DC: ask 2 rounds; others: 1 round
-
-        should_generate = (
-            explicit_create
-            or phase >= 4
-            or user_turns >= turn_threshold
-            or (has_answer and user_turns >= 1)
-        )
-
-        if should_generate:
-            bom = self._build_template_bom(category, project)
-            bom_json = json.dumps(bom, indent=2)
-            item_count = len(bom["line_items"])
-            total = bom.get("total_value", sum(
-                i.get("qty", 1) * i.get("unit_price", 0) for i in bom["line_items"]
-            ))
-            note = (
-                "\n\n> **Note:** Live AI is currently unavailable — this BOM uses "
-                "industry-standard templates. Once AI is configured (add `OPENAI_API_KEY` "
-                "or `ANTHROPIC_API_KEY` to backend `.env`), responses will be fully "
-                "tailored to your specific requirements."
-            )
-            return (
-                f"I've built a **{category}** BOM for **{project}** "
-                f"using industry-standard templates.\n\n"
-                f"The BOM contains **{item_count} line items** "
-                f"totalling **${total:,.0f}**.\n\n"
-                f"Review the items in the right panel. You can ask me to:\n"
-                f"- Add or remove specific items\n"
-                f"- Adjust quantities or pricing\n"
-                f"- Change vendors\n"
-                f"- Export or save the BOM\n"
-                f"{note}\n\n"
-                f"```json\n{bom_json}\n```"
-            )
-
-        # ── Phase questions ────────────────────────────────────────────────
-        if is_dc:
-            phase_questions = {
-                1: (
-                    f"I'll help you build a **{category}** BOM for **{project}**.\n\n"
-                    "**Phase 1 — Scope & Constraints**\n\n"
-                    "1. What is the **Day 1 cutover date** for this project?\n"
-                    "2. How many **racks / physical sites** are in scope?\n"
-                    "3. Any specialised hardware (GPU, AS400, bare metal, high-memory)?\n\n"
-                    "*Say **\"create the BOM\"** to skip ahead and generate a full template immediately.*"
-                ),
-                2: (
-                    "**Phase 2 — Inventory & Sizing**\n\n"
-                    "1. How many **servers** are being conveyed (transferred in the deal)?\n"
-                    "2. Are any running **EOL operating systems** (Server 2012 or older)?\n"
-                    "3. What is the **hypervisor** in use — VMware or Hyper-V?\n\n"
-                    "*Say **\"create the BOM now\"** to generate from templates.*"
-                ),
-            }
-            return phase_questions.get(
-                phase if phase in phase_questions else 1,
-                f"Tell me more about your **{category}** requirements, "
-                f"or say **\"create the BOM\"** to generate a complete template now.",
-            )
-        else:
-            # Non-DC: single question round using the 5-question flow
-            category_q = {
-                "SD-WAN": (
-                    "1. How many **sites** will connect via SD-WAN?\n"
-                    "2. What **ISP type** per site — MPLS, broadband, or both?\n"
-                    "3. Is **HA** required (active/active or active/passive)?\n"
-                ),
-                "Cybersecurity": (
-                    "1. How many **endpoints** need protection?\n"
-                    "2. What **compliance** frameworks apply (PCI, HIPAA, SOC 2)?\n"
-                    "3. Current tooling gaps — EDR, SIEM, PAM, or email security?\n"
-                ),
-                "Network Equipment": (
-                    "1. Total **port count** required (access layer)?\n"
-                    "2. **PoE** required — how many PoE+ ports?\n"
-                    "3. Target **uplink speed** — 10G, 25G, or 100G?\n"
-                ),
-                "M365 & Power Platform": (
-                    "1. **User count** — how many E3 vs E5 licenses needed?\n"
-                    "2. Is **Power BI Premium** (per capacity or per user) required?\n"
-                    "3. Migrating from **Exchange on-prem** or Google Workspace?\n"
-                ),
-                "Laptops": (
-                    "1. **User count** and role breakdown (exec / dev / standard)?\n"
-                    "2. **OS preference** — Windows, macOS, or mixed fleet?\n"
-                    "3. **MDM platform** already in place — Intune or Jamf?\n"
-                ),
-            }
-            q_block = category_q.get(
-                category,
-                "1. What is the **scope and scale** (sites, users, devices)?\n"
-                "2. Any **compliance** requirements (PCI, HIPAA, SOC 2)?\n"
-                "3. Preferred **vendors** or existing contracts to honour?\n"
-            )
-            return (
-                f"I'll help you build a **{category}** BOM for **{project}**.\n\n"
-                f"{q_block}\n"
-                "*Say **\"create the BOM\"** to skip ahead and generate a full template immediately.*"
-            )
-
-    # ── Template BOM builder (rule-based, no AI needed) ───────────────────
-
-    def _build_template_bom(self, category: str, project: str) -> dict:
-        """Return a vendor-ready template BOM dict for the given category."""
-        templates = {
-            "Data Center / COLO": [
-                {"description": "Dell PowerEdge R750 Server (2x Xeon Gold, 512GB RAM)",
-                 "category": "Compute", "qty": 8, "unit_price": 28500, "vendor": "Dell Technologies"},
-                {"description": "NetApp AFF A400 All-Flash Storage Array (50TB raw)",
-                 "category": "Storage", "qty": 2, "unit_price": 125000, "vendor": "NetApp"},
-                {"description": "Cisco Nexus 93180YC-FX Switch (48x25G + 6x100G)",
-                 "category": "Network", "qty": 4, "unit_price": 18750, "vendor": "Cisco"},
-                {"description": "Cisco ASR 1002-X Edge Router",
-                 "category": "Network", "qty": 2, "unit_price": 22000, "vendor": "Cisco"},
-                {"description": "APC Smart-UPS SRT 10kVA UPS",
-                 "category": "Power & Physical", "qty": 4, "unit_price": 9800, "vendor": "APC by Schneider"},
-                {"description": "42U Server Rack Cabinet with Cable Management",
-                 "category": "Power & Physical", "qty": 8, "unit_price": 3200, "vendor": "Panduit"},
-                {"description": "VMware vSphere Enterprise Plus (per CPU, 3-yr)",
-                 "category": "Software & Licensing", "qty": 16, "unit_price": 5500, "vendor": "VMware"},
-                {"description": "Veeam Backup & Replication Enterprise (50 VMs)",
-                 "category": "Software & Licensing", "qty": 1, "unit_price": 12000, "vendor": "Veeam"},
-                {"description": "Data Center Colocation — Full Cabinet (monthly)",
-                 "category": "Managed Services", "qty": 8, "unit_price": 2200, "vendor": "Equinix"},
-                {"description": "Remote Hands & Smart Hands Support (40 hrs/mo)",
-                 "category": "Managed Services", "qty": 1, "unit_price": 4800, "vendor": "Equinix"},
-            ],
-            "SD-WAN / Network": [
-                {"description": "Cisco Catalyst SD-WAN Edge (2x WAN, 4x LAN)",
-                 "category": "Network", "qty": 30, "unit_price": 4200, "vendor": "Cisco"},
-                {"description": "Cisco SD-WAN Manager (vManage) — Cloud Hosted",
-                 "category": "Software & Licensing", "qty": 1, "unit_price": 45000, "vendor": "Cisco"},
-                {"description": "MPLS WAN Circuit 100Mbps (monthly per site)",
-                 "category": "Connectivity", "qty": 30, "unit_price": 1800, "vendor": "AT&T"},
-                {"description": "Broadband Internet Circuit 500Mbps (monthly)",
-                 "category": "Connectivity", "qty": 30, "unit_price": 350, "vendor": "Comcast Business"},
-                {"description": "Cisco Umbrella DNS Security (per user/yr)",
-                 "category": "Security", "qty": 500, "unit_price": 24, "vendor": "Cisco"},
-                {"description": "SD-WAN Professional Services & Deployment",
-                 "category": "Professional Services", "qty": 1, "unit_price": 85000, "vendor": "CDW"},
-            ],
-            "Cybersecurity": [
-                {"description": "Palo Alto PA-3220 NGFW (10Gbps throughput)",
-                 "category": "Security", "qty": 4, "unit_price": 42000, "vendor": "Palo Alto Networks"},
-                {"description": "CrowdStrike Falcon Complete (endpoint, per device/yr)",
-                 "category": "Security", "qty": 500, "unit_price": 180, "vendor": "CrowdStrike"},
-                {"description": "Splunk Enterprise Security (indexing, 10GB/day)",
-                 "category": "Security", "qty": 1, "unit_price": 95000, "vendor": "Splunk"},
-                {"description": "Okta Identity Cloud — SSO + MFA (per user/yr)",
-                 "category": "Security", "qty": 500, "unit_price": 72, "vendor": "Okta"},
-                {"description": "Tenable.sc Vulnerability Management (500 assets)",
-                 "category": "Security", "qty": 1, "unit_price": 28000, "vendor": "Tenable"},
-                {"description": "Security Awareness Training Platform (per user/yr)",
-                 "category": "Security", "qty": 500, "unit_price": 15, "vendor": "KnowBe4"},
-                {"description": "SOC-as-a-Service — 24×7 MDR (monthly)",
-                 "category": "Managed Services", "qty": 12, "unit_price": 18500, "vendor": "Arctic Wolf"},
-            ],
-        }
-        # Pick closest matching template
-        items_raw = templates.get(category)
-        if items_raw is None:
-            for key in templates:
-                if any(w in category.lower() for w in key.lower().split("/")):
-                    items_raw = templates[key]
-                    break
-        if items_raw is None:
-            items_raw = templates["Data Center / COLO"]
-
-        line_items = []
-        for i, item in enumerate(items_raw, 1):
-            ext = item["qty"] * item["unit_price"]
-            line_items.append({
-                "line_number": i,
-                "description": item["description"],
-                "category": item["category"],
-                "unit": "/unit",
-                "qty": item["qty"],
-                "unit_price": item["unit_price"],
-                "ext_price": ext,
-                "vendor": item["vendor"],
-                "status": "draft",
-            })
-
-        total = sum(li["ext_price"] for li in line_items)
-        return {
-            "project": project,
-            "category": category,
-            "total_value": total,
-            "currency": "USD",
-            "line_items": line_items,
-        }

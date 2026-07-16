@@ -597,7 +597,12 @@ export default function ChatPage() {
   const clearHidden = () => localStorage.removeItem(HIDDEN_KEY)
   const filterSessions = (sessions) => {
     const hidden = loadHidden()
-    return sessions.filter(s => !hidden.has(s.session_id) && (s.message_count || 0) > 0)
+    // Show sessions that: (1) are not deleted, AND (2) have at least 1 message
+    // OR have a meaningful title/category (brand-new session before first reply)
+    return sessions.filter(s =>
+      !hidden.has(s.session_id) &&
+      ((s.message_count || 0) > 0 || s.title || s.category)
+    )
   }
 
   // ── Conversation localStorage cache ─────────────────────────────────────
@@ -688,13 +693,22 @@ export default function ChatPage() {
         type: 'text',
         text: m.content || '',
       }))
+      // Dedup: keep unique messages by (role + first 120 chars of text)
+      const dedup = (msgs) => {
+        const seen = new Set()
+        return msgs.filter(m => {
+          const key = (m.role || '') + ':' + (m.text || '').slice(0, 120)
+          if (seen.has(key)) return false
+          seen.add(key); return true
+        })
+      }
       const cached = loadConvCache(sid)
-      const toShow = (cached?.length || 0) > fromBackend.length ? cached : (fromBackend.length ? fromBackend : null)
+      const toShow = (cached?.length || 0) > fromBackend.length ? dedup(cached) : (fromBackend.length ? dedup(fromBackend) : null)
       if (toShow?.length) {
         setMessages(toShow)
         if (fromBackend.length >= (cached?.length || 0) && fromBackend.length) saveConvCache(sid, toShow)
       } else {
-        setMessages([{ id: 'empty', role: 'ai', type: 'text', text: 'Session loaded — no messages found.' }])
+        setMessages([{ id: 'empty', role: 'ai', type: 'text', text: 'Session loaded \u2014 no messages found.' }])
       }
     }).catch(() => {
       const cached = loadConvCache(sid)
@@ -839,18 +853,19 @@ export default function ChatPage() {
           sid = startResp.session_id
           setSessionId(sid)
           sessionStorage.setItem('chat_session_id', sid)
-          // Add to history sidebar immediately
+          // Add to history sidebar immediately (optimistic update)
           setChatHistory(prev => [{
             session_id: sid,
             category: cat,
             status: 'active',
-            title: proj + ' — ' + cat,
+            title: proj + ' \u2014 ' + cat,
             progress: 0,
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           }, ...prev])
-          // Store welcome — only show it if the next sendMessage doesn't produce a BOM
-          var pendingWelcome = startResp.message
+          // NOTE: startResp.message (welcome) is intentionally NOT shown here.
+          // The streaming response will be the first visible AI message.
+          // Showing both would create a duplicate/ghost message (the original bug).
         }
         let resp
         let streamingSucceeded = false
@@ -861,58 +876,65 @@ export default function ChatPage() {
             resp = await chatApi.sendMessageWithAttachment(sid, userText, capturedFile, capturedCategory)
           } else {
             // ── SSE streaming path ─────────────────────────────────────────
+            // Add a placeholder AI message updated in-place as tokens arrive.
+            // We do NOT replace the streamed text with a summary afterward —
+            // that was the "overriding" bug. The AI's own text IS the display.
             let streamingText = ''
             let streamDone = false
-            // Add a placeholder AI message that will be updated in-place
             setMessages(prev => [...prev, { id: streamMsgId, role: 'ai', type: 'text', text: '…', _streamId: streamMsgId }])
             setIsTyping(false)
             for await (const frame of chatApi.streamMessage(sid, userText)) {
               if (!frame.done) {
                 streamingText += frame.token
-                setMessages(prev => prev.map(m => m._streamId === streamMsgId
-                  ? { ...m, text: streamingText }
-                  : m))
+                setMessages(prev => prev.map(m =>
+                  m._streamId === streamMsgId ? { ...m, text: streamingText } : m
+                ))
               } else {
                 streamDone = true
                 streamingSucceeded = true
-                resp = { response: streamingText, progress: frame.progress || 0, complete: frame.complete || false, partial_bom: frame.bom || null, suggestions: frame.suggestions || [] }
-                setMessages(prev => prev.map(m => m._streamId === streamMsgId
-                  ? { ...m, text: streamingText, _streamId: undefined }
-                  : m))
+                // Keep the streamed text as-is — do NOT replace it with a summary.
+                // Just attach metadata (type, bom, suggestions) to the existing message.
+                resp = {
+                  response: streamingText,
+                  progress: frame.progress || 0,
+                  complete: frame.complete || false,
+                  partial_bom: frame.bom || null,
+                  suggestions: frame.suggestions || [],
+                  session_title: frame.session_title || null,
+                }
+                setMessages(prev => prev.map(m =>
+                  m._streamId === streamMsgId
+                    ? { ...m, text: streamingText, _streamId: undefined }
+                    : m
+                ))
               }
             }
             if (!streamDone) throw new Error('Stream ended without done frame')
           }
         } catch (sendErr) {
-          // Streaming failed — fall back to blocking /chat
-          // Remove the streaming placeholder if it was added
+          // Streaming failed — fall back to blocking /chat ONLY for attachment path.
+          // For text messages: do NOT call /chat as a fallback — that would append
+          // the user message a second time to the backend session (double-write bug).
           setMessages(prev => prev.filter(m => m._streamId !== streamMsgId))
           streamingSucceeded = false
-          try {
-            resp = capturedFile
-              ? await chatApi.sendMessageWithAttachment(sid, userText, capturedFile, capturedCategory)
-              : await chatApi.sendMessage(sid, userText)
-          } catch (fallbackErr) {
-            if (fallbackErr?.response?.status === 404 || fallbackErr?.response?.status === 422) {
-              setSessionId(null)
-              const cat  = detectCategory(userText) || ctx.category || 'Data Center / COLO'
-              const proj = detectProject(userText) || ctx.project || 'New Project'
-              const startResp = await chatApi.startSession(cat, proj)
-              sid = startResp.session_id
-              setSessionId(sid)
-              sessionStorage.setItem('chat_session_id', sid)
-              resp = capturedFile
-                ? await chatApi.sendMessageWithAttachment(sid, userText, capturedFile, capturedCategory)
-                : await chatApi.sendMessage(sid, userText)
-            } else {
-              throw fallbackErr
+          if (capturedFile) {
+            try {
+              resp = await chatApi.sendMessageWithAttachment(sid, userText, capturedFile, capturedCategory)
+            } catch (attachErr) {
+              throw attachErr
             }
+          } else {
+            // For text: show error, let user retry — don't double-write session
+            addMsg({ role: 'ai', type: 'text', text: '⚠️ Stream error — please try again. (Tip: check backend is running on port 8001)' })
+            sendingRef.current = false
+            setIsTyping(false)
+            return
           }
         }
-        setIsTyping(false)  // ensure spinner hidden (streaming sets it early; attachment path needs it here)
+        setIsTyping(false)
         setPhaseProgress(resp.progress || 0)
 
-        // If BOM was generated by AI, convert and show it
+        // Convert backend BOM to frontend format
         let aiBOM = null
         if (resp.partial_bom) {
           const proj = detectProject(userText) || ctx.project || 'New Project'
@@ -920,66 +942,43 @@ export default function ChatPage() {
           if (aiBOM) { setLocalBOM(aiBOM); dispatch(setCurrentBOM(aiBOM)) }
         }
 
-        // Show welcome only when the response is NOT a BOM creation
-        // (avoids redundant "Hello..." + "✅ Created..." back-to-back)
-        if (pendingWelcome && !resp.complete) {
-          addMsg({ role: 'ai', type: 'text', text: pendingWelcome })
-        }
-
-        // Auto-save to backend when BOM is complete
+        // Auto-save when BOM is complete
         if (resp.complete && aiBOM) {
           try {
             await bomApi?.create?.(aiBOM)
             dispatch(saveBOM(aiBOM))
             dispatch(pushNotification({ type: 'bom_created', title: 'BOM Created', message: `${aiBOM.name} — ${aiBOM.lineItems.length} items · ${fmt(aiBOM.totalValue)}`, link: '/bom-library' }))
             setToast({ open: true, msg: 'BOM saved to library automatically', severity: 'success' })
-          } catch { /* save is best-effort */ }
+          } catch { /* best-effort */ }
         }
 
-        // When BOM is complete, build a clean human-readable summary instead of
-        // showing the raw response text (which may still contain JSON remnants)
-        let displayText = resp.response || ''
-        if (resp.complete && aiBOM) {
-          const cats = [...new Set(aiBOM.lineItems.map(li => li.category))]
-          displayText = (
-            `✅ Created **${aiBOM.name}**\n\n` +
-            `**${aiBOM.lineItems.length} line items** | Total: **${fmt(aiBOM.totalValue)}**\n` +
-            `Categories: ${cats.join(' · ')}\n\n` +
-            `The BOM is live in the panel on the right. You can:\n` +
-            `- Change item 2 qty to 8\n` +
-            `- Remove item 5\n` +
-            `- Analyze cost savings\n` +
-            `- Export as CSV\n` +
-            `- Save to BOM Library`
-          )
-        }
-
-        // For streaming path: placeholder is already in the list, update it with final metadata.
-        // For attachment/fallback path: add a new message via addMsg.
+        // For streaming path: the text is already correct in the placeholder.
+        // Only update the TYPE and attach BOM metadata — never replace the text.
         if (streamingSucceeded) {
           setMessages(prev => prev.map(m => m.id === streamMsgId ? {
             ...m,
-            type: resp.complete ? 'bom_created' : 'text',
-            text: displayText,
+            type: resp.complete && aiBOM ? 'bom_created' : 'text',
             bom: aiBOM || undefined,
             actions: resp.complete && aiBOM ? ['library', 'rfq'] : undefined,
             suggestions: resp.suggestions?.length ? resp.suggestions : undefined,
           } : m))
         } else {
+          // Attachment fallback path — add new message
           addMsg({
             role: 'ai',
-            type: resp.complete ? 'bom_created' : 'text',
-            text: displayText,
+            type: resp.complete && aiBOM ? 'bom_created' : 'text',
+            text: resp.response || '',
             bom: aiBOM,
             actions: resp.complete && aiBOM ? ['library', 'rfq'] : undefined,
             attachment: resp.attachment || null,
             suggestions: resp.suggestions?.length ? resp.suggestions : undefined,
           })
         }
-        // When creating a new BOM while one already exists → session divider + reset session
-        if (resp.complete && aiBOM && currentBOM) {
+        // When creating a new BOM while one already exists → show a session divider
+        // but keep the session alive so follow-up questions (EOL risk, lead times, etc.)
+        // are answered in context. User can start a fresh session via the + button.
+        if (resp.complete && aiBOM && currentBOM && currentBOM.id !== aiBOM.id) {
           addMsg({ role: 'divider', type: 'divider', prevBOM: currentBOM.name })
-          setSessionId(null)
         }
         // Update session title in sidebar when backend provides one
         if (resp.session_title && sid) {
@@ -1001,12 +1000,15 @@ export default function ChatPage() {
         // a single transient error killing the entire AI session.
         console.warn('Backend AI error:', err?.message)
         backendFailCount.current += 1
+        // Never permanently kill backendMode — backend may recover on next message.
+        // After 2 consecutive failures show a toast; reset counter so user can retry.
         if (backendFailCount.current >= 2) {
-          setBackendMode(false)
+          backendFailCount.current = 0   // reset so next send re-attempts backend
         }
         if (!backendWarnedRef.current) {
           backendWarnedRef.current = true
-          setToast({ open: true, msg: backendFailCount.current >= 2 ? 'AI backend unavailable — using local mode' : 'AI request failed — retrying locally for this message', severity: 'warning' })
+          setTimeout(() => { backendWarnedRef.current = false }, 30000)  // re-arm after 30s
+          setToast({ open: true, msg: 'AI backend returned an error — using local templates for this message', severity: 'warning' })
         }
       }
     }
@@ -1023,11 +1025,10 @@ export default function ChatPage() {
       if (resp.type === 'bom_created' && resp.bom) {
         dispatch(pushNotification({ type: 'bom_created', title: 'BOM Created', message: `${resp.bom.name} — ${resp.bom.lineItems.length} items · ${fmt(resp.bom.totalValue)}`, link: '/bom-library' }))
       }
-      // When creating a NEW BOM while one already exists → insert a session divider
-      // and reset the backend session so the next creation gets a fresh context
+      // When creating a NEW BOM while one already exists → insert a session divider.
+      // Keep session alive so follow-up questions work in context.
       if (resp.type === 'bom_created' && currentBOM) {
         addMsg({ role: 'divider', type: 'divider', prevBOM: currentBOM.name })
-        setSessionId(null)
       }
       addMsg({ role: 'ai', ...resp })
       sendingRef.current = false

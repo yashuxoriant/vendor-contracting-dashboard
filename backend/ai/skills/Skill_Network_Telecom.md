@@ -206,6 +206,200 @@ Mandatory when site_count > 3 or when remote cutover configuration is required:
 |---|---|---|---|
 | **MPLS private circuit (new)** | **12–20 weeks** | Flag if Day 1 < 22 weeks away | **Highest-risk item in any network separation** |
 | SD-WAN broadband (new address) | 4–8 weeks | Flag if Day 1 < 10 weeks away | |
+| Cisco Catalyst switch (high-end) | 16–26 weeks | Flag if Day 1 < 28 weeks away | Supply chain constraints; order early |
+| Firewall appliance (PA/FortiGate) | 8–16 weeks | Flag if Day 1 < 18 weeks away | |
+| OOB console server | 2–4 weeks | Flag if Day 1 < 6 weeks away | |
+
+---
+
+## Conveying / Shared / Dedicated Decision Tree
+
+> **This is Chetan's Rule #1:** "Shared or dedicated? If dedicated, is it conveying? If conveying → don't buy. If not conveying → buy net new. If end of life → buy replacement."
+
+```
+FOR EACH site:
+
+  STEP 1 — Is the network infrastructure shared or dedicated to this entity?
+    SHARED (e.g., used by multiple tenants, MSP-owned, parent company owned):
+      → The standalone entity has NO existing equipment to convey
+      → Scope = BUY NET NEW for all layers
+      → Do not qualify further — go straight to sizing
+
+    DEDICATED (equipment exclusively used by this entity today):
+      → Continue to STEP 2
+
+  STEP 2 — Is the dedicated equipment conveying in the deal?
+    CONVEYING = equipment transfers to the standalone entity at Day 1
+    NOT CONVEYING = equipment stays with seller / MSP / parent
+
+    NOT CONVEYING:
+      → Scope = BUY NET NEW for all layers
+      → Same as shared — size fresh
+
+    CONVEYING:
+      → Continue to STEP 3
+
+  STEP 3 — Is the conveying equipment EOL or EOS?
+    EOL = End of Life (no longer sold, support ended)
+    EOS = End of Support / End of Service Life (still runs but vendor support contract not available)
+
+    Check against EOL/EOS database for the specific model.
+
+    CONVEYING + ACTIVE (not EOL/EOS):
+      → Do NOT generate replacement hardware line items
+      → Scope = integration work only:
+          * License migration / transfer fees
+          * SmartNet / maintenance contract on conveyed hardware (new contract under standalone entity)
+          * Configuration changes (professional services)
+          * Any missing layer (e.g., firewall conveying but no WAN router → buy WAN router only)
+
+    CONVEYING + EOL/EOS:
+      → Generate REPLACEMENT hardware line items (full bundle per component — see SKU Bundles section)
+      → Add annotation: "Replacement required — conveyed hardware is EOL/EOS: [model] [EOL date]"
+      → recommendation_status = "replace_eol"
+
+  STEP 4 — How many sites?
+    total_quantity = quantity_per_site × number_of_sites
+    Annotate each line item: quantity_basis = "[qty] per site × [N] sites = [total]"
+    NEVER put just a number without this breakdown when site_count > 1
+
+  STEP 5 — Site criticality
+    CRITICAL site (HQ, primary DC, hub site, compliance-regulated):
+      → Full HA pair for ALL layers (core switch + firewall + WAN router)
+      → quantity_per_site doubles for all HA-affected line items
+    STANDARD site:
+      → HA at firewall layer only (by default)
+      → Single WAN router acceptable if bandwidth < 100Mbps
+```
+
+---
+
+## Full SKU Bundles — Complete Component Sets
+
+> **Core principle (Chetan's exact words):** "A Cisco router is not one SKU. It always has 8 lines — some are software, some are maintenance. Getting to those 8 lines takes 4–6 weeks. With AI, we get there in 6 hours."
+
+**RULE: Every hardware component MUST generate its complete bundle. Never output a single-line "Cisco Router". Always expand to the full bundle below.**
+
+---
+
+### Bundle 1 — Cisco SD-WAN / WAN Router (8 lines)
+
+Use when: SD-WAN deployment, WAN edge router, branch router for a dedicated/new site.
+Reference model: Cisco Catalyst 8300 series (adjust model by bandwidth tier).
+
+| # | Line | SKU Example | Category | Notes |
+|---|---|---|---|---|
+| 1 | Router chassis (base hardware) | C8300-1N1S-4T2X | Hardware | One per site; HA sites get 2 |
+| 2 | IOS XE SD-WAN software license | C8300-SDWAN-LIC | Software License | 3-year term minimum |
+| 3 | DNA Advantage / SD-WAN subscription | DNA-SDWAN-A-3Y | SaaS/Subscription | Per-device, co-terminus with hardware contract |
+| 4 | SmartNet maintenance (3-year) | CON-SNTP-C83001N | Support Contract | Mandatory on every hardware unit |
+| 5 | WAN interface module (per circuit type) | NIM-1GE-CU-SFP or NIM-2T | Interface Module | One per WAN circuit; include one spare |
+| 6 | SFP transceiver (per WAN port) | GLC-LH-SMD or SFP-10G-SR | Transceiver | Match fiber type to circuit hand-off |
+| 7 | Console cable + power cable | CAB-CONSOLE-USB, PWR-C1-715WAC | Accessories | One set per unit |
+| 8 | Rack mount kit | ACS-1900-RM-19 | Accessories | One per unit; confirm rack U availability |
+
+**BOM annotation required:** `ha_role` = "active" or "standby" on each unit line when HA pair.
+
+---
+
+### Bundle 2 — NGFW / Firewall (8–10 lines)
+
+Use when: deploying a next-generation firewall at any site (standalone or HA pair).
+Reference model: Fortinet FortiGate 200F / 400F or Palo Alto PA-820 / PA-1410.
+
+| # | Line | SKU Example (Fortinet) | SKU Example (Palo Alto) | Category | Notes |
+|---|---|---|---|---|---|
+| 1 | Firewall appliance | FG-200F | PA-820 | Hardware | Two units for HA pair |
+| 2 | IPS / IDS license | FC-10-0200F-108-02-36 | PAN-PA-820-TP3 | Security License | 3-year; required for NGFW classification |
+| 3 | URL filtering license | FC-10-0200F-112-02-36 | PAN-PA-820-URL2-3YR | Security License | 3-year |
+| 4 | SSL inspection / deep packet inspection | FC-10-0200F-131-02-36 | Included in TP bundle | Security License | Size appliance at 2× throughput if enabled |
+| 5 | Advanced malware protection (AMP/Sandbox) | FC-10-0200F-100-02-36 | PAN-PA-820-DNS-3YR | Security License | Optional but recommended for critical sites |
+| 6 | HA peer unit (same model) | FG-200F | PA-820 | Hardware | HA pair only; annotate ha_role = "standby" |
+| 7 | Hardware support / FortiCare (3-year) | FC-10-0200F-247-02-36 | PAN-SVC-PREM-820-3YR | Support Contract | One per physical unit |
+| 8 | Rack mount kit + power cable | SP-FG200F-RACK | Included | Accessories | |
+| 9 | SFP uplinks (to core switch) | SFP-10G-SR (×2 per unit) | SFP-PLUS-SR | Transceiver | Match switch uplink ports |
+| 10 | Professional services — firewall policy migration | PS-FW-MIGRATION | — | Services | Scope hours based on ruleset count |
+
+---
+
+### Bundle 3 — LAN Access Switch (5 lines)
+
+Use when: deploying access layer switching (end-user floor switches).
+Reference model: Cisco Catalyst 9300-48P (PoE) or Aruba 2930F-48G-PoE+.
+
+| # | Line | SKU Example (Cisco) | SKU Example (Aruba) | Category | Notes |
+|---|---|---|---|---|---|
+| 1 | Switch chassis | C9300-48P-A | JL260A | Hardware | One per 48 users; stack in pairs |
+| 2 | Network advantage license | C9300-48-A | Included | Software License | Required for OSPF, QoS, NetFlow |
+| 3 | Stacking cable (if stacked) | STACK-T1-50CM (×2) | J9578A | Accessories | One pair per stack; for 2-switch stacks |
+| 4 | SmartNet / Aruba support (3-year) | CON-3SNT-C9300 | H7J35A3 | Support Contract | Per switch chassis |
+| 5 | SFP uplink transceivers | SFP-10G-SR (×2) | J9151E (×2) | Transceiver | Two 10G uplinks per switch to distribution |
+
+**PoE annotation required on every access switch line:**
+`notes` = "PoE budget: [calculated_load]W / [switch_capacity]W — [headroom]% available"
+
+---
+
+### Bundle 4 — Wireless Access Point (4 lines)
+
+Use when: deploying WiFi coverage at any site (office, warehouse, or outdoor).
+Reference model: Cisco Catalyst 9130AXI (indoor) / 9124AXD (outdoor), Aruba AP555.
+
+| # | Line | SKU Example (Cisco) | SKU Example (Aruba) | Category | Notes |
+|---|---|---|---|---|---|
+| 1 | Access point unit | C9130AXI-B | JZ332A | Hardware | Count = density formula from Sizing Rules |
+| 2 | PoE injector (if switch PoE budget full) | AIR-PWRINJ6= | JW629A | Accessories | Include only if switch PoE is over 80% budget |
+| 3 | Cloud / controller license | DNA-PREM-AP-3Y | JW635AAE (Aruba Central) | SaaS/Subscription | Per AP, 3-year; do NOT mix on-prem and cloud |
+| 4 | Mounting hardware | AIR-AP-BRACKET-2= | JYMQ-0001 | Accessories | Ceiling T-bar or solid ceiling — confirm with facilities |
+
+**Outdoor APs:** replace line 1 with outdoor-rated model (C9124AXD, Aruba AP565); add IP67-rated enclosure line.
+
+---
+
+### Bundle 5 — Distribution / Core Switch (5 lines)
+
+Use when: deploying distribution or core layer switches (sites > 200 users or data center top-of-rack).
+Reference model: Cisco Catalyst 9500-24Y4C or Cisco Nexus 93180YC-FX (DC).
+
+| # | Line | SKU Example | Category | Notes |
+|---|---|---|---|---|
+| 1 | Distribution/core switch chassis | C9500-24Y4C-A | Hardware | One per pair for HA; two for redundant design |
+| 2 | Network premier license | C9500-24Y4C-A (license included) or C9500-NW-A | Software License | Required for layer-3 routing, VXLAN |
+| 3 | SmartNet (3-year) | CON-3SNT-C9500 | Support Contract | Per chassis |
+| 4 | 25G/100G SFP/QSFP transceivers | SFP-25G-SR-S, QSFP-100G-SR4-S | Transceiver | 2× per switch for inter-switch links; 1× per access uplink |
+| 5 | Rack mount kit + power cord | — | Accessories | Confirm PDU power type (C13/C19) |
+
+---
+
+### Bundle 6 — SD-WAN / WAN Cisco FortiGate Router (Budget Vendor — 7 lines)
+
+Use when: budget WAN edge, APAC/smaller sites, or Fortinet is the stated vendor standard.
+Reference model: FortiGate 200F (WAN) or FortiGate 100F (small branch).
+
+| # | Line | SKU Example | Category | Notes |
+|---|---|---|---|---|
+| 1 | FortiGate appliance | FG-200F or FG-100F | Hardware | One per site; HA sites get 2 |
+| 2 | FortiCare Premium support (3-year) | FC-10-F200F-247-02-36 | Support Contract | Per unit |
+| 3 | FortiGuard Enterprise Protection (SD-WAN) | FC-10-F200F-811-02-36 | Security License | Includes IPS, AV, URL, App Control, SD-WAN |
+| 4 | WAN interface module / SFP | FG-TRAN-GC or FG-TRAN-SFP+SR | Interface/Transceiver | Per WAN port type |
+| 5 | Console cable + power cable | Included / SP-Cable-D9F-C | Accessories | |
+| 6 | Rack mount kit | SP-FG200F-RACK | Accessories | |
+| 7 | FortiManager license (if centrally managed) | FC-10-FG100-175-02-12 (annual) | Software License | One per deployment if FortiManager in scope |
+
+---
+
+## How to Apply Bundles in a BOM
+
+When a user says "we need routers for 10 sites":
+
+1. Identify the right bundle (e.g., Bundle 1 — Cisco SD-WAN Router)
+2. Multiply each line by site count: `quantity = [per-site qty] × 10 sites`
+3. Annotate: `quantity_basis = "2 per site × 10 sites = 20"`
+4. For HA pair sites: `ha_role` = "active" / "standby" alternating on each unit line
+5. Set `order_sequence` = 1 for OOB/console servers, 2 for routers, 3 for switches, 4 for firewalls, 5 for APs, 6 for licenses, 7 for services
+6. Tag `price_basis` = "list" until vendor quotes are received; set to "negotiated" after quotes
+
+**Never collapse 8 lines into 1 line.** A BOM with a single "Cisco Router" line will be rejected at the Vendor-Ready BOM Gate above.
 | Dark fiber / dedicated wavelength | 16–26 weeks | Flag if Day 1 < 28 weeks away | Initiate immediately |
 | Colocation cross-connect | 2–4 weeks | Flag if Day 1 < 6 weeks away | |
 | Cisco switches (standard SKU) | 8–14 weeks | Flag if Day 1 < 16 weeks away | |

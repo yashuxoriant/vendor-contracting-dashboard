@@ -165,6 +165,7 @@ class ChatMessage(BaseModel):
     role: str
     content: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
+    message_id: str = Field(default_factory=lambda: f"msg_{uuid4().hex[:12]}")
     metadata: Dict[str, Any] = {}
 
 
@@ -182,7 +183,8 @@ class SessionContext(BaseModel):
     # Sprint 3 — BOM embedding pipeline
     bom_id: Optional[str] = None        # Scopes vector search to a specific indexed BOM
     domain_preselected: bool = False    # True when user chose domain from the picker UI
-    agent_state: Dict[str, Any] = {}   # BOM extraction decision fields (Steps 1-8)
+    agent_state: Dict[str, Any] = {}   # BOM extraction decision fields (all phases)
+    current_phase_name: str = "intake"  # LangGraph phase name: intake/qualify/scope/sizing/generate/validate/complete
 
 
 class ChatSession(BaseModel):
