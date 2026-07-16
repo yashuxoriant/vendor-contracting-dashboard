@@ -1,0 +1,39 @@
+# extractor/requirements.txt
+
+# SharePoint / Microsoft Graph
+requests
+office365-rest-python-client
+llama-index-core
+# AI APIs
+anthropic
+llama-cloud
+openai
+groq
+llama-parse
+# File Processing
+pandas
+openpyxl
+pdfplumber
+PyMuPDF
+pymupdf
+pypdf
+python-docx
+PyGithub
+# Utilities
+python-dotenv
+httpx
+pytesseract
+Pillow
+
+fastapi
+uvicorn[standard]
+httpx
+python-multipart
+pydantic
+PyPDF
+beautifulsoup4
+lxml
+duckduckgo-search
+msal
+office365-rest-python-client
+tenacity

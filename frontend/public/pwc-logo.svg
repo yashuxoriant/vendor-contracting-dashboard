@@ -1,0 +1,8 @@
+<svg width="150" height="80" xmlns="http://www.w3.org/2000/svg">
+  <!-- PwC Orange Stripes -->
+  <path d="M 85 15 L 110 15 L 95 35 L 70 35 Z" fill="#D04A02"/>
+  <path d="M 100 25 L 125 25 L 110 45 L 85 45 Z" fill="#E8703A"/>
+  
+  <!-- pwc text -->
+  <text x="10" y="65" font-family="'Playfair Display', Georgia, serif" font-size="48" font-weight="800" fill="#000000" letter-spacing="-2">pwc</text>
+</svg>
