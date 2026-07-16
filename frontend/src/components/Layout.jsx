@@ -25,7 +25,6 @@ const menuItems = [
   { text: 'Vendor Price Selector', icon: <CompareIcon sx={{ fontSize: 17 }} />, path: '/vendor-selector' },
   { text: 'Quote Extractor', icon: <ReceiptIcon sx={{ fontSize: 17 }} />, path: '/quote-extractor' },
   { text: 'RFQ Builder', icon: <BuildIcon sx={{ fontSize: 17 }} />, path: '/rfq-builder' },
-  { text: 'EOL Management', icon: <WarningIcon sx={{ fontSize: 17 }} />, path: '/eol-management' },
 ]
 
 const ROLES = ['All Users', 'Buyer IT', 'Seller IT', 'SI / JBR', 'BOM Creator']

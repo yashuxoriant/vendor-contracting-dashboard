@@ -39,9 +39,8 @@ export const bomService = {
   },
 
   exportBOM: async (bomId, format = 'excel') => {
-    const response = await apiClient.post(
-      `/api/bom/export/${format}`,
-      { bom_id: bomId },
+    const response = await apiClient.get(
+      `/api/bom/${bomId}/export/excel`,
       { responseType: 'blob' }
     )
     return response.data

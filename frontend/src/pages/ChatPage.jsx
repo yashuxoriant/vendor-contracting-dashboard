@@ -3,14 +3,12 @@ import { useDispatch, useSelector } from 'react-redux'
 import { useNavigate } from 'react-router-dom'
 import {
   Box, Typography, TextField, IconButton, Paper, Chip, Button,
-  Avatar, Tooltip, LinearProgress, Snackbar, Alert, Menu, MenuItem,
+  Avatar, Tooltip, LinearProgress, Snackbar, Alert,
   Dialog, DialogContent, DialogTitle, DialogActions,
 } from '@mui/material'
 import {
   Send, Add, AutoAwesome, Save, Build, Download,
-  Person, FolderOpen, CloudDone, CloudOff, RateReview, DeleteOutline,
-  AttachFile, InsertDriveFile, Close, CheckCircle,
-  TableChart, PictureAsPdf, Description, Code,
+  Person, FolderOpen, CloudDone, CloudOff, RateReview, DeleteOutline, Close,
 } from '@mui/icons-material'
 import { saveBOM, deleteBOM, setCurrentBOM, setActiveBOMForRFQ } from '../store/slices/bomSlice'
 import { pushNotification } from '../store/slices/notificationsSlice'
@@ -157,7 +155,7 @@ function buildBOM(project, category, qty = 1) {
 const fmt = (v) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(v)
 
 // BOM modification commands — always handled locally (backend has no in-memory BOM state)
-function isLocalBOMCmd(msg) {
+function isLocalBOMCmd(msg, hasBOM = false) {
   const m = msg.toLowerCase().trim()
   return (
     // Explicit item-level updates: "change item 2 qty to 8", "update item 3 price to $500"
@@ -169,13 +167,14 @@ function isLocalBOMCmd(msg) {
     /\b(add|include|insert)\s+(a\s+)?(new\s+)?(item|service|product|tool|software|license)/i.test(m) ||
     // "modify/update this BOM by adding..."
     /\b(modify|update|change)\s+(this\s+)?(bom|list)\s+(by\s+)?(adding|including|inserting)/i.test(m) ||
-    // Save / confirm
-    /^(save|confirm|done|ok|yes|looks good|perfect)/.test(m) ||
-    // Export
-    /^(export|download|csv|excel)/.test(m) ||
-    // Analysis
-    /^(analyz|insight|saving|cost|cheaper|break|summary|show\s+(cost|spend))/.test(m) ||
-    // List BOMs
+    // Save / confirm — ONLY intercept when a draft BOM is in the panel.
+    // Without this guard, "confirmed" during agent intake would be swallowed locally.
+    (hasBOM && /^(save|confirm|done|ok|yes|looks good|perfect)/.test(m)) ||
+    // Export — only meaningful when a BOM exists
+    (hasBOM && /^(export|download|csv|excel)/.test(m)) ||
+    // Analysis — only meaningful when a BOM exists
+    (hasBOM && /^(analyz|insight|saving|cost|cheaper|break|summary|show\s+(cost|spend))/.test(m)) ||
+    // List BOMs — always local (reads Redux store)
     /^(show|list)\s+(my\s+)?(bom|all)/.test(m) ||
     // Load / RFQ
     /^(load|open|edit)\s+/.test(m) ||
@@ -429,90 +428,40 @@ function getAIResponse(userMsg, currentBOM, bomList, ctx) {
   }
 }
 
-// ── BOM domain options shown in the New BOM picker modal ──────────────────
-const BOM_DOMAINS = [
-  { key: 'Data Center / COLO',    label: 'Data Center / COLO',    icon: '🏗️', desc: 'DC builds, colocation, server infra' },
-  { key: 'SD-WAN',                label: 'SD-WAN / WAN',          icon: '🌐', desc: 'SD-WAN edges, MPLS, branch networking' },
-  { key: 'Cybersecurity',         label: 'Cybersecurity',         icon: '🔒', desc: 'EDR, SIEM, PAM, Zero Trust, WAF' },
-  { key: 'End User Computing',    label: 'End User Computing',    icon: '💻', desc: 'Laptops, VDI, peripherals, EUC fleet' },
-  { key: 'M365 & Power Platform', label: 'M365 & Power Platform', icon: '☁️', desc: 'Microsoft 365, Teams, SharePoint' },
-  { key: 'Network Equipment',     label: 'Network Equipment',     icon: '🔌', desc: 'Switches, routers, firewalls, APs' },
-  { key: 'Cloud Infrastructure',  label: 'Cloud Infrastructure',  icon: '⚡', desc: 'Azure, AWS, hybrid cloud landing zones' },
-]
-
-// Steps used to compute live progress % in the BOM Preview sidebar panel.
-const INTAKE_STEPS = [
-  { key: 'ma_phase',                   label: 'M&A Phase' },
-  { key: 'workstream_category',        label: 'Category' },
-  { key: 'triggering_event',           label: 'Triggering Event' },
-  { key: 'site_entity_scope',          label: 'Sites in Scope' },
-  { key: 'site_classification_type',   label: 'Site Type' },
-  { key: 'site_classification_size',   label: 'Site Size' },
-  { key: 'conveyance_status',          label: 'Conveyance Status' },
-  { key: 'required_by_date',           label: 'Required-By Date' },
-  { key: 'vendor_standard_preferred',  label: 'Preferred Vendor' },
-  { key: 'requestor',                  label: 'Requestor' },
-]
-
 // Convert backend BOM (snake_case line_items) to frontend BOM (camelCase lineItems)
 function backendBOMtoFrontend(backendBOM, projectName) {
-  if (!backendBOM) return null
-  // Handle both "line_items" (default schema) and "bom_line_items" (skill file format)
-  const rawItems = backendBOM.line_items || backendBOM.bom_line_items || []
-  if (!rawItems.length) return null
-
-  const lineItems = rawItems.map((item, i) => {
-    const qty = item.qty || item.quantity || 1
-    const unitPrice = item.unit_price || 0
-    const extPrice = item.extended_price || item.ext_price || (unitPrice * qty) || 0
-    return {
-      id: 'li_ai_' + Date.now() + '_' + i,
-      lineNo: item.line_number || i + 1,
-      category: item.category || 'General',
-      description: item.description || '',
-      unit: item.unit || '/unit',
-      qty,
-      unitPrice,
-      extPrice,
-      vendor: item.vendor || '',
-      status: item.eol_flag ? 'eol_flagged' : (item.status || 'draft'),
-      sku: item.sku || item.part_number || '',
-      term: item.term || 'one-time',
-      orderSeq: item.order_sequence || item.order_seq || '',
-      notes: item.notes || '',
-      // skill file extra fields
-      haRole: item.ha_role || '',
-      siteName: item.site_name || '',
-      priceBasis: item.price_basis || '',
-      quantityBasis: item.quantity_basis || '',
-      recommendationStatus: item.recommendation_status || '',
-      eolWarning: item.eol_warning || '',
-    }
-  })
-
-  const totalValue = lineItems.reduce((s, i) => s + (i.extPrice || 0), 0)
+  if (!backendBOM || !backendBOM.line_items) return null
+  const lineItems = backendBOM.line_items.map((item, i) => ({
+    id: 'li_ai_' + Date.now() + '_' + i,
+    lineNo: item.line_number || i + 1,
+    category: item.category || 'General',
+    description: item.description || '',
+    unit: item.unit || '/unit',
+    // backend template uses 'qty', BOM schema uses 'quantity' — handle both
+    qty: item.qty || item.quantity || 1,
+    unitPrice: item.unit_price || 0,
+    // backend template uses 'ext_price', schema uses 'extended_price'
+    extPrice: item.ext_price || item.extended_price || (item.unit_price || 0) * (item.qty || item.quantity || 1),
+    vendor: item.vendor || '',
+    status: item.eol_flag ? 'eol_flagged' : (item.status || 'draft'),
+    sku: item.sku || '',
+    term: item.term || item.unit || 'one-time',
+    orderSeq: item.order_sequence || '',
+    notes: item.notes || '',
+  }))
+  const totalValue = lineItems.reduce((s, i) => s + i.extPrice, 0)
   const cat = backendBOM.category || 'Data Center / COLO'
-  const proj = backendBOM.project || backendBOM.qualification_basis?.site_groups?.[0]?.name || projectName || 'New Project'
-  const maturity = backendBOM.bom_maturity || 'budgetary'
-
+  const proj = backendBOM.project || projectName || 'New Project'
   return {
     id: 'bom_ai_' + Date.now(),
     name: backendBOM.name || (proj + ' — ' + cat + ' BOM'),
     project: proj,
     category: cat,
-    status: 'draft',
-    version: 1,
-    maturity,
-    bomScope: backendBOM.bom_scope || '',
-    referenceBomRef: backendBOM.reference_bom_ref || '',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    status: 'draft', version: 1,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     createdBy: 'AI Agent',
-    lineItems,
-    totalValue,
+    lineItems, totalValue,
     warnings: backendBOM.warnings || [],
-    assumptions: backendBOM.assumptions || [],
-    humanValidationStatus: backendBOM.human_validation_status || 'pending',
     approvalsRequired: backendBOM.approvals_required || ['Buyer IT', 'Seller IT', 'SI Technical Team'],
     history: [{ version: 1, timestamp: new Date().toISOString(), action: 'Generated by AI Agent', changes: lineItems.length + ' line items', user: 'AI Assistant', totalValue }],
   }
@@ -546,6 +495,32 @@ async function exportBOMExcel(bom, dispatchFn) {
   }
 }
 
+// ── BOM domain options shown in the picker modal ─────────────────────────
+const BOM_DOMAINS = [
+  { key: 'Data Center / COLO',    label: 'Data Center / COLO',    icon: '🏢', desc: 'DC builds, colocation, server infra' },
+  { key: 'SD-WAN',                label: 'SD-WAN / WAN',          icon: '🌐', desc: 'SD-WAN edges, MPLS, branch networking' },
+  { key: 'Cybersecurity',         label: 'Cybersecurity',         icon: '🔒', desc: 'EDR, SIEM, PAM, Zero Trust, WAF' },
+  { key: 'End User Computing',    label: 'End User Computing',    icon: '💻', desc: 'Laptops, VDI, peripherals, EUC fleet' },
+  { key: 'M365 & Power Platform', label: 'M365 & Power Platform', icon: '☁️', desc: 'Microsoft 365, Teams, SharePoint' },
+  { key: 'Network Equipment',     label: 'Network Equipment',     icon: '🔌', desc: 'Switches, routers, firewalls, APs' },
+  { key: 'Cloud Infrastructure',  label: 'Cloud Infrastructure',  icon: '⚡', desc: 'Azure, AWS, hybrid cloud landing zones' },
+]
+
+// Steps used to compute live progress % in the BOM Preview panel sidebar.
+// Progress = (steps answered / total steps) * 100
+const INTAKE_STEPS = [
+  { key: 'ma_phase',                   label: 'M&A Phase' },
+  { key: 'workstream_category',        label: 'Category' },
+  { key: 'triggering_event',           label: 'Triggering Event' },
+  { key: 'site_entity_scope',          label: 'Sites in Scope' },
+  { key: 'site_classification_type',   label: 'Site Type' },
+  { key: 'site_classification_size',   label: 'Site Size' },
+  { key: 'conveyance_status',          label: 'Conveyance Status' },
+  { key: 'required_by_date',           label: 'Required-By Date' },
+  { key: 'vendor_standard_preferred',  label: 'Preferred Vendor' },
+  { key: 'requestor',                  label: 'Requestor' },
+]
+
 export default function ChatPage() {
   const dispatch = useDispatch()
   const navigate = useNavigate()
@@ -569,20 +544,13 @@ export default function ChatPage() {
   const [backendChecked, setBackendChecked] = useState(false)
   const [toast, setToast] = useState({ open: false, msg: '', severity: 'info' })
 
-  // Attachment state
-  const [attachedFile, setAttachedFile]     = useState(null)
-  const [attachCategory, setAttachCategory] = useState('BOMs')
-  const [categoryMenuAnchor, setCategoryMenuAnchor] = useState(null)
-  const fileInputRef = useRef(null)
+  // Domain picker + live intake progress tracking
+  const [domainPickerOpen, setDomainPickerOpen] = useState(false)
+  const [intakeFields, setIntakeFields] = useState({})   // collected step fields for sidebar progress
+  const [confirmDeleteEntry, setConfirmDeleteEntry] = useState(null) // {type:'chat'|'bom', item}
 
   // Chat history (from backend — persisted in Cosmos + ADLS)
   const [chatHistory, setChatHistory] = useState([])
-  const [sidebarSearch, setSidebarSearch] = useState('')
-
-  // Domain picker modal + intake progress tracking
-  const [domainPickerOpen, setDomainPickerOpen] = useState(false)
-  const [intakeFields, setIntakeFields] = useState({})
-  const [confirmDeleteEntry, setConfirmDeleteEntry] = useState(null) // {type:'chat'|'bom', item}
 
   // Derive current phase (1-10) from progress percentage
   const currentPhase = phaseProgress > 0 ? Math.max(1, Math.min(10, Math.ceil(phaseProgress / 10))) : 0
@@ -597,41 +565,10 @@ export default function ChatPage() {
   const clearHidden = () => localStorage.removeItem(HIDDEN_KEY)
   const filterSessions = (sessions) => {
     const hidden = loadHidden()
-    // Show sessions that: (1) are not deleted, AND (2) have at least 1 message
-    // OR have a meaningful title/category (brand-new session before first reply)
-    return sessions.filter(s =>
-      !hidden.has(s.session_id) &&
-      ((s.message_count || 0) > 0 || s.title || s.category)
-    )
+    return sessions.filter(s => !hidden.has(s.session_id) && (s.message_count || 0) > 0)
   }
 
-  // ── Conversation localStorage cache ─────────────────────────────────────
-  // Conversations survive backend restarts and ADLS transcript delays.
-  const CONV_CACHE_PREFIX = 'chat_conv_'
-  const BOM_SESSION_MAP_KEY = 'bom_session_map'
-
-  const saveBOMSession = (bomId, sid) => {
-    if (!bomId || !sid) return
-    try { const map = JSON.parse(localStorage.getItem(BOM_SESSION_MAP_KEY) || '{}'); map[bomId] = sid; localStorage.setItem(BOM_SESSION_MAP_KEY, JSON.stringify(map)) } catch (_) {}
-  }
-  const lookupBOMSession = (bomId) => {
-    if (!bomId) return null
-    try { return JSON.parse(localStorage.getItem(BOM_SESSION_MAP_KEY) || '{}')[bomId] || null } catch (_) { return null }
-  }
-  const saveConvCache = (sid, msgs) => {
-    if (!sid || !msgs?.length) return
-    try {
-      const payload = msgs.map(m => ({ role: m.role, type: m.type || 'text', text: m.text || '' }))
-      localStorage.setItem(CONV_CACHE_PREFIX + sid, JSON.stringify(payload))
-    } catch (_) {}
-  }
-  const loadConvCache = (sid) => {
-    try {
-      const raw = localStorage.getItem(CONV_CACHE_PREFIX + sid)
-      if (!raw) return null
-      return JSON.parse(raw).map((m, i) => ({ id: 'c_' + i, ...m }))
-    } catch (_) { return null }
-  }
+  // On mount: check backend + load chat history + restore previous session
   useEffect(() => {
     chatApi.ping().then(online => {
       setBackendMode(online)
@@ -641,21 +578,28 @@ export default function ChatPage() {
         chatApi.getHistory('demo_user', 50)
           .then(sessions => setChatHistory(filterSessions(sessions)))
           .catch(() => {})
-        // Restore last session across page refresh
+        // Restore session from sessionStorage so context persists across page refresh
         const savedSid = sessionStorage.getItem('chat_session_id')
         if (savedSid) {
           setSessionId(savedSid)
-          const cached = loadConvCache(savedSid)
-          if (cached?.length) {
-            setMessages(cached)
-          } else {
-            chatApi.getMessages(savedSid).then(data => {
-              const restored = (data.messages || []).map((m, i) => ({
-                id: 'r_' + i, role: m.role === 'assistant' ? 'ai' : m.role, type: 'text', text: m.content || '',
-              }))
-              if (restored.length) setMessages(restored)
-            }).catch(() => {})
-          }
+          chatApi.getTranscript(savedSid, 'demo_user')
+            .then(transcript => {
+              const conv = (transcript?.conversation || []).slice(1) // skip welcome msg
+              if (conv.length > 0) {
+                const restored = conv.map((m, i) => ({
+                  id: 'restored_' + i,
+                  role: m.role === 'user' ? 'user' : 'ai',
+                  type: 'text',
+                  text: m.content || '',
+                }))
+                setMessages(prev => [
+                  ...prev,
+                  { id: 'restored_divider', role: 'ai', type: 'text', text: '*— Conversation restored —*' },
+                  ...restored,
+                ])
+              }
+            })
+            .catch(() => sessionStorage.removeItem('chat_session_id'))
         }
       }
     })
@@ -670,8 +614,55 @@ export default function ChatPage() {
     }
   }
 
-  // Load a historical chat session — tries backend then falls back to localStorage cache.
+  // ── Conversation + BOM-Session-Map localStorage cache ───────────────────
+  // CONV_CACHE_PREFIX: conversation per sessionId (survives backend restarts)
+  // BOM_SESSION_MAP_KEY: stable bomId→sessionId map (survives page refresh +
+  //   backend restart so any BOM, including seed BOMs, restores its conversation)
+  const CONV_CACHE_PREFIX = 'chat_conv_'
+  const BOM_SESSION_MAP_KEY = 'bom_session_map'
+
+  const saveBOMSession = (bomId, sid) => {
+    if (!bomId || !sid) return
+    try {
+      const map = JSON.parse(localStorage.getItem(BOM_SESSION_MAP_KEY) || '{}')
+      map[bomId] = sid
+      localStorage.setItem(BOM_SESSION_MAP_KEY, JSON.stringify(map))
+    } catch (_) {}
+  }
+  const lookupBOMSession = (bomId) => {
+    if (!bomId) return null
+    try { return JSON.parse(localStorage.getItem(BOM_SESSION_MAP_KEY) || '{}')[bomId] || null }
+    catch (_) { return null }
+  }
+  const removeBOMSession = (bomId) => {
+    if (!bomId) return
+    try {
+      const map = JSON.parse(localStorage.getItem(BOM_SESSION_MAP_KEY) || '{}')
+      delete map[bomId]
+      localStorage.setItem(BOM_SESSION_MAP_KEY, JSON.stringify(map))
+    } catch (_) {}
+  }
+
+  const saveConvCache = (sid, msgs) => {
+    if (!sid || !msgs?.length) return
+    try {
+      const payload = msgs.map(m => ({ role: m.role, type: m.type || 'text', text: m.text || '' }))
+      localStorage.setItem(CONV_CACHE_PREFIX + sid, JSON.stringify(payload))
+    } catch (_) {}
+  }
+  const loadConvCache = (sid) => {
+    try {
+      const raw = localStorage.getItem(CONV_CACHE_PREFIX + sid)
+      if (!raw) return null
+      return JSON.parse(raw).map((m, i) => ({ id: 'c_' + i, ...m }))
+    } catch (_) { return null }
+  }
+
+  // Fully reset session state then load a historical chat transcript.
+  // linkedBom: optional BOM from Redux to set immediately (used when restoring
+  // a session via a BOM sidebar item that has creatingSessionId set).
   const switchToSession = (sessionItem, linkedBom = null) => {
+    // --- reset all active-session state ---
     const restoredBom = linkedBom || null
     setLocalBOM(restoredBom)
     dispatch(setCurrentBOM(restoredBom))
@@ -681,49 +672,57 @@ export default function ChatPage() {
     setIsTyping(false)
     sendingRef.current = false
     setInput('')
+
     const sid = sessionItem.session_id
     setSessionId(sid)
     sessionStorage.setItem('chat_session_id', sid)
+
     setMessages([{ id: 'loading', role: 'ai', type: 'text', text: '_Loading conversation…_' }])
 
-    chatApi.getMessages(sid).then(data => {
+    chatApi.getTranscript(sid).then(data => {
       const fromBackend = (data.messages || []).map((m, i) => ({
         id: 'h_' + i,
         role: m.role === 'assistant' ? 'ai' : m.role,
         type: 'text',
         text: m.content || '',
       }))
-      // Dedup: keep unique messages by (role + first 120 chars of text)
-      const dedup = (msgs) => {
-        const seen = new Set()
-        return msgs.filter(m => {
-          const key = (m.role || '') + ':' + (m.text || '').slice(0, 120)
-          if (seen.has(key)) return false
-          seen.add(key); return true
-        })
-      }
-      const cached = loadConvCache(sid)
-      const toShow = (cached?.length || 0) > fromBackend.length ? dedup(cached) : (fromBackend.length ? dedup(fromBackend) : null)
+      // Prefer the localStorage cache when it has MORE turns than the backend
+      // returned. ADLS historically only held the welcome message; the stream
+      // endpoint now re-archives after every turn, but the local cache (written
+      // in onDone) is always the most complete source and must never be
+      // overwritten by a shorter transcript.
+      const cached      = loadConvCache(sid)
+      const backendLen  = fromBackend.length
+      const cacheLen    = cached?.length || 0
+      const toShow      = cacheLen > backendLen ? cached : (fromBackend.length ? fromBackend : null)
       if (toShow?.length) {
         setMessages(toShow)
-        if (fromBackend.length >= (cached?.length || 0) && fromBackend.length) saveConvCache(sid, toShow)
+        // Only update the cache when the backend returned at least as many
+        // messages — prevents a welcome-only ADLS response wiping a good cache.
+        if (backendLen >= cacheLen && fromBackend.length) saveConvCache(sid, toShow)
       } else {
-        setMessages([{ id: 'empty', role: 'ai', type: 'text', text: 'Session loaded \u2014 no messages found.' }])
+        setMessages([{ id: 'empty', role: 'ai', type: 'text', text: 'Session loaded — no messages found.' }])
+      }
+      if (data.bom) {
+        setLocalBOM(data.bom)
+        dispatch(setCurrentBOM(data.bom))
       }
     }).catch(() => {
+      // Backend unreachable or session evicted — restore from localStorage cache
       const cached = loadConvCache(sid)
       if (cached?.length) {
         setMessages(cached)
         setToast({ open: true, msg: 'Restored from local cache (backend session expired)', severity: 'info' })
       } else {
         setMessages([{ id: 'err', role: 'ai', type: 'text', text: 'Could not load session transcript.' }])
-        setToast({ open: true, msg: 'Could not load session', severity: 'error' })
+        setToast({ open: true, msg: 'Could not load session transcript', severity: 'error' })
       }
     })
   }
 
-  // Handle domain/category selection from the Domain Picker modal.
-  // Pre-starts a backend session and sets up the welcome message with M&A intake questions.
+  // Handle domain selection from the picker modal.
+  // Pre-starts a backend session with domain_preselected=true so the skill
+  // file is loaded from turn 1, and sets up the welcome message.
   const handleDomainSelect = async (category) => {
     setDomainPickerOpen(false)
     setLocalBOM(null)
@@ -733,36 +732,25 @@ export default function ChatPage() {
     setPhaseProgress(0)
     setIntakeFields({})
     sessionStorage.removeItem('chat_session_id')
+
     const domainObj = BOM_DOMAINS.find(d => d.key === category) || { icon: '📋' }
     setMessages([{
       id: Date.now(), role: 'ai', type: 'text',
-      text: `${domainObj.icon} **${category} BOM** selected.\n\nI've loaded the ${category} skill and qualification checklist.\n\n**Step 1 — M&A Phase:** What phase is this engagement in?\n\n- **Day-1 Readiness** — minimum viable cutover to legally close\n- **TSA Exit / Cutover** — active migration off TSA-provided services\n- **Full Integration / Standalone Build** — post-TSA steady-state build-out`,
+      text: `${domainObj.icon} **${category} BOM** selected.\n\nI've loaded the ${category} skill file and qualification checklist.\n\n**Step 1 — M&A Phase:** What phase is this engagement in?\n\n- **Day-1 Readiness** — minimum viable cutover to legally close\n- **TSA Exit / Cutover** — active migration off TSA-provided services\n- **Full Integration / Standalone Build** — post-TSA steady-state build-out`,
     }])
+
     if (backendMode) {
       try {
-        const resp = await chatApi.startSession(category, 'New Project', 'demo_user')
+        const resp = await chatApi.startSession(category, 'New Project', 'demo_user', null, true)
         setSessionId(resp.session_id)
         sessionStorage.setItem('chat_session_id', resp.session_id)
-        // Immediately add to history sidebar so it's visible right away
-        setChatHistory(prev => [{
-          session_id: resp.session_id,
-          category,
-          status: 'active',
-          title: category + ' BOM',
-          progress: 0,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        }, ...prev])
       } catch (_) {
-        // Session created lazily on first message
+        // Session will be created lazily on first message send
       }
     }
   }
 
-  // Initialise welcome message when no session is being restored
   useEffect(() => {
-    const savedSid = sessionStorage.getItem('chat_session_id')
-    if (savedSid) return  // session restore already handled in the backend-ping useEffect
     const welcome = savedCurrentBOM
       ? { id: 1, role: 'ai', type: 'loaded', text: 'Loaded **"' + savedCurrentBOM.name + '"** (v' + savedCurrentBOM.version + ') - **' + savedCurrentBOM.lineItems.length + ' items**, ' + fmt(savedCurrentBOM.totalValue) + '. What would you like to do?', bom: savedCurrentBOM }
       : { id: 1, role: 'ai', type: 'help', text: 'Hello! I am your **AI BOM Assistant**.\n\nI can create, update, analyze and manage your Bills of Materials in real-time. Just describe what you need in plain English.', suggestions: ['Create a Data Center BOM for Panasonic', 'Create SD-WAN BOM for 30 sites', 'Create Cybersecurity BOM for Idemia', 'Show my BOMs'] }
@@ -772,56 +760,21 @@ export default function ChatPage() {
 
   useEffect(() => { msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, isTyping])
 
-  const addMsg = (msg) => setMessages(prev => [...prev, { ...msg, id: Date.now() + Math.random() }])
-
-  const ATTACH_CATEGORIES = [
-    'BOMs', 'Data Center / COLO', 'SD-WAN', 'Cybersecurity',
-    'Network Equipment', 'M365 & Power Platform', 'Cloud Infrastructure',
-    'EOL Replacement', 'Laptops', 'Quotes', 'Contracts',
-  ]
-
-  const fileIcon = (name = '') => {
-    const ext = (name.split('.').pop() || '').toLowerCase()
-    if (ext === 'pdf') return <PictureAsPdf sx={{ fontSize: 14 }} />
-    if (['xlsx', 'xls', 'csv'].includes(ext)) return <TableChart sx={{ fontSize: 14 }} />
-    if (['docx', 'doc'].includes(ext)) return <Description sx={{ fontSize: 14 }} />
-    if (ext === 'json') return <Code sx={{ fontSize: 14 }} />
-    return <InsertDriveFile sx={{ fontSize: 14 }} />
-  }
-
-  const handleFileChange = (e) => {
-    const f = e.target.files?.[0]
-    if (!f) return
-    if (f.size > 20 * 1024 * 1024) {
-      setToast({ open: true, msg: 'File exceeds 20 MB limit', severity: 'error' })
-      return
-    }
-    setAttachedFile(f)
-    e.target.value = ''
-  }
+  const addMsg = (msg) => setMessages(prev => [...prev, { id: Date.now() + Math.random(), ...msg }])
 
   const handleSend = useCallback(async (text) => {
     const userText = (text || input).trim()
-    if (!userText && !attachedFile) return
+    if (!userText) return
     if (sendingRef.current) return   // already processing — ignore duplicate trigger
     sendingRef.current = true
-    const capturedFile     = attachedFile
-    const capturedCategory = attachCategory
     setInput('')
-    setAttachedFile(null)
-    addMsg({
-      role: 'user', type: 'text',
-      text: userText || `📎 Uploaded: ${capturedFile?.name}`,
-      attachment: capturedFile
-        ? { filename: capturedFile.name, size_bytes: capturedFile.size, category: capturedCategory }
-        : null,
-    })
+    addMsg({ role: 'user', type: 'text', text: userText })
     setIsTyping(true)
 
     // ── Always handle BOM modification commands locally ────────────────────
     // The backend has no knowledge of the in-memory BOM; these commands are
     // handled by getAIResponse which operates on the currentBOM state directly.
-    if (isLocalBOMCmd(userText)) {
+    if (isLocalBOMCmd(userText, !!currentBOM)) {
       await new Promise(r => setTimeout(r, 350))
       setIsTyping(false)
       const resp = getAIResponse(userText, currentBOM, bomList, ctx)
@@ -847,168 +800,194 @@ export default function ChatPage() {
         let sid = sessionId
         // Start a session if we don't have one yet
         if (!sid) {
-          const cat  = detectCategory(userText) || ctx.category || 'Data Center / COLO'
-          const proj = detectProject(userText) || ctx.project || 'New Project'
-          const startResp = await chatApi.startSession(cat, proj)
+          const cat  = detectCategory(userText) || savedCurrentBOM?.category || 'Data Center / COLO'
+          const proj = detectProject(userText) || savedCurrentBOM?.project || 'New Project'
+          const startResp = await chatApi.startSession(cat, proj, 'demo_user', savedCurrentBOM || null)
           sid = startResp.session_id
           setSessionId(sid)
-          sessionStorage.setItem('chat_session_id', sid)
-          // Add to history sidebar immediately (optimistic update)
-          setChatHistory(prev => [{
-            session_id: sid,
-            category: cat,
-            status: 'active',
-            title: proj + ' \u2014 ' + cat,
-            progress: 0,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          }, ...prev])
-          // NOTE: startResp.message (welcome) is intentionally NOT shown here.
-          // The streaming response will be the first visible AI message.
-          // Showing both would create a duplicate/ghost message (the original bug).
+          sessionStorage.setItem('chat_session_id', sid)  // persist for page-refresh resume
+          // Link this new session to the currently loaded BOM (if any) so clicking
+          // the BOM in the sidebar later will restore this conversation.
+          if (currentBOM?.id) saveBOMSession(currentBOM.id, sid)
+          // Store welcome — only show it if the next sendMessage doesn't produce a BOM
+          // (avoids showing "Hello! I am your AI..." immediately before a BOM creation msg)
+          var pendingWelcome = startResp.message
         }
-        let resp
-        let streamingSucceeded = false
-        const streamMsgId = Date.now() + Math.random()
-        try {
-          // Use attachment endpoint when a file was captured (no streaming for attachments)
-          if (capturedFile) {
-            resp = await chatApi.sendMessageWithAttachment(sid, userText, capturedFile, capturedCategory)
-          } else {
-            // ── SSE streaming path ─────────────────────────────────────────
-            // Add a placeholder AI message updated in-place as tokens arrive.
-            // We do NOT replace the streamed text with a summary afterward —
-            // that was the "overriding" bug. The AI's own text IS the display.
-            let streamingText = ''
-            let streamDone = false
-            setMessages(prev => [...prev, { id: streamMsgId, role: 'ai', type: 'text', text: '…', _streamId: streamMsgId }])
+        // ── Streaming call — no timeout, tokens arrive as they stream ──────
+        const streamingMsgId = Date.now() + Math.random()
+        addMsg({ role: 'ai', type: 'text', text: '', id: streamingMsgId, streaming: true })
+        let streamedText = ''
+        await chatApi.sendMessageStream(
+          sid, userText, 'demo_user',
+          (token) => {
+            streamedText += token
+            setMessages(prev => prev.map(m =>
+              m.id === streamingMsgId ? { ...m, text: streamedText } : m
+            ))
+          },
+          (finalEvt) => {
             setIsTyping(false)
-            for await (const frame of chatApi.streamMessage(sid, userText)) {
-              if (!frame.done) {
-                streamingText += frame.token
-                setMessages(prev => prev.map(m =>
-                  m._streamId === streamMsgId ? { ...m, text: streamingText } : m
-                ))
-              } else {
-                streamDone = true
-                streamingSucceeded = true
-                // Keep the streamed text as-is — do NOT replace it with a summary.
-                // Just attach metadata (type, bom, suggestions) to the existing message.
-                resp = {
-                  response: streamingText,
-                  progress: frame.progress || 0,
-                  complete: frame.complete || false,
-                  partial_bom: frame.bom || null,
-                  suggestions: frame.suggestions || [],
-                  session_title: frame.session_title || null,
+            setPhaseProgress(finalEvt.progress || 0)
+
+            // ── Parse intake fields from streamed text ────────────────────────
+            if (finalEvt.intake_fields) {
+              setIntakeFields(prev => ({ ...prev, ...finalEvt.intake_fields }))
+            } else {
+              const updates = {}
+              // Priority 1: parse the agent’s Markdown intake summary table
+              // Rows look like: | M&A Phase | TSA Exit / Cutover |
+              const tableRows = [...streamedText.matchAll(/\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|/g)]
+              tableRows.forEach(([, field, value]) => {
+                const f = field.toLowerCase()
+                const v = value.trim()
+                if (v && v !== 'Value' && v !== '---') {
+                  if (/m.?a phase|^phase$/i.test(f))                         updates.ma_phase = v
+                  if (/workstream|^category$|domain/i.test(f))               updates.workstream_category = v
+                  if (/triggering|^trigger$/i.test(f))                        updates.triggering_event = v
+                  if (/site.*scope|sites in scope|entity scope/i.test(f))    updates.site_entity_scope = v
+                  if (/site.*type|site.*class|site.*breakdown|site mix/i.test(f)) updates.site_classification_type = v
+                  if (/site.*size|small.*medium|medium.*large/i.test(f))     updates.site_classification_size = v
+                  if (/conveyance|conveying/i.test(f))                        updates.conveyance_status = v
+                  if (/required.by|timeline|cutover date/i.test(f))           updates.required_by_date = v
+                  if (/preferred vendor|vendor standard/i.test(f))            updates.vendor_standard_preferred = v
+                  if (/requestor|business owner/i.test(f))                    updates.requestor = v
                 }
-                setMessages(prev => prev.map(m =>
-                  m._streamId === streamMsgId
-                    ? { ...m, text: streamingText, _streamId: undefined }
-                    : m
-                ))
+              })
+              // Priority 2: heuristic scan for when no table present
+              const txt = streamedText.toLowerCase()
+              if (!updates.ma_phase            && /tsa exit|day.?1|full integration|standalone/i.test(txt))         updates.ma_phase = true
+              if (!updates.workstream_category  && /sd.?wan|data center|cybersecurity|end user|m365|network equipment/i.test(txt)) updates.workstream_category = true
+              if (!updates.site_entity_scope    && /\d+\s*site|\d+\s*branch|\d+\s*location/i.test(txt))            updates.site_entity_scope = true
+              if (!updates.vendor_standard_preferred && /cisco|meraki|palo alto|fortinet|juniper/i.test(txt))       updates.vendor_standard_preferred = true
+              if (!updates.required_by_date     && /december|january|february|march|q[1-4]\s*20\d\d/i.test(txt))   updates.required_by_date = true
+              if (Object.keys(updates).length) setIntakeFields(prev => ({ ...prev, ...updates }))
+            }
+
+            // ── Auto-trigger BOM generation when skill invoked but no JSON returned ───
+            // Detect: agent confirmed all fields and said “Invoking the … Skill File now”
+            // but output prose only. Auto-send “generate” which matches CONFIRM regex
+            // (≥4 user turns) → backend sets force_generation=True → LLM outputs JSON.
+            const skillInvokedPhrase = /invoking.*skill file|all fields confirmed.*invoking|skill file.*now/i.test(streamedText)
+            if (skillInvokedPhrase && !finalEvt.bom && !streamedText.includes('```json')) {
+              setTimeout(() => { if (!sendingRef.current) handleSend('generate') }, 900)
+            }
+
+            let aiBOM = null
+            // Use backend-extracted BOM, or fall back to parsing it from the streamed text
+            let bomSource = finalEvt.bom
+            if (!bomSource && streamedText) {
+              // Try complete fence first
+              const m = streamedText.match(/```json\s*([\s\S]*?)```/)
+              if (m) { try { bomSource = JSON.parse(m[1].trim()) } catch (_) {} }
+              // Try truncated fence (max_tokens hit mid-JSON) — recover last complete line_items
+              if (!bomSource) {
+                const mTrunc = streamedText.match(/```json\s*([\s\S]*)/)
+                if (mTrunc) {
+                  try {
+                    const partial = mTrunc[1].trim()
+                    const nameMatch = partial.match(/"name":\s*"([^"]+)"/)
+                    const projMatch = partial.match(/"project":\s*"([^"]+)"/)
+                    const catMatch  = partial.match(/"category":\s*"([^"]+)"/)
+                    const itemsMatch = partial.match(/"line_items":\s*(\[[\s\S]*)/)
+                    if (itemsMatch && nameMatch) {
+                      let itemsStr = itemsMatch[1]
+                      const lastObj = itemsStr.lastIndexOf('}')
+                      if (lastObj > 0) itemsStr = itemsStr.slice(0, lastObj + 1) + ']'
+                      const recovered = JSON.parse(
+                        '{"name":' + JSON.stringify(nameMatch[1]) +
+                        ',"project":' + JSON.stringify(projMatch?.[1] || '') +
+                        ',"category":' + JSON.stringify(catMatch?.[1] || '') +
+                        ',"line_items":' + itemsStr +
+                        ',"totals":{"hardware":0,"software":0,"services":0,"total_otc":0,"tco_3year":0}' +
+                        ',"warnings":["⚠️ BOM truncated — partial output recovered. Increase token limit for full BOM."]' +
+                        ',"approvals_required":["Buyer IT","Seller IT","SI Technical Team"]}'
+                      )
+                      if (recovered.line_items?.length > 0) bomSource = recovered
+                    }
+                  } catch (_) {}
+                }
               }
             }
-            if (!streamDone) throw new Error('Stream ended without done frame')
-          }
-        } catch (sendErr) {
-          // Streaming failed — fall back to blocking /chat ONLY for attachment path.
-          // For text messages: do NOT call /chat as a fallback — that would append
-          // the user message a second time to the backend session (double-write bug).
-          setMessages(prev => prev.filter(m => m._streamId !== streamMsgId))
-          streamingSucceeded = false
-          if (capturedFile) {
-            try {
-              resp = await chatApi.sendMessageWithAttachment(sid, userText, capturedFile, capturedCategory)
-            } catch (attachErr) {
-              throw attachErr
+            if (bomSource) {
+              const proj = detectProject(userText) || 'New Project'
+              aiBOM = backendBOMtoFrontend(bomSource, proj)
+              // Tag the BOM with the session that generated it so clicking it
+              // in the sidebar can restore the full conversation.
+              if (aiBOM && sid) {
+                aiBOM.creatingSessionId = sid
+                saveBOMSession(aiBOM.id, sid)  // persist to localStorage (survives page refresh)
+              }
+              if (aiBOM) { setLocalBOM(aiBOM); dispatch(setCurrentBOM(aiBOM)) }
             }
-          } else {
-            // For text: show error, let user retry — don't double-write session
-            addMsg({ role: 'ai', type: 'text', text: '⚠️ Stream error — please try again. (Tip: check backend is running on port 8001)' })
-            sendingRef.current = false
-            setIsTyping(false)
-            return
+            if ((finalEvt.complete || (aiBOM && aiBOM.lineItems?.length > 0)) && aiBOM) {
+              // Always save to Redux immediately (works offline too)
+              dispatch(saveBOM(aiBOM))
+              // Persist to Cosmos via backend (best-effort)
+              bomApi?.create?.(aiBOM)
+                .then(() => setToast({ open: true, msg: 'BOM saved to library', severity: 'success' }))
+                .catch(() => setToast({ open: true, msg: 'BOM created (saved locally — sync to backend failed)', severity: 'warning' }))
+              const cats = [...new Set(aiBOM.lineItems.map(li => li.category))]
+              const displayText = (
+                `✅ Created **${aiBOM.name}**\n\n` +
+                `**${aiBOM.lineItems.length} line items** | Total: **${fmt(aiBOM.totalValue)}**\n` +
+                `Categories: ${cats.join(' · ')}\n\n` +
+                `The BOM is live in the panel on the right. You can:\n` +
+                `- Change item 2 qty to 8\n- Remove item 5\n- Analyze cost savings\n- Export as CSV\n- Save to BOM Library`
+              )
+              setMessages(prev => {
+                const next = prev.map(m =>
+                  m.id === streamingMsgId ? { ...m, text: displayText, type: 'bom_created', bom: aiBOM, actions: ['library', 'rfq'], streaming: false } : m
+                )
+                // Cache conversation so it survives backend restarts
+                saveConvCache(sid, next)
+                return next
+              })
+            } else {
+              setMessages(prev => {
+                const next = prev.map(m =>
+                  m.id === streamingMsgId ? { ...m, streaming: false } : m
+                )
+                saveConvCache(sid, next)
+                return next
+              })
+            }
           }
-        }
-        setIsTyping(false)
-        setPhaseProgress(resp.progress || 0)
-
-        // Convert backend BOM to frontend format
-        let aiBOM = null
-        if (resp.partial_bom) {
-          const proj = detectProject(userText) || ctx.project || 'New Project'
-          aiBOM = backendBOMtoFrontend(resp.partial_bom, proj)
-          if (aiBOM) { setLocalBOM(aiBOM); dispatch(setCurrentBOM(aiBOM)) }
-        }
-
-        // Auto-save when BOM is complete
-        if (resp.complete && aiBOM) {
-          try {
-            await bomApi?.create?.(aiBOM)
-            dispatch(saveBOM(aiBOM))
-            dispatch(pushNotification({ type: 'bom_created', title: 'BOM Created', message: `${aiBOM.name} — ${aiBOM.lineItems.length} items · ${fmt(aiBOM.totalValue)}`, link: '/bom-library' }))
-            setToast({ open: true, msg: 'BOM saved to library automatically', severity: 'success' })
-          } catch { /* best-effort */ }
-        }
-
-        // For streaming path: the text is already correct in the placeholder.
-        // Only update the TYPE and attach BOM metadata — never replace the text.
-        if (streamingSucceeded) {
-          setMessages(prev => prev.map(m => m.id === streamMsgId ? {
-            ...m,
-            type: resp.complete && aiBOM ? 'bom_created' : 'text',
-            bom: aiBOM || undefined,
-            actions: resp.complete && aiBOM ? ['library', 'rfq'] : undefined,
-            suggestions: resp.suggestions?.length ? resp.suggestions : undefined,
-          } : m))
-        } else {
-          // Attachment fallback path — add new message
-          addMsg({
-            role: 'ai',
-            type: resp.complete && aiBOM ? 'bom_created' : 'text',
-            text: resp.response || '',
-            bom: aiBOM,
-            actions: resp.complete && aiBOM ? ['library', 'rfq'] : undefined,
-            attachment: resp.attachment || null,
-            suggestions: resp.suggestions?.length ? resp.suggestions : undefined,
-          })
-        }
-        // When creating a new BOM while one already exists → show a session divider
-        // but keep the session alive so follow-up questions (EOL risk, lead times, etc.)
-        // are answered in context. User can start a fresh session via the + button.
-        if (resp.complete && aiBOM && currentBOM && currentBOM.id !== aiBOM.id) {
-          addMsg({ role: 'divider', type: 'divider', prevBOM: currentBOM.name })
-        }
-        // Update session title in sidebar when backend provides one
-        if (resp.session_title && sid) {
-          setChatHistory(prev => prev.map(s =>
-            s.session_id === sid ? { ...s, title: resp.session_title } : s
-          ))
-        }
-        if (resp.complete) refreshHistory()   // pull updated history from Cosmos/ADLS
-        // Persist conversation to localStorage cache for offline/refresh restore
-        if (sid) {
-          setMessages(prev => { saveConvCache(sid, prev); return prev })
-        }
+        )
         backendFailCount.current = 0   // reset failure counter on success
         sendingRef.current = false
         return
       } catch (err) {
-        // Backend call failed — fall through to local logic for THIS message only
-        // Only permanently disable backendMode after 2 consecutive failures to avoid
-        // a single transient error killing the entire AI session.
-        console.warn('Backend AI error:', err?.message)
-        backendFailCount.current += 1
-        // Never permanently kill backendMode — backend may recover on next message.
-        // After 2 consecutive failures show a toast; reset counter so user can retry.
-        if (backendFailCount.current >= 2) {
-          backendFailCount.current = 0   // reset so next send re-attempts backend
-        }
-        if (!backendWarnedRef.current) {
-          backendWarnedRef.current = true
-          setTimeout(() => { backendWarnedRef.current = false }, 30000)  // re-arm after 30s
-          setToast({ open: true, msg: 'AI backend returned an error — using local templates for this message', severity: 'warning' })
+        const errMsg = err?.message || ''
+        // ── 404 = backend session expired (restart wiped in-memory Cosmos) ────
+        // Clear the stale session ID so the NEXT message creates a fresh session
+        // rather than permanently disabling backendMode.
+        if (errMsg.includes('404') || errMsg.toLowerCase().includes('session not found')) {
+          console.warn('Backend session expired — will create new session on next message')
+          setSessionId(null)
+          sessionStorage.removeItem('chat_session_id')
+          // Remove the stale mapping so the BOM gets linked to the new session
+          if (currentBOM?.id) {
+            try {
+              const map = JSON.parse(localStorage.getItem(BOM_SESSION_MAP_KEY) || '{}')
+              delete map[currentBOM.id]
+              localStorage.setItem(BOM_SESSION_MAP_KEY, JSON.stringify(map))
+            } catch (_) {}
+          }
+          setToast({ open: true, msg: 'Session expired — reconnecting…', severity: 'info' })
+          // Fall through to local mode for this message only (next will use new session)
+        } else {
+          // Backend call failed — fall through to local logic for THIS message only
+          // Only permanently disable backendMode after 2 consecutive failures to avoid
+          // a single transient error killing the entire AI session.
+          console.warn('Backend AI error:', errMsg)
+          backendFailCount.current += 1
+          if (backendFailCount.current >= 2) {
+            setBackendMode(false)
+          }
+          if (!backendWarnedRef.current) {
+            backendWarnedRef.current = true
+            setToast({ open: true, msg: backendFailCount.current >= 2 ? 'AI backend unavailable — using local mode' : 'AI request failed — retrying locally for this message', severity: 'warning' })
+          }
         }
       }
     }
@@ -1025,10 +1004,13 @@ export default function ChatPage() {
       if (resp.type === 'bom_created' && resp.bom) {
         dispatch(pushNotification({ type: 'bom_created', title: 'BOM Created', message: `${resp.bom.name} — ${resp.bom.lineItems.length} items · ${fmt(resp.bom.totalValue)}`, link: '/bom-library' }))
       }
-      // When creating a NEW BOM while one already exists → insert a session divider.
-      // Keep session alive so follow-up questions work in context.
+      // When creating a NEW BOM while one already exists → insert a session divider
+      // and reset the backend session so the next creation gets a fresh context
       if (resp.type === 'bom_created' && currentBOM) {
         addMsg({ role: 'divider', type: 'divider', prevBOM: currentBOM.name })
+        setSessionId(null)
+        setIntakeFields({})
+        sessionStorage.removeItem('chat_session_id')  // new BOM = fresh session
       }
       addMsg({ role: 'ai', ...resp })
       sendingRef.current = false
@@ -1047,146 +1029,35 @@ export default function ChatPage() {
     }
   }
 
-  // ── Widget renderers ────────────────────────────────────────────────────────
-  // Render ```form { fields:[{label,type,value}] } ``` as a mini form card
-  const renderFormWidget = (jsonStr, key) => {
-    let data = {}
-    try { data = JSON.parse(jsonStr) } catch { return null }
-    const fields = Array.isArray(data.fields) ? data.fields : []
-    const title = data.title || 'Details'
-    return (
-      <Box key={key} sx={{ mt: 1, p: 1.25, borderRadius: 1.5, border: '1px solid #E0E7FF', bgcolor: '#F5F3FF' }}>
-        <Typography sx={{ fontSize: '0.68rem', fontWeight: 700, color: '#4F46E5', mb: 0.75, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-          {title}
-        </Typography>
-        {fields.map((f, i) => (
-          <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', py: 0.3, borderBottom: i < fields.length - 1 ? '1px solid #E0E7FF' : 'none' }}>
-            <Typography sx={{ fontSize: '0.7rem', color: '#6B7280', fontWeight: 500 }}>{f.label}</Typography>
-            <Typography sx={{ fontSize: '0.7rem', color: '#111827', fontWeight: 600 }}>{f.value ?? '—'}</Typography>
-          </Box>
-        ))}
-      </Box>
-    )
-  }
-
-  // Render ```actions [{label, action, variant?}] ``` as clickable buttons
-  const renderActionsWidget = (jsonStr, key) => {
-    let items = []
-    try { items = JSON.parse(jsonStr) } catch { return null }
-    if (!Array.isArray(items)) return null
-    return (
-      <Box key={key} sx={{ mt: 1, display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-        {items.map((item, i) => (
-          <Button key={i} size="small" variant={item.variant === 'primary' ? 'contained' : 'outlined'}
-            onClick={() => !isTyping && !sendingRef.current && handleSend(item.action || item.label)}
-            disabled={isTyping}
-            sx={{ fontSize: '0.68rem', textTransform: 'none', borderRadius: 1.5, px: 1.25, py: 0.25, minHeight: 28,
-              ...(item.variant === 'primary'
-                ? { bgcolor: '#D04A02', color: '#fff', border: 'none', '&:hover': { bgcolor: '#B03A00' } }
-                : { color: '#D04A02', borderColor: '#D04A02', '&:hover': { bgcolor: '#FDF3ED' } }) }}>
-            {item.label}
-          </Button>
-        ))}
-      </Box>
-    )
-  }
-
-  // Render ```steps [{label, done?}] ``` as a vertical checklist
-  const renderStepsWidget = (jsonStr, key) => {
-    let items = []
-    try { items = JSON.parse(jsonStr) } catch { return null }
-    if (!Array.isArray(items)) return null
-    const done = items.filter(s => s.done).length
-    const pct = Math.round((done / items.length) * 100)
-    return (
-      <Box key={key} sx={{ mt: 1, p: 1.25, borderRadius: 1.5, border: '1px solid #D1FAE5', bgcolor: '#F0FDF4' }}>
-        <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.75 }}>
-          <Typography sx={{ fontSize: '0.68rem', fontWeight: 700, color: '#065F46', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Steps</Typography>
-          <Typography sx={{ fontSize: '0.68rem', color: '#065F46', fontWeight: 600 }}>{done}/{items.length}</Typography>
-        </Box>
-        <LinearProgress variant="determinate" value={pct} sx={{ height: 4, borderRadius: 2, mb: 1, bgcolor: '#A7F3D0', '& .MuiLinearProgress-bar': { bgcolor: '#059669' } }} />
-        {items.map((s, i) => (
-          <Box key={i} sx={{ display: 'flex', alignItems: 'center', gap: 0.75, py: 0.2 }}>
-            <Box sx={{ width: 14, height: 14, borderRadius: '50%', bgcolor: s.done ? '#059669' : '#D1FAE5', border: `2px solid ${s.done ? '#059669' : '#6EE7B7'}`, flexShrink: 0 }} />
-            <Typography sx={{ fontSize: '0.7rem', color: s.done ? '#065F46' : '#374151', fontWeight: s.done ? 600 : 400, textDecoration: s.done ? 'line-through' : 'none' }}>
-              {s.label}
-            </Typography>
-          </Box>
-        ))}
-      </Box>
-    )
-  }
-
-  // Render ```progress {label, value, max?, color?} ``` as a progress bar card
-  const renderProgressWidget = (jsonStr, key) => {
-    let data = {}
-    try { data = JSON.parse(jsonStr) } catch { return null }
-    const pct = data.max ? Math.min(100, Math.round((data.value / data.max) * 100)) : Math.min(100, data.value || 0)
-    const color = data.color || '#D04A02'
-    return (
-      <Box key={key} sx={{ mt: 1, p: 1.25, borderRadius: 1.5, border: '1px solid #FDE68A', bgcolor: '#FFFBEB' }}>
-        <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
-          <Typography sx={{ fontSize: '0.7rem', fontWeight: 600, color: '#92400E' }}>{data.label || 'Progress'}</Typography>
-          <Typography sx={{ fontSize: '0.7rem', fontWeight: 700, color: '#92400E' }}>{pct}%</Typography>
-        </Box>
-        <LinearProgress variant="determinate" value={pct} sx={{ height: 6, borderRadius: 3, bgcolor: '#FDE68A', '& .MuiLinearProgress-bar': { bgcolor: color, borderRadius: 3 } }} />
-        {data.sublabel && <Typography sx={{ fontSize: '0.62rem', color: '#B45309', mt: 0.4 }}>{data.sublabel}</Typography>}
-      </Box>
-    )
-  }
-
-  // ── Main text renderer ───────────────────────────────────────────────────────
-  // Splits text on fenced widget blocks before passing remainder to markdown renderer.
   const renderText = (text) => {
     if (!text) return null
-    // Split on fenced blocks: ```type\n...\n```
-    const FENCE_RE = /```(form|actions|steps|progress)\n([\s\S]*?)```/g
-    const elements = []
-    let last = 0
-    let match
-    let idx = 0
-    FENCE_RE.lastIndex = 0
-    while ((match = FENCE_RE.exec(text)) !== null) {
-      // Render any preceding markdown text
-      const before = text.slice(last, match.index).trim()
-      if (before) elements.push(...renderMarkdown(before, `md-${idx++}`))
-      // Render the widget
-      const [, blockType, blockContent] = match
-      const trimmed = blockContent.trim()
-      if (blockType === 'form') elements.push(renderFormWidget(trimmed, `fw-${idx++}`))
-      else if (blockType === 'actions') elements.push(renderActionsWidget(trimmed, `aw-${idx++}`))
-      else if (blockType === 'steps') elements.push(renderStepsWidget(trimmed, `sw-${idx++}`))
-      else if (blockType === 'progress') elements.push(renderProgressWidget(trimmed, `pw-${idx++}`))
-      last = match.index + match[0].length
-    }
-    // Remaining text after last widget (or all text if no widgets)
-    const tail = text.slice(last)
-    if (tail.trim()) elements.push(...renderMarkdown(tail, `md-${idx++}`))
-    return elements.filter(Boolean)
-  }
-
-  // ── Markdown-only renderer (extracted from original renderText) ──────────────
-  const renderMarkdown = (text, keyPrefix = 'md') => {
-    if (!text) return []
-    // Strip raw ```json/plain fences (safety net for non-widget fences)
-    const cleaned = text.replace(/```json[\s\S]*?```/g, '').replace(/```[\s\S]*?```/g, '').trim()
+    // Pre-process: strip complete and incomplete ```json``` fences (handles truncated AI output)
+    const cleaned = text
+      .replace(/```json[\s\S]*?```/g, '')        // complete json fences
+      .replace(/```[\s\S]*?```/g, '')             // other complete fences
+      .replace(/```json[\s\S]*/g, '\n*(BOM JSON captured — see preview panel on the right)*')  // truncated json fence
+      .replace(/```[\s\S]*/g, '')                 // other truncated fences
+      .trim()
     const lines = cleaned.split('\n')
     const elements = []
     let i = 0
     while (i < lines.length) {
       const line = lines[i]
+      // Heading 1/2
       if (/^#{1,2}\s/.test(line)) {
         elements.push(
-          <Typography key={`${keyPrefix}-${i}`} sx={{ fontSize: '0.82rem', fontWeight: 700, color: 'inherit', mt: 0.5, lineHeight: 1.4 }}>
+          <Typography key={i} sx={{ fontSize: '0.82rem', fontWeight: 700, color: 'inherit', mt: 0.5, lineHeight: 1.4 }}>
             {renderInline(line.replace(/^#+\s*/, ''))}
           </Typography>
         )
         i++; continue
       }
+      // Horizontal rule
       if (/^[\-=]{3,}$/.test(line.trim())) {
-        elements.push(<Box key={`${keyPrefix}-${i}`} sx={{ borderTop: '1px solid rgba(0,0,0,0.12)', my: 0.5 }} />)
+        elements.push(<Box key={i} sx={{ borderTop: '1px solid rgba(0,0,0,0.12)', my: 0.5 }} />)
         i++; continue
       }
+      // Bullet / numbered list
       if (/^[\-\*]\s/.test(line) || /^\d+\.\s/.test(line)) {
         const listItems = []
         while (i < lines.length && (/^[\-\*]\s/.test(lines[i]) || /^\d+\.\s/.test(lines[i]))) {
@@ -1194,18 +1065,20 @@ export default function ChatPage() {
           i++
         }
         elements.push(
-          <Box key={`${keyPrefix}-list-${i}`} component="ul" sx={{ pl: 2, my: 0.25, '& li': { fontSize: '0.78rem', lineHeight: 1.7, color: 'inherit' } }}>
+          <Box key={'list-' + i} component="ul" sx={{ pl: 2, my: 0.25, '& li': { fontSize: '0.78rem', lineHeight: 1.7, color: 'inherit' } }}>
             {listItems.map((li, j) => <li key={j}>{renderInline(li)}</li>)}
           </Box>
         )
         continue
       }
+      // Empty line → small gap
       if (!line.trim()) {
-        elements.push(<Box key={`${keyPrefix}-${i}`} sx={{ height: 4 }} />)
+        elements.push(<Box key={i} sx={{ height: 4 }} />)
         i++; continue
       }
+      // Normal paragraph
       elements.push(
-        <Typography key={`${keyPrefix}-${i}`} sx={{ fontSize: '0.78rem', lineHeight: 1.6, color: 'inherit' }}>
+        <Typography key={i} sx={{ fontSize: '0.78rem', lineHeight: 1.6, color: 'inherit' }}>
           {renderInline(line)}
         </Typography>
       )
@@ -1238,7 +1111,7 @@ export default function ChatPage() {
           <Button fullWidth variant="contained" size="small" startIcon={<Add sx={{ fontSize: 14 }} />}
             onClick={() => setDomainPickerOpen(true)}
             sx={{ textTransform: 'none', fontSize: '0.72rem', fontWeight: 700, bgcolor: '#D04A02', '&:hover': { bgcolor: '#A33A00' } }}>
-            New BOM Chat
+            + New BOM Chat
           </Button>
         </Box>
 
@@ -1259,39 +1132,18 @@ export default function ChatPage() {
             )}
           </Box>
         </Box>
-        {/* Search bar */}
-        <Box sx={{ px: 1, pb: 0.5 }}>
-          <TextField
-            size="small" fullWidth
-            placeholder="Search sessions…"
-            value={sidebarSearch}
-            onChange={e => setSidebarSearch(e.target.value)}
-            InputProps={{ sx: { fontSize: '0.68rem', height: 26, bgcolor: '#F9FAFB', '& input': { py: 0 } } }}
-            sx={{ '& .MuiOutlinedInput-root': { borderRadius: '6px', '& fieldset': { borderColor: '#E5E7EB' } } }}
-          />
-        </Box>
         <Box sx={{ flex: 1, overflowY: 'auto', px: 1, pb: 1 }}>
           {/* Merge chat sessions + saved BOMs into one time-sorted list */}
           {(() => {
-            const chatItems = chatHistory.map(s => {
-              // Prefer human-readable title: backend-generated title > project+category > fallback
-              const title = s.title
-                || (s.project && s.category ? `${s.project} · ${s.category}` : null)
-                || s.project
-                || s.category
-                || 'Chat Session'
-              const lastMsg = s.last_message || ''
-              const preview = lastMsg.length > 50 ? lastMsg.slice(0, 50) + '…' : lastMsg
-              return {
-                key: 'chat_' + s.session_id,
-                type: 'chat',
-                label: title,
-                sub: preview || (s.message_count + ' msgs'),
-                date: s.updated_at || '',
-                active: s.session_id === sessionId,
-                raw: s,
-              }
-            })
+            const chatItems = chatHistory.map(s => ({
+              key: 'chat_' + s.session_id,
+              type: 'chat',
+              label: s.category || s.project || 'Chat Session',
+              sub: s.message_count + ' msgs',
+              date: s.updated_at || '',
+              active: s.session_id === sessionId,
+              raw: s,
+            }))
             const bomItems = bomList.map(b => ({
               key: 'bom_' + b.id,
               type: 'bom',
@@ -1301,10 +1153,7 @@ export default function ChatPage() {
               active: currentBOM?.id === b.id,
               raw: b,
             }))
-            const sq = sidebarSearch.toLowerCase().trim()
-            const all = [...chatItems, ...bomItems]
-              .sort((a, b) => (b.date > a.date ? 1 : -1))
-              .filter(item => !sq || item.label.toLowerCase().includes(sq) || (item.sub || '').toLowerCase().includes(sq))
+            const all = [...chatItems, ...bomItems].sort((a, b) => (b.date > a.date ? 1 : -1))
             if (all.length === 0) return (
               <Typography sx={{ fontSize: '0.65rem', color: '#9CA3AF', textAlign: 'center', mt: 2 }}>
                 No history yet. Start a chat to create your first BOM.
@@ -1324,7 +1173,27 @@ export default function ChatPage() {
                     if (item.type === 'chat') {
                       switchToSession(item.raw)
                     } else {
-                      handleSend('Load ' + item.raw.name)
+                      const bom = item.raw
+                      // Check both the in-memory tag (new BOMs this session) and the
+                      // persistent localStorage map (survives page refresh + backend restart).
+                      const linkedSid = bom.creatingSessionId || lookupBOMSession(bom.id)
+                      if (linkedSid) {
+                        switchToSession({ session_id: linkedSid, progress: 100 }, bom)
+                      } else {
+                        // No prior session for this BOM — show it and start fresh.
+                        // A session will be created lazily on the first message send.
+                        setLocalBOM(bom)
+                        dispatch(setCurrentBOM(bom))
+                        setSessionId(null)
+                        sessionStorage.removeItem('chat_session_id')
+                        setIntakeFields({})
+                        setPhaseProgress(0)
+                        setMessages([{
+                          id: Date.now(), role: 'ai', type: 'loaded',
+                          text: `Loaded **"${bom.name}"** (v${bom.version || 1}) — **${(bom.lineItems || []).length} items**, ${fmt(bom.totalValue || 0)}. What would you like to do?`,
+                          bom,
+                        }])
+                      }
                     }
                   }}>
                   <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.5 }}>
@@ -1335,11 +1204,11 @@ export default function ChatPage() {
                       <Typography sx={{ fontSize: '0.67rem', fontWeight: 600, color: item.active ? '#D04A02' : '#1F2937', lineHeight: 1.2, pr: 1.5 }} noWrap>
                         {item.label}
                       </Typography>
-                      <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.2, alignItems: 'center' }}>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 0.2 }}>
                         {item.type === 'bom'
                           ? <Chip label={item.sub} size="small" sx={{ fontSize: '0.5rem', height: 13, bgcolor: statusBg, color: '#374151' }} />
-                          : <Typography sx={{ fontSize: '0.56rem', color: '#9CA3AF', flex: 1, mr: 0.5 }} noWrap>{item.sub}</Typography>}
-                        <Typography sx={{ fontSize: '0.55rem', color: '#9CA3AF', flexShrink: 0 }}>{dateStr}</Typography>
+                          : <Typography sx={{ fontSize: '0.56rem', color: '#9CA3AF' }}>{item.sub}</Typography>}
+                        <Typography sx={{ fontSize: '0.55rem', color: '#9CA3AF' }}>{dateStr}</Typography>
                       </Box>
                     </Box>
                   </Box>
@@ -1432,67 +1301,8 @@ export default function ChatPage() {
                   color: isAI(msg) ? '#1F2937' : 'white',
                   border: isAI(msg) ? '1px solid #F3F4F6' : 'none',
                   borderRadius: isAI(msg) ? '4px 12px 12px 12px' : '12px 4px 12px 12px',
-                  p: msg.attachment ? 0 : 1.25,
-                  overflow: 'hidden',
-                  boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
+                  p: 1.25, boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
                 }}>
-                  {/* ── Claude-style attachment card — shown ABOVE the text ── */}
-                  {msg.attachment && (
-                    <Box sx={{
-                      display: 'flex', alignItems: 'center', gap: 1,
-                      bgcolor: isAI(msg) ? '#F8FAFC' : 'rgba(0,0,0,0.18)',
-                      borderBottom: isAI(msg) ? '1px solid #E2E8F0' : '1px solid rgba(255,255,255,0.15)',
-                      px: 1.25, py: 0.9,
-                    }}>
-                      {/* File-type colour block */}
-                      <Box sx={{
-                        width: 36, height: 36, borderRadius: '8px', flexShrink: 0,
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        bgcolor: (() => {
-                          const ext = (msg.attachment.filename || '').split('.').pop().toLowerCase()
-                          if (ext === 'pdf') return '#FEE2E2'
-                          if (['xlsx','xls','csv'].includes(ext)) return '#DCFCE7'
-                          if (['docx','doc'].includes(ext)) return '#DBEAFE'
-                          return '#F3F4F6'
-                        })(),
-                      }}>
-                        <Box sx={{
-                          color: (() => {
-                            const ext = (msg.attachment.filename || '').split('.').pop().toLowerCase()
-                            if (ext === 'pdf') return '#DC2626'
-                            if (['xlsx','xls','csv'].includes(ext)) return '#16A34A'
-                            if (['docx','doc'].includes(ext)) return '#2563EB'
-                            return '#6B7280'
-                          })(),
-                        }}>
-                          {fileIcon(msg.attachment.filename)}
-                        </Box>
-                      </Box>
-                      <Box sx={{ flex: 1, minWidth: 0 }}>
-                        <Typography sx={{
-                          fontSize: '0.72rem', fontWeight: 600, lineHeight: 1.25,
-                          color: isAI(msg) ? '#0F172A' : 'white',
-                        }} noWrap>
-                          {msg.attachment.filename}
-                        </Typography>
-                        <Typography sx={{
-                          fontSize: '0.6rem', mt: 0.15,
-                          color: isAI(msg) ? '#64748B' : 'rgba(255,255,255,0.65)',
-                        }}>
-                          {(msg.attachment.filename || '').split('.').pop().toUpperCase()}
-                          {msg.attachment.size_bytes ? ` · ${(msg.attachment.size_bytes / 1024).toFixed(0)} KB` : ''}
-                          {' · '}{msg.attachment.category || 'BOMs'}
-                        </Typography>
-                        {isAI(msg) && msg.attachment.ingest_status_url && (
-                          <Typography sx={{ fontSize: '0.58rem', color: '#22C55E', mt: 0.2, display: 'flex', alignItems: 'center', gap: 0.3 }}>
-                            <CheckCircle sx={{ fontSize: 10 }} /> Uploaded to SharePoint · AI indexed
-                          </Typography>
-                        )}
-                      </Box>
-                    </Box>
-                  )}
-                  {/* Message text — inside padding only here */}
-                  <Box sx={{ p: 1.25 }}>
                   {renderText(msg.text)}
 
                   {msg.options && (
@@ -1505,30 +1315,14 @@ export default function ChatPage() {
                   )}
 
                   {msg.suggestions && (
-                    <Box sx={{ mt: 1.25 }}>
-                      <Typography sx={{ fontSize: '0.6rem', color: '#9CA3AF', mb: 0.6, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                        Follow-up suggestions
-                      </Typography>
-                      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                    <Box sx={{ mt: 1 }}>
+                      <Typography sx={{ fontSize: '0.62rem', color: '#9CA3AF', mb: 0.5 }}>Try asking:</Typography>
+                      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.4 }}>
                         {msg.suggestions.map(s => (
-                          <Chip
-                            key={s}
-                            label={s}
-                            size="small"
-                            onClick={() => !isTyping && !sendingRef.current && handleSend(s)}
-                            disabled={isTyping}
-                            sx={{
-                              fontSize: '0.65rem',
-                              height: 24,
-                              cursor: isTyping ? 'default' : 'pointer',
-                              bgcolor: '#F0F9FF',
-                              color: '#0369A1',
-                              border: '1px solid #BAE6FD',
-                              fontWeight: 500,
-                              '&:hover': { bgcolor: '#0369A1', color: 'white', borderColor: '#0369A1' },
-                              '& .MuiChip-label': { px: 1 },
-                            }}
-                          />
+                          <Box key={s} onClick={() => !isTyping && !sendingRef.current && handleSend(s)}
+                            sx={{ fontSize: '0.7rem', color: '#3B82F6', cursor: isTyping ? 'default' : 'pointer', p: '4px 8px', borderRadius: '4px', bgcolor: '#EFF6FF', opacity: isTyping ? 0.5 : 1, '&:hover': { bgcolor: isTyping ? '#EFF6FF' : '#DBEAFE' } }}>
+                            {s}
+                          </Box>
                         ))}
                       </Box>
                     </Box>
@@ -1585,8 +1379,7 @@ export default function ChatPage() {
                       )}
                     </Box>
                   )}
-                  </Box>{/* end inner padding box */}
-                </Box>{/* end bubble */}
+                </Box>
               </Box>
               {!isAI(msg) && (
                 <Avatar sx={{ width: 26, height: 26, bgcolor: '#374151', flexShrink: 0 }}>
@@ -1625,114 +1418,21 @@ export default function ChatPage() {
               ))}
             </Box>
           )}
-
-          {/* SharePoint folder category menu */}
-          <Menu anchorEl={categoryMenuAnchor} open={Boolean(categoryMenuAnchor)}
-            onClose={() => setCategoryMenuAnchor(null)}
-            PaperProps={{ sx: { maxHeight: 260, minWidth: 210 } }}>
-            {ATTACH_CATEGORIES.map(cat => (
-              <MenuItem key={cat} dense selected={cat === attachCategory}
-                onClick={() => { setAttachCategory(cat); setCategoryMenuAnchor(null) }}
-                sx={{ fontSize: '0.75rem' }}>
-                {cat}
-              </MenuItem>
-            ))}
-          </Menu>
-
-          {/* Hidden file input */}
-          <input ref={fileInputRef} type="file" hidden
-            accept=".pdf,.xlsx,.xls,.csv,.docx,.doc,.txt,.json"
-            onChange={handleFileChange} />
-
-          {/* ── Composer box — file card + text input in one bordered box (Claude-style) ── */}
-          <Box sx={{
-            border: '1px solid #E5E7EB', borderRadius: '10px', bgcolor: '#F9FAFB',
-            '&:focus-within': { borderColor: '#D04A02', boxShadow: '0 0 0 2px rgba(208,74,2,0.08)' },
-          }}>
-            {/* Inline file card inside composer */}
-            {attachedFile && (
-              <Box sx={{
-                display: 'flex', alignItems: 'center', gap: 1,
-                px: 1.25, pt: 1, pb: 0.75,
-                borderBottom: '1px solid #E5E7EB',
-              }}>
-                {/* File type colour block */}
-                <Box sx={{
-                  width: 34, height: 34, borderRadius: '8px', flexShrink: 0,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  bgcolor: (() => {
-                    const ext = attachedFile.name.split('.').pop().toLowerCase()
-                    if (ext === 'pdf') return '#FEE2E2'
-                    if (['xlsx','xls','csv'].includes(ext)) return '#DCFCE7'
-                    if (['docx','doc'].includes(ext)) return '#DBEAFE'
-                    return '#F3F4F6'
-                  })(),
-                }}>
-                  <Box sx={{
-                    color: (() => {
-                      const ext = attachedFile.name.split('.').pop().toLowerCase()
-                      if (ext === 'pdf') return '#DC2626'
-                      if (['xlsx','xls','csv'].includes(ext)) return '#16A34A'
-                      if (['docx','doc'].includes(ext)) return '#2563EB'
-                      return '#6B7280'
-                    })(),
-                  }}>
-                    {fileIcon(attachedFile.name)}
-                  </Box>
-                </Box>
-                <Box sx={{ flex: 1, minWidth: 0 }}>
-                  <Typography sx={{ fontSize: '0.72rem', fontWeight: 600, color: '#0F172A', lineHeight: 1.25 }} noWrap>
-                    {attachedFile.name}
-                  </Typography>
-                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 0.15 }}>
-                    <Typography sx={{ fontSize: '0.6rem', color: '#64748B' }}>
-                      {attachedFile.name.split('.').pop().toUpperCase()} · {(attachedFile.size / 1024).toFixed(0)} KB
-                    </Typography>
-                    <Tooltip title="Change SharePoint folder">
-                      <Chip label={attachCategory} size="small"
-                        onClick={e => setCategoryMenuAnchor(e.currentTarget)}
-                        sx={{ fontSize: '0.55rem', height: 16, cursor: 'pointer',
-                          bgcolor: '#E0F2FE', color: '#0369A1', border: '1px solid #BAE6FD',
-                          '&:hover': { bgcolor: '#BAE6FD' } }} />
-                    </Tooltip>
-                  </Box>
-                </Box>
-                <IconButton size="small" onClick={() => setAttachedFile(null)}
-                  sx={{ p: 0.3, color: '#94A3B8', flexShrink: 0,
-                    '&:hover': { bgcolor: '#FEE2E2', color: '#DC2626' } }}>
-                  <Close sx={{ fontSize: 14 }} />
-                </IconButton>
-              </Box>
-            )}
-
-            {/* Text input row */}
-            <Box sx={{ display: 'flex', alignItems: 'flex-end', px: 0.5, py: 0.25 }}>
-              {/* Attach button */}
-              <Tooltip title="Attach file — uploads to SharePoint &amp; embeds for AI">
-                <IconButton size="small" onClick={() => fileInputRef.current?.click()}
-                  sx={{ width: 32, height: 32, color: '#94A3B8', flexShrink: 0,
-                    '&:hover': { color: '#D04A02', bgcolor: 'transparent' } }}>
-                  <AttachFile sx={{ fontSize: 17 }} />
-                </IconButton>
-              </Tooltip>
-              <TextField
-                multiline maxRows={4} fullWidth
-                placeholder={attachedFile ? 'Ask about this file…' : 'Ask me to create, update, or analyze a BOM…'}
-                value={input} onChange={e => setInput(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !sendingRef.current) { e.preventDefault(); handleSend() } }}
-                variant="standard"
-                InputProps={{ disableUnderline: true }}
-                sx={{ '& .MuiInputBase-input': { fontSize: '0.8rem', py: '7px', px: 0.5 } }}
-              />
-              <IconButton onClick={() => handleSend()} disabled={(!input.trim() && !attachedFile) || isTyping}
-                sx={{ width: 34, height: 34, bgcolor: '#D04A02', color: 'white', borderRadius: '8px', flexShrink: 0, mx: 0.5, mb: 0.25,
-                  '&:hover': { bgcolor: '#A33A00' }, '&.Mui-disabled': { bgcolor: '#F3F4F6', color: '#9CA3AF' } }}>
-                <Send sx={{ fontSize: 16 }} />
-              </IconButton>
-            </Box>
+          <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-end' }}>
+            <TextField
+              multiline maxRows={4} fullWidth
+              placeholder="Ask me to create, update, or analyze a BOM..."
+              value={input} onChange={e => setInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !sendingRef.current) { e.preventDefault(); handleSend() } }}
+              sx={{ bgcolor: '#F9FAFB', '& .MuiInputBase-input': { fontSize: '0.8rem', py: '8px' }, '& .MuiOutlinedInput-root': { '& fieldset': { borderColor: '#E5E7EB' }, '&:hover fieldset': { borderColor: '#D04A02' }, '&.Mui-focused fieldset': { borderColor: '#D04A02' } } }}
+            />
+            <IconButton onClick={() => handleSend()} disabled={!input.trim() || isTyping}
+              sx={{ width: 40, height: 40, bgcolor: '#D04A02', color: 'white', borderRadius: '8px', flexShrink: 0, '&:hover': { bgcolor: '#A33A00' }, '&.Mui-disabled': { bgcolor: '#F3F4F6', color: '#9CA3AF' } }}>
+              <Send sx={{ fontSize: 18 }} />
+            </IconButton>
           </Box>
           <Typography sx={{ fontSize: '0.58rem', color: '#9CA3AF', mt: 0.5, textAlign: 'center' }}>
-            Enter to send · Shift+Enter new line · 📎 Attach file → uploads to SharePoint &amp; embeds for AI context
+            Press Enter to send | Shift+Enter for new line
           </Typography>
         </Box>
       </Box>
@@ -1743,13 +1443,23 @@ export default function ChatPage() {
           <Typography sx={{ fontWeight: 700, fontSize: '0.75rem', color: '#1F2937' }}>
             {currentBOM ? 'Live BOM Preview' : 'BOM Preview'}
           </Typography>
-          {currentBOM && (
-            <Box sx={{ display: 'flex', gap: 0.5 }}>
+          <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
+            {currentBOM && <>
               <Tooltip title="Save BOM"><IconButton size="small" onClick={() => handleSend('save')} sx={{ color: '#10B981' }}><Save sx={{ fontSize: 15 }} /></IconButton></Tooltip>
               <Tooltip title="Send to RFQ"><IconButton size="small" onClick={() => { dispatch(setActiveBOMForRFQ(currentBOM)); navigate('/rfq-builder') }} sx={{ color: '#3B82F6' }}><Build sx={{ fontSize: 15 }} /></IconButton></Tooltip>
               <Tooltip title="Export as Excel"><IconButton size="small" onClick={() => exportBOMExcel(currentBOM, dispatch)} sx={{ color: '#6B7280' }}><Download sx={{ fontSize: 15 }} /></IconButton></Tooltip>
-            </Box>
-          )}
+            </>}
+            {!currentBOM && phaseProgress >= 85 && (
+              <Tooltip title="Intake complete — click to generate BOM JSON">
+                <IconButton size="small" onClick={() => { if (!sendingRef.current) handleSend('generate') }}
+                  sx={{ color: '#D04A02',
+                    animation: 'bomPulse 1.6s ease-in-out infinite',
+                    '@keyframes bomPulse': { '0%,100%': { opacity: 1, transform: 'scale(1)' }, '50%': { opacity: 0.55, transform: 'scale(0.88)' } } }}>
+                  <AutoAwesome sx={{ fontSize: 15 }} />
+                </IconButton>
+              </Tooltip>
+            )}
+          </Box>
         </Box>
 
         {!currentBOM ? (
@@ -1759,7 +1469,7 @@ export default function ChatPage() {
             const hasProgress = answeredCount > 0 || phaseProgress > 0
             const displayPct = phaseProgress > 0 ? phaseProgress : pct
             return hasProgress ? (
-              // Intake progress tracker — shown while gathering fields
+              // ── Intake progress tracker (shown while gathering fields, before BOM generated)
               <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', p: 1.5, overflow: 'hidden' }}>
                 <Box sx={{ mb: 1.5 }}>
                   <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
@@ -1777,14 +1487,17 @@ export default function ChatPage() {
                   {INTAKE_STEPS.map(step => {
                     const done = !!intakeFields[step.key]
                     return (
-                      <Box key={step.key} sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.6, borderBottom: '1px solid #F9FAFB' }}>
-                        <Box sx={{ width: 16, height: 16, borderRadius: '50%', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                          bgcolor: done ? '#D1FAE5' : '#F3F4F6' }}>
+                      <Box key={step.key} sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.6,
+                        borderBottom: '1px solid #F9FAFB' }}>
+                        <Box sx={{ width: 16, height: 16, borderRadius: '50%', flexShrink: 0,
+                          bgcolor: done ? '#D1FAE5' : '#F3F4F6',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                           <Typography sx={{ fontSize: '0.6rem', color: done ? '#10B981' : '#9CA3AF', fontWeight: 700, lineHeight: 1 }}>
                             {done ? '✓' : '·'}
                           </Typography>
                         </Box>
-                        <Typography sx={{ fontSize: '0.68rem', color: done ? '#065F46' : '#6B7280', fontWeight: done ? 600 : 400, lineHeight: 1.3 }}>
+                        <Typography sx={{ fontSize: '0.68rem', color: done ? '#065F46' : '#6B7280',
+                          fontWeight: done ? 600 : 400, lineHeight: 1.3 }}>
                           {step.label}
                         </Typography>
                       </Box>
@@ -1796,21 +1509,23 @@ export default function ChatPage() {
                     <Button fullWidth size="small" variant="contained"
                       onClick={() => { if (!sendingRef.current) handleSend('generate') }}
                       disabled={isTyping}
-                      sx={{ textTransform: 'none', fontSize: '0.68rem', fontWeight: 700, bgcolor: '#D04A02', '&:hover': { bgcolor: '#A33A00' }, py: 0.6, borderRadius: '8px' }}>
+                      sx={{ textTransform: 'none', fontSize: '0.68rem', fontWeight: 700,
+                        bgcolor: '#D04A02', '&:hover': { bgcolor: '#A33A00' }, py: 0.6,
+                        borderRadius: '8px' }}>
                       ⚡ Generate BOM Now
                     </Button>
                   )}
                   <Box sx={{ p: 1, bgcolor: '#FDF3ED', borderRadius: '8px', border: '1px dashed #FBBF9F' }}>
                     <Typography sx={{ fontSize: '0.62rem', color: '#92400E', textAlign: 'center', lineHeight: 1.5 }}>
                       {phaseProgress >= 85
-                        ? 'Intake complete — type "confirmed" or click Generate'
+                        ? 'Intake complete — type “confirmed” or click Generate'
                         : 'BOM will appear here once all qualification questions are answered'}
                     </Typography>
                   </Box>
                 </Box>
               </Box>
             ) : (
-              // Empty state (no session active)
+              // ── Empty state (no session active)
               <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', p: 2, textAlign: 'center' }}>
                 <AutoAwesome sx={{ fontSize: 32, color: '#E5E7EB', mb: 1 }} />
                 <Typography sx={{ fontSize: '0.75rem', color: '#9CA3AF', lineHeight: 1.5 }}>
@@ -1887,7 +1602,7 @@ export default function ChatPage() {
         )}
       </Box>
 
-      {/* ── Delete Confirmation Dialog ───────────────────────────────────── */}
+      {/* ── Delete Confirmation Dialog ────────────────────────────────── */}
       <Dialog open={!!confirmDeleteEntry} onClose={() => setConfirmDeleteEntry(null)} maxWidth="xs" fullWidth
         PaperProps={{ sx: { borderRadius: '12px' } }}>
         <DialogTitle sx={{ pb: 0.5, display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -1899,8 +1614,8 @@ export default function ChatPage() {
         <DialogContent sx={{ pt: 1 }}>
           <Typography sx={{ fontSize: '0.82rem', color: '#374151' }}>
             {confirmDeleteEntry?.type === 'chat'
-              ? <span>Remove <strong>{confirmDeleteEntry.item.label}</strong> from chat history?</span>
-              : <span>Permanently delete <strong>{confirmDeleteEntry?.item.label}</strong>? This will also remove it from the BOM Library.</span>
+              ? <>Remove <strong>{confirmDeleteEntry.item.label}</strong> from chat history?</>
+              : <>Permanently delete <strong>{confirmDeleteEntry?.item.label}</strong>? This will also remove it from the BOM Library.</>
             }
           </Typography>
           <Typography sx={{ fontSize: '0.74rem', color: '#6B7280', mt: 0.75 }}>
@@ -1918,7 +1633,7 @@ export default function ChatPage() {
                 setChatHistory(prev => prev.filter(s => s.session_id !== item.raw.session_id))
               } else {
                 dispatch(deleteBOM(item.raw.id))
-                bomApi.delete?.(item.raw.id)
+                bomApi.delete?.(item.raw.id)  // best-effort backend delete
               }
               setConfirmDeleteEntry(null)
             }}
@@ -1928,7 +1643,7 @@ export default function ChatPage() {
         </DialogActions>
       </Dialog>
 
-      {/* ── Domain Picker Dialog ─────────────────────────────────────────── */}
+      {/* ── Domain Picker Dialog ─────────────────────────────────────── */}
       <Dialog open={domainPickerOpen} onClose={() => setDomainPickerOpen(false)}
         maxWidth="sm" fullWidth
         PaperProps={{ sx: { borderRadius: '14px', p: 0.5 } }}>

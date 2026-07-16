@@ -19,6 +19,7 @@ langchain==0.1.6
 langchain-community==0.0.19
 langgraph==0.0.20
 openai>=1.12.0
+langchain-core==1.4.8
 
 # Azure AI Search (BOM embedding pipeline)
 azure-search-documents>=11.4.0

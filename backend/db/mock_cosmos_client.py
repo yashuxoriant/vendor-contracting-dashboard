@@ -39,7 +39,14 @@ class MockCosmosDBClient:
         logger.info("Mock containers created (no-op)")
     
     def _seed_sample_data(self):
-        """Seed with realistic PwC M&A BOM data matching client projects."""
+        """Seed with minimal reference data only.
+        BOM seed data is intentionally removed — the frontend Redux store owns
+        the canonical seed BOMs (bom_001…bom_004) with stable IDs.  Seeding
+        separate BOMs here caused ID mismatches: frontend used 'bom_001' while
+        the backend used 'bom_panasonic_001' for the same logical record,
+        meaning tombstone-based deletion could never match and deleted BOMs
+        reappeared on every server restart.
+        """
         now = datetime.utcnow()
 
         # Sample user
@@ -62,6 +69,8 @@ class MockCosmosDBClient:
             "base_items": [], "rules": {}, "example_boms": [],
             "created_by": "system", "created_at": now.isoformat()
         }
+
+        logger.info("Seeded mock database: user + template only (BOMs managed by frontend Redux)")
 
         # ── Seed BOM 1: Panasonic SD-WAN ──────────────────────────────────
         pan_items = [

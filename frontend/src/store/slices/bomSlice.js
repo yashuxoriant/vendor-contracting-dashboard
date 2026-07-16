@@ -90,11 +90,23 @@ const SEED = [
 
 const bomSlice = createSlice({
   name: 'bom',
-  initialState: { currentBOM: null, activeBOMForRFQ: null, bomList: SEED, loading: false, error: null },
+  initialState: {
+    currentBOM: null,
+    activeBOMForRFQ: null,
+    bomList: SEED,
+    loading: false,
+    error: null,
+    // Tombstone: IDs of BOMs the user has deleted this session.
+    // saveBOM will skip any BOM whose ID is in this set so backend re-fetches
+    // cannot resurrect deleted items.
+    deletedIds: (() => { try { return JSON.parse(localStorage.getItem('bom_deleted_ids') || '[]') } catch { return [] } })(),
+  },
   reducers: {
     setCurrentBOM:      (s, a) => { s.currentBOM = a.payload },
     setActiveBOMForRFQ: (s, a) => { s.activeBOMForRFQ = a.payload },
     saveBOM: (s, a) => {
+      // Skip if the user has already deleted this BOM
+      if (s.deletedIds.includes(a.payload?.id)) return
       const bom = { ...a.payload, updatedAt: new Date().toISOString() }
       const idx = s.bomList.findIndex(b => b.id === bom.id)
       if (idx >= 0) s.bomList[idx] = bom; else s.bomList.unshift(bom)
@@ -123,11 +135,20 @@ const bomSlice = createSlice({
       s.currentBOM.totalValue = s.currentBOM.lineItems.reduce((t, i) => t + (i.extPrice || 0), 0)
     },
     deleteBOM: (s, a) => {
-      s.bomList = s.bomList.filter(b => b.id !== a.payload)
-      if (s.currentBOM?.id === a.payload) s.currentBOM = null
+      const id = a.payload
+      s.bomList = s.bomList.filter(b => b.id !== id)
+      if (s.currentBOM?.id === id) s.currentBOM = null
+      // Add to tombstone list and persist to localStorage so page-refresh re-fetches
+      // from the backend cannot resurrect this BOM.
+      if (!s.deletedIds.includes(id)) {
+        s.deletedIds.push(id)
+        try { localStorage.setItem('bom_deleted_ids', JSON.stringify(s.deletedIds)) } catch (_) {}
+      }
     },
     resetToSeed: (s) => {
       s.bomList = SEED
+      s.deletedIds = []
+      try { localStorage.removeItem('bom_deleted_ids') } catch (_) {}
       if (s.currentBOM && !SEED.find(b => b.id === s.currentBOM.id)) s.currentBOM = null
     },
     archiveBOM: (s, a) => { const b = s.bomList.find(x => x.id === a.payload); if (b) b.status = 'archived' },

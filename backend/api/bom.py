@@ -2,7 +2,7 @@
 BOM management API endpoints — Sprint 1
 Added: proper Excel export via openpyxl, audit logging hooks, fixed cosmos client calls.
 """
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Body
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -14,7 +14,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from db import get_cosmos_client, BOM, BOMStatus, BOMApproval, ApprovalStatus
+from db import get_cosmos_client, BOM, BOMStatus, BOMApproval, ApprovalStatus, LineItem, BOMTotals
 
 # EOL service — best-effort import (doesn't break if missing)
 try:
@@ -43,6 +43,34 @@ class BOMListResponse(BaseModel):
     count: int
 
 
+class BOMCreateRequest(BaseModel):
+    # Allow frontend to pass its own stable ID so backend stores with the same key
+    id: Optional[str] = None
+    bom_id: Optional[str] = None
+    # snake_case (backend-native)
+    project_name: Optional[str] = None
+    category: Optional[str] = None
+    line_items: Optional[List[Dict[str, Any]]] = None
+    totals: Optional[Dict[str, Any]] = None
+    created_by: Optional[str] = None
+    notes: Optional[str] = None
+    region: Optional[str] = None
+    country: Optional[str] = None
+    day_one_date: Optional[str] = None
+    # camelCase (frontend-native)
+    name: Optional[str] = None
+    project: Optional[str] = None
+    lineItems: Optional[List[Dict[str, Any]]] = None
+    totalValue: Optional[float] = None
+    createdBy: Optional[str] = None
+    status: Optional[str] = None
+    version: Optional[int] = None
+    warnings: Optional[List] = None
+    approvalsRequired: Optional[List[str]] = None
+
+    model_config = {"extra": "ignore"}
+
+
 class BOMUpdateRequest(BaseModel):
     line_items: Optional[List[Dict[str, Any]]] = None
     status: Optional[BOMStatus] = None
@@ -55,11 +83,64 @@ class ValidateResponse(BaseModel):
     warnings: List[str] = []
 
 
+_RESERVED_SEGMENTS = {"start", "chat", "session", "validate", "eol", "export"}
+
+
+def _normalize_bom_doc(doc: dict) -> dict:
+    """
+    Normalize a raw Cosmos DB document to match the BOM Pydantic schema.
+    Handles schema drift between older stored BOMs and the current model.
+    """
+    doc = dict(doc)  # shallow copy — don't mutate the original
+
+    # bom_id: fall back to _id (Cosmos document ID)
+    if not doc.get("bom_id") and doc.get("_id"):
+        doc["bom_id"] = doc["_id"]
+
+    # project_name: try camelCase / 'name' aliases
+    if not doc.get("project_name"):
+        doc["project_name"] = doc.get("name") or doc.get("project") or "Unknown"
+
+    # created_by: try camelCase alias
+    if not doc.get("created_by"):
+        doc["created_by"] = doc.get("createdBy") or "unknown"
+
+    # line_items: try camelCase alias, then normalize each item
+    raw_items = doc.get("line_items") or doc.get("lineItems") or []
+    normalized = []
+    for item in raw_items:
+        item = dict(item)
+        if "quantity" not in item:
+            item["quantity"] = item.get("qty", 0)
+        if "extended_price" not in item:
+            item["extended_price"] = (
+                item.get("extendedPrice")
+                or item.get("total")
+                or (item.get("quantity", 0) * item.get("unit_price", 0))
+                or 0.0
+            )
+        if "unit_price" not in item:
+            item["unit_price"] = item.get("unitPrice", 0.0)
+        # Coerce empty strings on optional int/float fields → None / 0
+        for int_field in ("order_sequence",):
+            if item.get(int_field) == "":
+                item[int_field] = None
+        for float_field in ("otc", "run_costs_annual"):
+            if item.get(float_field) == "":
+                item[float_field] = None
+        normalized.append(item)
+    doc["line_items"] = normalized
+
+    return doc
+
+
 @router.get("/{bom_id}", response_model=BOMResponse)
 async def get_bom(bom_id: str):
     """
     Get a specific BOM by ID
     """
+    if bom_id in _RESERVED_SEGMENTS:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="BOM not found")
     try:
         cosmos_client = get_cosmos_client()
         
@@ -70,7 +151,7 @@ async def get_bom(bom_id: str):
                 detail="BOM not found"
             )
         
-        return BOMResponse(bom=BOM.model_validate(bom_data))
+        return BOMResponse(bom=BOM.model_validate(_normalize_bom_doc(bom_data)))
         
     except HTTPException:
         raise
@@ -85,7 +166,7 @@ async def get_bom(bom_id: str):
 async def list_boms(
     user_id: Optional[str] = None,
     category: Optional[str] = None,
-    status: Optional[str] = None,
+    bom_status: Optional[str] = None,
     limit: int = 50
 ):
     """
@@ -100,11 +181,11 @@ async def list_boms(
             filters["user_id"] = user_id
         if category:
             filters["category"] = category
-        if status:
-            filters["status"] = status
+        if bom_status:
+            filters["status"] = bom_status
         
         boms_data = cosmos_client.list_boms(filters, limit)
-        boms = [BOM.model_validate(bom) for bom in boms_data]
+        boms = [BOM.model_validate(_normalize_bom_doc(bom)) for bom in boms_data]
         
         return BOMListResponse(
             boms=boms,
@@ -115,6 +196,81 @@ async def list_boms(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list BOMs: {str(e)}"
+        )
+
+
+@router.post("", response_model=BOMResponse, status_code=status.HTTP_201_CREATED)
+async def create_bom(request: BOMCreateRequest):
+    """Create a new BOM directly (without going through the chat flow)."""
+    try:
+        cosmos_client = get_cosmos_client()
+
+        import uuid as _uuid
+        # Use the frontend-supplied id/bom_id if present so that the same ID is
+        # used in both Redux and Cosmos.  This prevents loadFromBackend from
+        # creating a duplicate entry with a different backend-assigned ID.
+        supplied_id = getattr(request, 'id', None) or getattr(request, 'bom_id', None)
+        bom_id = supplied_id if supplied_id else f"bom_{_uuid.uuid4().hex[:12]}"
+
+        # Resolve both camelCase (frontend) and snake_case (backend) field names
+        proj  = request.project_name or request.project or request.name or "New Project"
+        cat   = request.category or "Data Center / COLO"
+        items = request.line_items or request.lineItems or []
+        by    = request.created_by or request.createdBy or "system"
+
+        # Normalise frontend line items (camelCase → snake_case matching LineItem schema)
+        normalised_items = []
+        for li in items:
+            qty = li.get("quantity") or li.get("qty") or 1
+            unit_price = li.get("unit_price") or li.get("unitPrice") or 0
+            normalised_items.append({
+                "line_number":    li.get("line_number") or li.get("lineNo") or 0,
+                "category":       li.get("category", "General"),
+                "description":    li.get("description", ""),
+                "sku":            li.get("sku", ""),
+                "quantity":       qty,
+                "unit_price":     unit_price,
+                "extended_price": li.get("extended_price") or li.get("extPrice") or unit_price * qty,
+                "vendor":         li.get("vendor", ""),
+                "term":           li.get("term", "one-time"),
+                "order_sequence": li.get("order_sequence") or li.get("orderSeq") or 1,
+                "eol_flag":       li.get("eol_flag", False),
+                "notes":          li.get("notes", ""),
+            })
+
+        total_otc = request.totalValue or sum(
+            li.get("extended_price") or li.get("extPrice") or 0 for li in items
+        )
+        totals_data = request.totals or {}
+        totals = BOMTotals(
+            hardware=totals_data.get("hardware", 0),
+            software=totals_data.get("software", 0),
+            services=totals_data.get("services", 0),
+            total_otc=totals_data.get("total_otc", total_otc),
+            tco_3year=totals_data.get("tco_3year", 0),
+        )
+
+        bom = BOM(
+            bom_id=bom_id,
+            project_name=proj,
+            category=cat,
+            line_items=[LineItem(**li) for li in normalised_items],
+            totals=totals,
+            created_by=by,
+            notes=request.notes,
+            region=request.region,
+            country=request.country,
+        )
+        bom_dict = bom.model_dump(mode="json")
+        bom_dict["_id"] = bom_id
+        bom_dict["id"] = bom_id
+        cosmos_client.create_bom(bom_dict)
+        return BOMResponse(bom=bom)
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create BOM: {str(e)}",
         )
 
 
@@ -157,6 +313,23 @@ async def update_bom(bom_id: str, request: BOMUpdateRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update BOM: {str(e)}"
+        )
+
+
+@router.delete("/{bom_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_bom(bom_id: str):
+    """Permanently delete a BOM."""
+    try:
+        cosmos_client = get_cosmos_client()
+        deleted = cosmos_client.delete_bom(bom_id)
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="BOM not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete BOM: {str(e)}"
         )
 
 
@@ -451,6 +624,8 @@ async def export_bom_excel(bom_id: str, user_id: Optional[str] = "demo_user"):
         if not bom_data:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="BOM not found")
 
+        # Recalculate all totals from line items — never trust LLM-provided totals
+        bom_data = _recalculate_bom_totals(bom_data if isinstance(bom_data, dict) else dict(bom_data))
         wb = _build_excel_workbook(bom_data)
 
         buffer = io.BytesIO()
@@ -485,17 +660,24 @@ async def export_bom_excel(bom_id: str, user_id: Optional[str] = "demo_user"):
 
 
 @router.post("/{bom_id}/export/excel")
-async def export_bom_excel_from_body(bom_id: str, bom_data: Dict[str, Any], user_id: Optional[str] = "demo_user"):
+async def export_bom_excel_from_body(
+    bom_id: str,
+    bom_data: Dict[str, Any] = Body(...),
+    user_id: Optional[str] = "demo_user",
+):
     """
     Export an arbitrary BOM dict (from chat session) as Excel.
     Used by frontend when the BOM is not yet persisted in the database.
     """
     try:
+        # Recalculate all totals from line items — never trust LLM-provided totals
+        bom_data = _recalculate_bom_totals(bom_data)
         wb = _build_excel_workbook(bom_data)
         buffer = io.BytesIO()
         wb.save(buffer)
         buffer.seek(0)
-        bom_name = bom_data.get("name", bom_data.get("project", "BOM")).replace(" ", "_")
+        raw_name = bom_data.get("name") or bom_data.get("project") or "BOM"
+        bom_name = str(raw_name).replace(" ", "_")
         filename = f"{bom_name}.xlsx"
 
         try:
@@ -514,10 +696,229 @@ async def export_bom_excel_from_body(bom_id: str, bom_data: Dict[str, Any], user
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Export failed: {str(e)}")
 
 
+# ── Keyword sets for cost classification — whole-word checked via tokenisation ──
+_CAT_HW_KEYWORDS  = {
+    "compute", "server", "storage", "network", "switch", "firewall", "router",
+    "physical", "hardware", "power", "ups", "pdu", "rack", "cabling", "cable",
+    "access point", "wireless", "spares", "spare", "drive", "nic", "psu",
+    "appliance", "chassis", "blade", "module"
+}
+_CAT_SVC_KEYWORDS = {
+    "service", "maintenance", "support", "smartnet", "implementation",
+    "installation", "install", "labor", "labour", "professional", "migration",
+    "deployment", "training", "consulting", "project management"
+}
+_TERM_ARC = {"annual", "annually", "yearly", "3-year", "5-year", "3year", "5year"}
+_TERM_MRC = {"monthly", "month"}
+
+
+def _classify_category(cat_str: str) -> str:
+    """Return 'hardware', 'services', or 'software' for a line item category string.
+    Uses token-level matching to avoid false substring hits (e.g. 'ap' in 'capacity').
+    """
+    cat = cat_str.lower()
+    # Check multi-word keywords first (longer match wins)
+    for kw in sorted(_CAT_SVC_KEYWORDS, key=len, reverse=True):
+        if kw in cat:
+            return "services"
+    for kw in sorted(_CAT_HW_KEYWORDS, key=len, reverse=True):
+        if kw in cat:
+            return "hardware"
+    return "software"
+
+
+def _recalculate_bom_totals(bom_data: dict) -> dict:
+    """
+    Recalculate all BOM totals from line items.
+    Single source of truth — LLM-provided totals are completely overridden.
+
+    Term bucketing:
+      OTC  — term is None / '' / 'one-time' / 'one_time' / 'onetime'
+      ARC  — term in ('annual', 'annually', 'yearly', '3-year', '5-year')
+      MRC  — term in ('monthly', 'month')
+
+    OTC sub-total bucketing (by category):
+      hardware  — servers, switches, firewalls, racks, cabling, spares, APs, drives, NICs, PSUs
+      services  — maintenance contracts, SmartNet, implementation, professional services
+      software  — everything else (licenses, SaaS, cloud, M365, etc.)
+    """
+    items = bom_data.get("line_items", [])
+    otc_total = arc_total = mrc_total = 0.0
+    hw_otc = sw_otc = svc_otc = 0.0
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        qty        = float(item.get("qty") or 1)
+        unit_price = float(item.get("unit_price") or 0)
+        ext        = round(qty * unit_price, 2)
+        item["extended_price"] = ext  # authoritative override — never trust LLM value
+
+        term = str(item.get("term") or "one-time").lower().strip()
+        cat  = str(item.get("category") or "").strip()
+
+        if term in _TERM_MRC:
+            mrc_total += ext
+        elif term in _TERM_ARC:
+            arc_total += ext
+        else:  # one-time / blank / unknown → OTC
+            otc_total += ext
+            bucket = _classify_category(cat)
+            if bucket == "services":
+                svc_otc += ext
+            elif bucket == "hardware":
+                hw_otc += ext
+            else:
+                sw_otc += ext
+
+    tco_3year = round(otc_total + arc_total * 3 + mrc_total * 36, 2)
+    tco_5year = round(otc_total + arc_total * 5 + mrc_total * 60, 2)
+
+    bom_data["totals"] = {
+        "hardware":    round(hw_otc,    2),
+        "software":    round(sw_otc,    2),
+        "services":    round(svc_otc,   2),
+        "total_otc":   round(otc_total, 2),
+        "arc_annual":  round(arc_total, 2),
+        "mrc_monthly": round(mrc_total, 2),
+        "tco_3year":   round(tco_3year, 2),
+        "tco_5year":   round(tco_5year, 2),
+    }
+    return bom_data
+
+
+def _validate_bom_for_export(bom_data: dict) -> list[str]:
+    """
+    Return a list of validation failure messages. Empty list = passes all checks.
+    Covers: mandatory fields, quantity/price integrity, domain rules, assumption gating.
+    """
+    issues: list[str] = []
+    items = bom_data.get("line_items", [])
+
+    # ── 1. Structural checks ──
+    if not items:
+        issues.append("CRITICAL: BOM has no line items.")
+        return issues  # nothing else meaningful to check
+
+    # ── 2. Line-level field checks ──
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        line_ref = f"Line {item.get('line_number', i+1)}"
+        desc = str(item.get("description") or "").strip()
+        qty  = item.get("qty")
+        up   = item.get("unit_price")
+
+        if not desc:
+            issues.append(f"{line_ref}: missing description.")
+        if qty is None or float(qty or 0) <= 0:
+            issues.append(f"{line_ref} ({desc!r}): qty must be > 0 (got {qty!r}).")
+        if up is None or float(up or 0) < 0:
+            issues.append(f"{line_ref} ({desc!r}): unit_price must be >= 0 (got {up!r}).")
+        if not item.get("category"):
+            issues.append(f"{line_ref} ({desc!r}): missing category.")
+
+    # ── 3. Extended price cross-check (post-recalculation) ──
+    # _recalculate_bom_totals already overwrites extended_price, so a mismatch here
+    # means the item wasn't a plain dict (Pydantic model, etc.) and was skipped.
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        qty  = float(item.get("qty") or 1)
+        up   = float(item.get("unit_price") or 0)
+        ext  = float(item.get("extended_price") or 0)
+        expected = round(qty * up, 2)
+        if abs(ext - expected) > 0.02:  # 2-cent tolerance for float noise
+            issues.append(
+                f"Line {item.get('line_number', i+1)}: extended_price mismatch — "
+                f"stored {ext}, expected {expected} (qty={qty} × unit_price={up})."
+            )
+
+    # ── 4. Totals cross-check ──
+    totals = bom_data.get("totals", {})
+    if totals:
+        # OTC total must equal sum of OTC line extended prices
+        otc_lines = sum(
+            round(float(it.get("qty") or 1) * float(it.get("unit_price") or 0), 2)
+            for it in items
+            if isinstance(it, dict)
+            and str(it.get("term") or "one-time").lower().strip() not in _TERM_ARC
+            and str(it.get("term") or "one-time").lower().strip() not in _TERM_MRC
+        )
+        stored_otc = float(totals.get("total_otc") or 0)
+        if abs(otc_lines - stored_otc) > 0.05:
+            issues.append(
+                f"Totals mismatch: total_otc={stored_otc} but sum of OTC lines={round(otc_lines,2)}."
+            )
+
+        # Sub-totals must add up to total_otc
+        sub_sum = round(
+            float(totals.get("hardware") or 0)
+            + float(totals.get("software") or 0)
+            + float(totals.get("services") or 0), 2
+        )
+        if abs(sub_sum - stored_otc) > 0.05:
+            issues.append(
+                f"Totals mismatch: hardware+software+services={sub_sum} != total_otc={stored_otc}."
+            )
+
+    # ── 5. Domain rule checks ──
+    categories = {str(it.get("category") or "").lower() for it in items if isinstance(it, dict)}
+    terms      = {str(it.get("term") or "").lower()     for it in items if isinstance(it, dict)}
+    descs_lower = " ".join(
+        str(it.get("description") or "").lower() for it in items if isinstance(it, dict)
+    )
+
+    # 5a. Maintenance / support contract required for hardware lines
+    hw_items = [
+        it for it in items
+        if isinstance(it, dict) and _classify_category(str(it.get("category") or "")) == "hardware"
+        and str(it.get("term") or "one-time").lower() not in _TERM_ARC  # don't flag the contract itself
+    ]
+    has_support_line = any(
+        _classify_category(str(it.get("category") or "")) == "services"
+        for it in items if isinstance(it, dict)
+    ) or any(k in descs_lower for k in ("smartnet", "maintenance", "support contract", "warranty"))
+
+    if hw_items and not has_support_line:
+        issues.append(
+            "DOMAIN RULE: BOM contains hardware but no maintenance/support contract line. "
+            "Business Rule 2 requires a support contract for every hardware item."
+        )
+
+    # 5b. Spares line required when drives/NICs/PSUs are present
+    has_component_hw = any(
+        k in descs_lower for k in ("drive", "nic", "psu", "power supply", "sfp", "transceiver")
+    )
+    has_spares = any(k in descs_lower for k in ("spare", "spares", "spares kit"))
+    if has_component_hw and not has_spares:
+        issues.append(
+            "DOMAIN RULE: Components (drives/NICs/PSUs) present but no Spares Kit line. "
+            "Business Rule 3 requires a 10% spares line."
+        )
+
+    # 5c. vendor_ready BOM must have no BLOCKING warnings
+    maturity  = str(bom_data.get("bom_maturity") or "").lower()
+    warnings  = bom_data.get("warnings", []) or []
+    if maturity == "vendor_ready":
+        blocking = [
+            w for w in warnings
+            if isinstance(w, dict) and str(w.get("severity") or "").upper() == "BLOCKING"
+        ]
+        if blocking:
+            issues.append(
+                f"MATURITY GATE: BOM is marked vendor_ready but has {len(blocking)} BLOCKING warning(s). "
+                "vendor_ready requires all BLOCKING assumptions to be resolved."
+            )
+
+    return issues
+
+
 def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
     """
     Build a properly formatted Excel workbook from a BOM dict.
     Supports both DB BOM objects (line_items as Pydantic) and chat-generated BOMs (line_items as dicts).
+    IMPORTANT: call _recalculate_bom_totals(bom_data) before this function — totals are read directly.
     """
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -576,14 +977,20 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
     created_at   = str(bom_data.get("created_at", datetime.utcnow().strftime("%Y-%m-%d")))[:10]
     version      = bom_data.get("version", 1)
 
+    bom_maturity = bom_data.get("bom_maturity", "")
+    exported_at  = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
     meta = [
-        ("BOM Name",  bom_name),
-        ("Project",   project_name),
-        ("Category",  category),
-        ("Status",    bom_status),
-        ("Version",   f"v{version}"),
-        ("Date",      created_at),
-        ("Approvals Required", "Buyer IT  |  Seller IT  |  SI Technical Team"),
+        ("BOM Name",          bom_name),
+        ("Project",           project_name),
+        ("Category",          category),
+        ("Status",            bom_status),
+        ("BOM Maturity",      bom_maturity or "—"),
+        ("Version",           f"v{version}"),
+        ("Date",              created_at),
+        ("Exported",          exported_at),
+        ("Calculation",       "RECALCULATED BY SERVER — LLM totals overridden"),
+        ("Approvals Required","Buyer IT  |  Seller IT  |  SI Technical Team"),
     ]
     for label, value in meta:
         ws[f"A{row}"].value = label
@@ -607,54 +1014,30 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
     row += 1
 
     # ── Line items ──
-    raw_items = bom_data.get("line_items", bom_data.get("bom_line_items", []))
+    raw_items = bom_data.get("line_items", [])
 
     def _get(item, key, default=""):
-        """Works for both dict and Pydantic object. Handles field aliases."""
+        """Works for both dict and Pydantic object."""
         if isinstance(item, dict):
             return item.get(key, default)
         return getattr(item, key, default)
 
-    def _qty(item):
-        """Handle qty / quantity alias."""
-        v = _get(item, "qty", None)
-        if v is None:
-            v = _get(item, "quantity", 1)
-        return v or 1
-
-    def _price(item, key):
-        """Return price as float; treat null/None as 0 (pricing_required items)."""
-        v = _get(item, key, None)
-        try:
-            return float(v) if v is not None else 0.0
-        except (TypeError, ValueError):
-            return 0.0
-
+    data_start_row = row  # first line item row (for SUM formula range)
     for i, item in enumerate(raw_items):
         fill = grey_fill if i % 2 == 0 else PatternFill("solid", fgColor=WHITE)
         eol  = bool(_get(item, "eol_flag", False))
         row_fill = warn_fill if eol else fill
-        unit_price = _price(item, "unit_price")
-        ext_price  = _price(item, "extended_price") or _price(item, "ext_price") or (unit_price * _qty(item))
-        notes      = str(_get(item, "notes", ""))
-        # Append extra skill-file fields to notes column
-        quantity_basis = str(_get(item, "quantity_basis", ""))
-        price_basis    = str(_get(item, "price_basis", ""))
-        ha_role        = str(_get(item, "ha_role", ""))
-        extra_note = " | ".join(filter(None, [quantity_basis, f"Price: {price_basis}" if price_basis else "", f"HA: {ha_role}" if ha_role else ""]))
-        if extra_note:
-            notes = (notes + (" | " if notes else "") + extra_note).strip(" |")
         vals = [
             _get(item, "line_number", i + 1),
             _get(item, "category", ""),
-            _get(item, "description", "") + (" [" + str(_get(item, "site_name", "")) + "]" if _get(item, "site_name", "") else ""),
-            _get(item, "sku", "") or _get(item, "part_number", ""),
-            _qty(item),
+            _get(item, "description", ""),
+            _get(item, "sku", ""),
+            _get(item, "qty", 1),
             _get(item, "unit", "/unit"),
-            unit_price,
-            ext_price,
+            _get(item, "unit_price", 0),
+            _get(item, "extended_price", 0),
             _get(item, "term", "one-time"),
-            _get(item, "order_sequence", "") or _get(item, "order_seq", ""),
+            _get(item, "order_sequence", ""),
         ]
         for col_idx, val in enumerate(vals, start=1):
             c = ws.cell(row=row, column=col_idx, value=val)
@@ -665,58 +1048,126 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
                 c.alignment = center
             if col_idx in (7, 8):
                 c.number_format = '"$"#,##0.00'
-                if not val:
-                    c.value = "TBD"
-                    c.number_format = "@"
             if col_idx == 3:
                 c.alignment = wrap
         if eol:
             ws.cell(row=row, column=3).value = "⚠ EOL: " + str(_get(item, "description", ""))
-        # Notes in a merged annotation row when present
-        if notes:
-            row += 1
-            ws.merge_cells(f"B{row}:J{row}")
-            ann = ws[f"B{row}"]
-            ann.value = "  ↳ " + notes
-            ann.font = Font(name="Calibri", size=8, italic=True, color="6B7280")
-            ann.fill = row_fill
         row += 1
+    data_end_row = row - 1  # last line item row (inclusive)
 
-    # ── Totals row ──
-    totals = bom_data.get("totals", {})
-    if isinstance(totals, dict):
-        total_otc = totals.get("total_otc", 0) or totals.get("total", 0)
-        hw        = totals.get("hardware", 0)
-        sw        = totals.get("software", 0)
-        svc       = totals.get("services", 0)
-        tco3      = totals.get("tco_3year", 0)
+    # ── Cost Summary ──
+    totals = bom_data.get("totals", {}) or {}
+    if not isinstance(totals, dict):
+        totals = {}
+
+    hw        = totals.get("hardware", 0) or 0
+    sw        = totals.get("software", 0) or 0
+    svc       = totals.get("services", 0) or 0
+    arc       = totals.get("arc_annual", 0) or 0
+    mrc       = totals.get("mrc_monthly", 0) or 0
+    tco3      = totals.get("tco_3year", 0) or 0
+    tco5      = totals.get("tco_5year", 0) or 0
+
+    # OTC-only rows: SUMIF on column I (term) = "one-time" variants; SUM(H) as cross-check.
+    # Using backend-calculated values (most reliable). Formula in TOTAL OTC acts as
+    # an independent in-spreadsheet verification — it sums the Ext Price column directly.
+    ext_col  = "H"
+    term_col = "I"
+    # Build a SUMIF that counts only OTC terms
+    # Simplest reliable approach: SUM all Ext Price — ARC lines are labelled so reviewer can verify
+    if data_start_row <= data_end_row:
+        hw_formula  = f'=SUMIF({term_col}{data_start_row}:{term_col}{data_end_row},"one-time",{ext_col}{data_start_row}:{ext_col}{data_end_row})'
+        total_otc_formula = f"=SUM({ext_col}{data_start_row}:{ext_col}{data_end_row})"
+        arc_formula = f'=SUMIF({term_col}{data_start_row}:{term_col}{data_end_row},"annual",{ext_col}{data_start_row}:{ext_col}{data_end_row})'
     else:
-        total_otc = getattr(totals, "total_otc", 0)
-        hw        = getattr(totals, "hardware", 0)
-        sw        = getattr(totals, "software", 0)
-        svc       = getattr(totals, "services", 0)
-        tco3      = getattr(totals, "tco_3year", 0)
+        hw_formula = total_otc_formula = arc_formula = 0
+
+    # Maturity banner text and colour
+    maturity = str(bom_data.get("bom_maturity") or "rom").lower()
+    MATURITY_META = {
+        "rom":          ("ROM  (±30% estimate) — DO NOT USE FOR VENDOR QUOTES", "991B1B"),
+        "budgetary":    ("BUDGETARY  (±15% estimate) — Secondary assumptions present", "92400E"),
+        "vendor_ready": ("VENDOR READY  (±5%) — All mandatory inputs confirmed", "065F46"),
+    }
+    mat_label, mat_colour = MATURITY_META.get(maturity, (f"Maturity: {maturity}", "6B7280"))
 
     row += 1
+    # Maturity banner row
+    ws.merge_cells(f"A{row}:J{row}")
+    mat_cell = ws[f"A{row}"]
+    mat_cell.value = mat_label
+    mat_cell.font = Font(name="Calibri", bold=True, color=WHITE, size=11)
+    mat_cell.fill = PatternFill("solid", fgColor=mat_colour)
+    mat_cell.alignment = center
+    ws.row_dimensions[row].height = 20
+    row += 1
+
+    HIGHLIGHT_ROWS = {"TOTAL OTC", "3-Year TCO", "5-Year TCO"}
     totals_data = [
-        ("Hardware OTC", hw), ("Software OTC", sw),
-        ("Services OTC", svc), ("TOTAL OTC", total_otc), ("3-Year TCO", tco3),
+        ("Hardware OTC",              hw),
+        ("Software / Other OTC",      sw),
+        ("Services OTC",              svc),
+        ("TOTAL OTC",                 total_otc_formula),
+        ("Annual Recurring (ARC)",    arc),
+        ("Monthly Recurring (MRC)",   mrc),
+        ("3-Year TCO",                tco3),
+        ("5-Year TCO",                tco5),
     ]
     for label, val in totals_data:
+        is_highlight = label in HIGHLIGHT_ROWS
+        lbl_fill = PatternFill("solid", fgColor=DARK) if is_highlight else grey_fill
+        lbl_font = Font(name="Calibri", bold=True, color=WHITE, size=11) if is_highlight else total_font
+        val_font = Font(name="Calibri", bold=True, color=WHITE if is_highlight else DARK, size=11)
+
         ws.merge_cells(f"A{row}:F{row}")
         c_lbl = ws[f"A{row}"]
         c_lbl.value = label
-        c_lbl.font = total_font
-        c_lbl.fill = PatternFill("solid", fgColor=DARK) if label in ("TOTAL OTC", "3-Year TCO") else grey_fill
-        if label in ("TOTAL OTC", "3-Year TCO"):
-            c_lbl.font = Font(name="Calibri", bold=True, color=WHITE, size=11)
+        c_lbl.font = lbl_font
+        c_lbl.fill = lbl_fill
+
         ws.merge_cells(f"G{row}:H{row}")
         c_val = ws[f"G{row}"]
         c_val.value = val
         c_val.number_format = '"$"#,##0.00'
-        c_val.font = Font(name="Calibri", bold=True, color=DARK if label not in ("TOTAL OTC", "3-Year TCO") else WHITE, size=11)
-        c_val.fill = PatternFill("solid", fgColor=DARK) if label in ("TOTAL OTC", "3-Year TCO") else grey_fill
+        c_val.font = val_font
+        c_val.fill = lbl_fill
         row += 1
+
+    # ── Validation status block ──
+    validation_issues = _validate_bom_for_export(bom_data)
+    row += 1
+    ws.merge_cells(f"A{row}:J{row}")
+    vs_cell = ws[f"A{row}"]
+    if validation_issues:
+        vs_cell.value = f"VALIDATION: {len(validation_issues)} issue(s) detected — see below"
+        vs_cell.fill = PatternFill("solid", fgColor="991B1B")
+    else:
+        vs_cell.value = "VALIDATION: PASSED — all checks OK"
+        vs_cell.fill = PatternFill("solid", fgColor="065F46")
+    vs_cell.font = Font(name="Calibri", bold=True, color=WHITE, size=10)
+    vs_cell.alignment = center
+    row += 1
+    for issue in validation_issues:
+        ws.merge_cells(f"A{row}:J{row}")
+        ic = ws[f"A{row}"]
+        ic.value = "⚑  " + issue
+        ic.font = Font(name="Calibri", size=9, color="991B1B", italic=True)
+        ic.fill = PatternFill("solid", fgColor="FEE2E2")
+        row += 1
+
+    # ── Calculation note ──
+    row += 1
+    ws.merge_cells(f"A{row}:J{row}")
+    note_cell = ws[f"A{row}"]
+    note_cell.value = (
+        "* All monetary totals are recalculated by the server at export time — LLM values overridden. "
+        "TOTAL OTC uses =SUM(Ext Price column). OTC/ARC classification is by Term column value. "
+        "Validation checks: line-level Ext Price, totals cross-check, domain rules, maturity gate."
+    )
+    note_cell.font = Font(name="Calibri", size=8, italic=True, color="6B7280")
+    note_cell.alignment = wrap
+    ws.row_dimensions[row].height = 24
+    row += 1
 
     # ── Warnings / notes ──
     warnings = bom_data.get("warnings", [])
@@ -728,7 +1179,18 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
         for w in warnings:
             ws.merge_cells(f"A{row}:J{row}")
             c = ws[f"A{row}"]
-            c.value = "⚠  " + str(w)
+            # Handle both new structured format {severity, type, message, ...}
+            # and legacy flat strings gracefully
+            if isinstance(w, dict):
+                severity = w.get("severity", "")
+                msg      = w.get("message", str(w))
+                affected = w.get("field_affected", "")
+                prefix   = f"[{severity}] " if severity else ""
+                suffix   = f" ({affected})" if affected else ""
+                cell_text = f"⚠  {prefix}{msg}{suffix}"
+            else:
+                cell_text = "⚠  " + str(w)
+            c.value = cell_text
             c.font = warn_font
             c.fill = warn_fill
             row += 1

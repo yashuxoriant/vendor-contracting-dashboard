@@ -35,78 +35,59 @@ apiClient.interceptors.response.use(
 
 export const chatApi = {
   ping: () => apiClient.get('/health').then(() => true).catch(() => false),
-  startSession: (category, project = 'New Project', userId = 'demo_user') =>
-    apiClient.post('/api/bom/start', { category, project, user_id: userId }).then(r => r.data),
+  startSession: (category, project = 'New Project', userId = 'demo_user', existingBom = null, domainPreselected = false) =>
+    apiClient.post('/api/bom/start', { category, project, user_id: userId, existing_bom: existingBom, domain_preselected: domainPreselected }).then(r => r.data),
   sendMessage: (sessionId, message, userId = 'demo_user') =>
     apiClient.post('/api/bom/chat', { session_id: sessionId, message, user_id: userId }).then(r => r.data),
-  /** Send a message with an optional file attachment */
-  sendMessageWithAttachment: (sessionId, message, file, category, userId = 'demo_user') => {
-    const fd = new FormData()
-    fd.append('session_id', sessionId)
-    fd.append('message', message || '')
-    fd.append('user_id', userId)
-    fd.append('category', category || 'BOMs')
-    if (file) fd.append('file', file)
-    return apiClient.post('/api/bom/chat-with-attachment', fd, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    }).then(r => r.data)
+  sendMessageStream: (sessionId, message, userId = 'demo_user', onToken, onDone) => {
+    const url = '/api/bom/stream'  // LangGraph async endpoint (Step 8)
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, message, user_id: userId }),
+    }).then(async (res) => {
+      if (!res.ok) throw new Error('Stream request failed: ' + res.status)
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) {
+          // Drain remaining buffer — final SSE event may still be buffered when stream closes
+          buffer += decoder.decode()
+          const remaining = buffer.split('\n\n')
+          for (const line of remaining) {
+            if (!line.startsWith('data: ')) continue
+            try {
+              const evt = JSON.parse(line.slice(6))
+              if (!evt.done) onToken(evt.token)
+              else onDone(evt)
+            } catch (_) {}
+          }
+          break
+        }
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n\n')
+        buffer = lines.pop()
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          try {
+            const evt = JSON.parse(line.slice(6))
+            if (!evt.done) onToken(evt.token)
+            else onDone(evt)
+          } catch (_) {}
+        }
+      }
+    })
   },
   getSession: (sessionId) =>
     apiClient.get(`/api/bom/session/${sessionId}`).then(r => r.data),
-  /** Load full conversation messages for Claude-like session restore */
-  getMessages: (sessionId) =>
-    apiClient.get(`/api/bom/session/${sessionId}/messages`).then(r => r.data),
   /** List past sessions from Cosmos (sidebar history) */
   getHistory: (userId = 'demo_user', limit = 30) =>
     apiClient.get('/api/bom/history', { params: { user_id: userId, limit } }).then(r => r.data),
   /** Load full conversation transcript from ADLS / Cosmos */
   getTranscript: (sessionId, userId = 'demo_user') =>
     apiClient.get(`/api/bom/history/${sessionId}/transcript`, { params: { user_id: userId } }).then(r => r.data),
-  /**
-   * SSE streaming chat — returns an async generator of parsed SSE frames.
-   * Usage:
-   *   for await (const frame of chatApi.streamMessage(sid, text)) { ... }
-   * Each frame: { token, done, complete?, progress?, bom?, suggestions? }
-   * Aborts with an error if no data arrives within 45 seconds (prevents infinite hang).
-   */
-  streamMessage: async function* (sessionId, message, userId = 'demo_user') {
-    const base = import.meta.env.VITE_API_URL || ''
-    const token = localStorage.getItem('token')
-    const controller = new AbortController()
-    // 45-second hard timeout — resets on each chunk received
-    let timeoutId = setTimeout(() => controller.abort(), 45000)
-    const resetTimeout = () => {
-      clearTimeout(timeoutId)
-      timeoutId = setTimeout(() => controller.abort(), 45000)
-    }
-    try {
-      const resp = await fetch(`${base}/api/bom/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-        body: JSON.stringify({ session_id: sessionId, message, user_id: userId }),
-        signal: controller.signal,
-      })
-      if (!resp.ok) throw new Error(`Stream failed: ${resp.status}`)
-      const reader = resp.body.getReader()
-      const decoder = new TextDecoder()
-      let buf = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        resetTimeout()
-        buf += decoder.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() // keep incomplete line
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try { yield JSON.parse(line.slice(6)) } catch (_) {}
-          }
-        }
-      }
-    } finally {
-      clearTimeout(timeoutId)
-    }
-  },
 }
 
 // ── BOM CRUD API ──────────────────────────────────────────────────────────
@@ -124,9 +105,17 @@ export const bomService = {
   create: (bomData) =>
     apiClient.post('/api/bom', bomData).then(r => r.data),
 
+  /** Delete a BOM permanently */
+  delete: (bomId) =>
+    apiClient.delete(`/api/bom/${bomId}`).then(r => r.data),
+
   /** Update a BOM */
   update: (bomId, data) =>
     apiClient.put(`/api/bom/${bomId}`, data).then(r => r.data),
+
+  /** Permanently delete a BOM */
+  delete: (bomId) =>
+    apiClient.delete(`/api/bom/${bomId}`).then(r => r.data).catch(() => null),  // best-effort
 
   /** Get approval status */
   getApprovals: (bomId) =>

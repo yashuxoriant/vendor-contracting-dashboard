@@ -7,7 +7,6 @@ import VendorPriceSelectorPage from './pages/VendorPriceSelectorPage'
 import QuoteExtractorPage from './pages/QuoteExtractorPage'
 import RFQBuilderPage from './pages/RFQBuilderPage'
 import BOMReviewPage from './pages/BOMReviewPage'
-import EOLManagementPage from './pages/EOLManagementPage'
 function App() {
   return (
     <Layout>
@@ -23,7 +22,6 @@ function App() {
         {/* Sprint 3 — 3-party approval workflow */}
         <Route path="/bom-review/:bomId" element={<BOMReviewPage />} />
         <Route path="/bom-review" element={<BOMReviewPage />} />
-        <Route path="/eol-management" element={<EOLManagementPage />} />
       </Routes>
     </Layout>
   )
