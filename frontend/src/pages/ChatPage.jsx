@@ -509,16 +509,14 @@ const BOM_DOMAINS = [
 // Steps used to compute live progress % in the BOM Preview panel sidebar.
 // Progress = (steps answered / total steps) * 100
 const INTAKE_STEPS = [
-  { key: 'ma_phase',                   label: 'M&A Phase' },
-  { key: 'workstream_category',        label: 'Category' },
-  { key: 'triggering_event',           label: 'Triggering Event' },
-  { key: 'site_entity_scope',          label: 'Sites in Scope' },
-  { key: 'site_classification_type',   label: 'Site Type' },
-  { key: 'site_classification_size',   label: 'Site Size' },
-  { key: 'conveyance_status',          label: 'Conveyance Status' },
-  { key: 'required_by_date',           label: 'Required-By Date' },
-  { key: 'vendor_standard_preferred',  label: 'Preferred Vendor' },
-  { key: 'requestor',                  label: 'Requestor' },
+  { key: 'ma_phase',              label: 'M&A Phase' },
+  { key: 'workstream_category',   label: 'Category' },
+  { key: 'conveyance_status',     label: 'Conveyance Status' },
+  { key: 'site_count',            label: 'Sites in Scope' },
+  { key: 'user_count',            label: 'Users per Site' },
+  { key: 'required_by_date',      label: 'Required-By Date' },
+  { key: 'vendor_standard',       label: 'Preferred Vendor' },
+  { key: 'site_criticality',      label: 'Site Criticality' },
 ]
 
 export default function ChatPage() {
@@ -578,28 +576,50 @@ export default function ChatPage() {
         chatApi.getHistory('demo_user', 50)
           .then(sessions => setChatHistory(filterSessions(sessions)))
           .catch(() => {})
-        // Restore session from sessionStorage so context persists across page refresh
-        const savedSid = sessionStorage.getItem('chat_session_id')
+        // Restore session from localStorage so context persists across page refresh AND tab close
+        const savedSid = localStorage.getItem('chat_session_id') || sessionStorage.getItem('chat_session_id')
         if (savedSid) {
           setSessionId(savedSid)
+          localStorage.setItem('chat_session_id', savedSid)
+
+          // 1. Immediately restore from localStorage cache (fast, survives backend restart)
+          const cached = (() => {
+            try {
+              const raw = localStorage.getItem('chat_conv_' + savedSid)
+              if (!raw) return null
+              return JSON.parse(raw).map((m, i) => ({ id: 'c_' + i, ...m }))
+            } catch (_) { return null }
+          })()
+          if (cached?.length) {
+            setMessages(cached)
+          }
+
+          // 2. Then try backend for fresher data
           chatApi.getTranscript(savedSid, 'demo_user')
             .then(transcript => {
-              const conv = (transcript?.conversation || []).slice(1) // skip welcome msg
+              // Backend returns { messages: [...] } — NOT conversation
+              const conv = (transcript?.messages || []).filter(m => m.role !== 'assistant' || true)
               if (conv.length > 0) {
-                const restored = conv.map((m, i) => ({
+                const fromBackend = conv.map((m, i) => ({
                   id: 'restored_' + i,
-                  role: m.role === 'user' ? 'user' : 'ai',
+                  role: m.role === 'assistant' ? 'ai' : m.role,
                   type: 'text',
                   text: m.content || '',
                 }))
-                setMessages(prev => [
-                  ...prev,
-                  { id: 'restored_divider', role: 'ai', type: 'text', text: '*— Conversation restored —*' },
-                  ...restored,
-                ])
+                // Only override local cache if backend has MORE messages
+                const cacheLen = cached?.length || 0
+                if (fromBackend.length > cacheLen) {
+                  setMessages(fromBackend)
+                }
               }
             })
-            .catch(() => sessionStorage.removeItem('chat_session_id'))
+            .catch(() => {
+              // Backend can't find session (restarted/evicted) — keep localStorage cache, don't wipe the session ID
+              if (!cached?.length) {
+                localStorage.removeItem('chat_session_id')
+                sessionStorage.removeItem('chat_session_id')
+              }
+            })
         }
       }
     })
@@ -675,6 +695,7 @@ export default function ChatPage() {
 
     const sid = sessionItem.session_id
     setSessionId(sid)
+    localStorage.setItem('chat_session_id', sid)
     sessionStorage.setItem('chat_session_id', sid)
 
     setMessages([{ id: 'loading', role: 'ai', type: 'text', text: '_Loading conversation…_' }])
@@ -743,6 +764,7 @@ export default function ChatPage() {
       try {
         const resp = await chatApi.startSession(category, 'New Project', 'demo_user', null, true)
         setSessionId(resp.session_id)
+        localStorage.setItem('chat_session_id', resp.session_id)
         sessionStorage.setItem('chat_session_id', resp.session_id)
       } catch (_) {
         // Session will be created lazily on first message send
@@ -805,6 +827,7 @@ export default function ChatPage() {
           const startResp = await chatApi.startSession(cat, proj, 'demo_user', savedCurrentBOM || null)
           sid = startResp.session_id
           setSessionId(sid)
+          localStorage.setItem('chat_session_id', sid)
           sessionStorage.setItem('chat_session_id', sid)  // persist for page-refresh resume
           // Link this new session to the currently loaded BOM (if any) so clicking
           // the BOM in the sidebar later will restore this conversation.
@@ -830,7 +853,10 @@ export default function ChatPage() {
             setPhaseProgress(finalEvt.progress || 0)
 
             // ── Parse intake fields from streamed text ────────────────────────
-            if (finalEvt.intake_fields) {
+            if (finalEvt.agent_state && Object.keys(finalEvt.agent_state).length) {
+              // Backend sends authoritative agent_state — use it directly
+              setIntakeFields(prev => ({ ...prev, ...finalEvt.agent_state }))
+            } else if (finalEvt.intake_fields) {
               setIntakeFields(prev => ({ ...prev, ...finalEvt.intake_fields }))
             } else {
               const updates = {}
@@ -841,24 +867,22 @@ export default function ChatPage() {
                 const f = field.toLowerCase()
                 const v = value.trim()
                 if (v && v !== 'Value' && v !== '---') {
-                  if (/m.?a phase|^phase$/i.test(f))                         updates.ma_phase = v
-                  if (/workstream|^category$|domain/i.test(f))               updates.workstream_category = v
-                  if (/triggering|^trigger$/i.test(f))                        updates.triggering_event = v
-                  if (/site.*scope|sites in scope|entity scope/i.test(f))    updates.site_entity_scope = v
-                  if (/site.*type|site.*class|site.*breakdown|site mix/i.test(f)) updates.site_classification_type = v
-                  if (/site.*size|small.*medium|medium.*large/i.test(f))     updates.site_classification_size = v
+                  if (/m.?a phase|^phase$/i.test(f))                          updates.ma_phase = v
+                  if (/workstream|^category$|domain/i.test(f))                updates.workstream_category = v
                   if (/conveyance|conveying/i.test(f))                        updates.conveyance_status = v
+                  if (/site.*scope|sites in scope|site count|number of site/i.test(f)) updates.site_count = v
+                  if (/user.*site|user.*count|user per site/i.test(f))        updates.user_count = v
                   if (/required.by|timeline|cutover date/i.test(f))           updates.required_by_date = v
-                  if (/preferred vendor|vendor standard/i.test(f))            updates.vendor_standard_preferred = v
-                  if (/requestor|business owner/i.test(f))                    updates.requestor = v
+                  if (/preferred vendor|vendor standard/i.test(f))            updates.vendor_standard = v
+                  if (/criticality|site.*critical|ha\s*pair/i.test(f))        updates.site_criticality = v
                 }
               })
               // Priority 2: heuristic scan for when no table present
               const txt = streamedText.toLowerCase()
               if (!updates.ma_phase            && /tsa exit|day.?1|full integration|standalone/i.test(txt))         updates.ma_phase = true
               if (!updates.workstream_category  && /sd.?wan|data center|cybersecurity|end user|m365|network equipment/i.test(txt)) updates.workstream_category = true
-              if (!updates.site_entity_scope    && /\d+\s*site|\d+\s*branch|\d+\s*location/i.test(txt))            updates.site_entity_scope = true
-              if (!updates.vendor_standard_preferred && /cisco|meraki|palo alto|fortinet|juniper/i.test(txt))       updates.vendor_standard_preferred = true
+              if (!updates.site_count           && /\d+\s*site|\d+\s*branch|\d+\s*location/i.test(txt))            updates.site_count = true
+              if (!updates.vendor_standard      && /cisco|meraki|palo alto|fortinet|juniper/i.test(txt))            updates.vendor_standard = true
               if (!updates.required_by_date     && /december|january|february|march|q[1-4]\s*20\d\d/i.test(txt))   updates.required_by_date = true
               if (Object.keys(updates).length) setIntakeFields(prev => ({ ...prev, ...updates }))
             }

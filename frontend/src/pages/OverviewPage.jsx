@@ -242,7 +242,7 @@ export default function OverviewPage() {
                 {['monthly', 'quarterly', 'yearly'].map(p => <MenuItem key={p} value={p} sx={{ fontSize: '0.72rem', textTransform: 'capitalize' }}>{p}</MenuItem>)}
               </Select>
             </FormControl>
-            <Tooltip title="Refresh data"><IconButton size="small" onClick={load} disabled={loading} sx={{ color: '#6B7280' }}><Refresh sx={{ fontSize: 16 }} /></IconButton></Tooltip>
+            <Tooltip title="Refresh data"><span><IconButton size="small" onClick={load} disabled={loading} sx={{ color: '#6B7280' }}><Refresh sx={{ fontSize: 16 }} /></IconButton></span></Tooltip>
           </Box>
         </Box>
 

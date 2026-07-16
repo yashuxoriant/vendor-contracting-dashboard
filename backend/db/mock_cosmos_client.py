@@ -1,16 +1,25 @@
 """
 Mock/Dummy Cosmos DB Client
-In-memory storage for local development without Azure
+In-memory storage for local development without Azure.
+Sessions are persisted to a local JSON file so they survive backend restarts.
 """
 
 from typing import Dict, List, Optional, Any
 import logging
 from datetime import datetime
 import uuid
+import json
+import os
+import threading
 
 from db.schemas import BOM, ChatSession, Pattern, Template, User, AnalyticsMetric
 
 logger = logging.getLogger(__name__)
+
+# Sessions are written to this file so they survive backend restarts.
+_SESSIONS_FILE = os.path.join(
+    os.path.dirname(__file__), "..", "local_storage", "mock_sessions.json"
+)
 
 
 class MockCosmosDBClient:
@@ -27,12 +36,37 @@ class MockCosmosDBClient:
             "users": {},
             "audit": {},
         }
+        self._session_lock = threading.Lock()
         logger.info("Initialized MockCosmosDBClient (in-memory storage)")
         self._seed_sample_data()
-    
-    def connect(self):
-        """Mock connect - always succeeds"""
-        logger.info("Mock Cosmos DB connected (no-op)")
+        self._load_sessions_from_disk()
+
+    def _load_sessions_from_disk(self):
+        """Load previously persisted sessions from disk (best-effort)."""
+        try:
+            path = os.path.abspath(_SESSIONS_FILE)
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                # Merge: disk sessions do NOT overwrite seed data
+                for sid, sdata in saved.items():
+                    if sid not in self.collections["sessions"]:
+                        self.collections["sessions"][sid] = sdata
+                logger.info("Loaded %d sessions from disk (%s)", len(saved), path)
+        except Exception as exc:
+            logger.warning("Could not load sessions from disk (non-fatal): %s", exc)
+
+    def _save_sessions_to_disk(self):
+        """Persist sessions to disk so they survive backend restarts (best-effort)."""
+        try:
+            path = os.path.abspath(_SESSIONS_FILE)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with self._session_lock:
+                data = {k: v for k, v in self.collections["sessions"].items()}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, default=str, ensure_ascii=False)
+        except Exception as exc:
+            logger.debug("Session disk-save skipped (non-fatal): %s", exc)
     
     def create_containers_if_not_exist(self):
         """Mock container creation - already exists in memory"""
@@ -265,16 +299,20 @@ class MockCosmosDBClient:
 
     # Session-specific operations (dict-based API used by REST layer)
     def create_session(self, session_data: dict) -> dict:
-        """Create session in mock storage"""
-        return self.create_item("sessions", session_data)
+        """Create session in mock storage and persist to disk."""
+        result = self.create_item("sessions", session_data)
+        self._save_sessions_to_disk()
+        return result
 
     def get_session(self, session_id: str) -> Optional[dict]:
         """Get session from mock storage"""
         return self.read_item("sessions", session_id, session_id)
 
     def update_session(self, session_id: str, session_data: dict) -> dict:
-        """Update session in mock storage"""
-        return self.update_item("sessions", session_id, session_data)
+        """Update session in mock storage and persist to disk."""
+        result = self.update_item("sessions", session_id, session_data)
+        self._save_sessions_to_disk()
+        return result
 
     def list_sessions(self, user_id: str = None, limit: int = 50) -> list:
         """List sessions ordered by updated_at desc, optionally filtered by user_id"""
