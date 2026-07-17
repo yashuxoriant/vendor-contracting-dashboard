@@ -25,14 +25,19 @@ INDEX_NAME = "bom-embeddings"
 
 @dataclass
 class BOMChunkDocument:
-    id: str                    # unique chunk ID (base64-url of bom_id+chunk_index)
-    bom_id: str
+    id: str                      # deterministic chunk ID: sha256(sp_file_id::content_hash::chunk_index)
+    bom_id: str                  # SharePoint Graph item ID (stable across renames/moves)
     filename: str
     vendor: str
-    category: str
+    category: str                # top-level SharePoint folder name (e.g. 'SD-WAN', 'Data Center - COLO')
     chunk_index: int
     chunk_text: str
     embedding: List[float]
+    sp_file_id: str = ""         # SharePoint Graph item ID (same as bom_id for SP files)
+    content_hash: str = ""       # SHA-256 of raw file bytes — used for dedup / version tracking
+    sp_etag: str = ""            # SharePoint eTag — persisted for quick-skip on subsequent syncs
+    folder_path: str = ""        # parent folder(s) relative to drive root, e.g. 'SD-WAN'
+    sharepoint_path: str = ""    # full relative path within the drive, e.g. 'SD-WAN/quote.xlsx'
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -97,8 +102,9 @@ def _mock_delete_by_bom(bom_id: str) -> int:
 
 # ── Azure Search index management ─────────────────────────────────────────────
 
-def _chunk_doc_id(bom_id: str, chunk_index: int) -> str:
-    raw = f"{bom_id}::{chunk_index}"
+def _chunk_doc_id(bom_id: str, content_hash: str, chunk_index: int) -> str:
+    """Version-aware chunk ID. Changes when file content changes, preventing stale duplicates."""
+    raw = f"{bom_id}::{content_hash[:16]}::{chunk_index}"
     return hashlib.sha256(raw.encode()).hexdigest()[:40]
 
 
@@ -152,12 +158,18 @@ def ensure_index() -> bool:
         )
 
         fields = [
-            SimpleField(name="id",          type=SearchFieldDataType.String, key=True),
-            SimpleField(name="bom_id",      type=SearchFieldDataType.String, filterable=True),
-            SimpleField(name="filename",    type=SearchFieldDataType.String, filterable=True),
-            SimpleField(name="vendor",      type=SearchFieldDataType.String, filterable=True),
-            SimpleField(name="category",    type=SearchFieldDataType.String, filterable=True),
-            SimpleField(name="chunk_index", type=SearchFieldDataType.Int32),
+            SimpleField(name="id",              type=SearchFieldDataType.String, key=True),
+            SimpleField(name="bom_id",          type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="filename",        type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="vendor",          type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="category",        type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="chunk_index",     type=SearchFieldDataType.Int32),
+            # Version-tracking & provenance fields — enable idempotent upserts, dedup, and RAG source attribution
+            SimpleField(name="sp_file_id",      type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="content_hash",    type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="sp_etag",         type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="folder_path",     type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="sharepoint_path", type=SearchFieldDataType.String, filterable=True),
             SearchableField(name="chunk_text", type=SearchFieldDataType.String),
             SearchField(
                 name="embedding",
@@ -200,6 +212,35 @@ def ensure_index() -> bool:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
+def get_bom_indexed_state(bom_id: str) -> Optional[Dict[str, str]]:
+    """
+    Return the stored {content_hash, sp_file_id} for an already-indexed BOM,
+    or None if no chunks exist for this bom_id.
+    Used by the ingest pipeline to skip re-embedding unchanged content.
+    """
+    sc, _ = _get_search_clients()
+    if sc is None:
+        chunks = [d for d in _mock_store if d["bom_id"] == bom_id]
+        if chunks:
+            return {"content_hash": chunks[0].get("content_hash", ""),
+                    "sp_file_id":   chunks[0].get("sp_file_id", "")}
+        return None
+    try:
+        results = list(sc.search(
+            search_text="*",
+            filter=f"bom_id eq '{bom_id}'",
+            select=["content_hash", "sp_file_id"],
+            top=1,
+        ))
+        if results:
+            return {"content_hash": results[0].get("content_hash") or "",
+                    "sp_file_id":   results[0].get("sp_file_id") or ""}
+        return None
+    except Exception as exc:
+        logger.warning("get_bom_indexed_state failed: %s", exc)
+        return None
+
+
 def upsert_chunks(docs: List[BOMChunkDocument]) -> int:
     """
     Upload/merge BOM chunk documents into the search index.
@@ -215,14 +256,19 @@ def upsert_chunks(docs: List[BOMChunkDocument]) -> int:
     try:
         batch = [
             {
-                "id":          doc.id,
-                "bom_id":      doc.bom_id,
-                "filename":    doc.filename,
-                "vendor":      doc.vendor,
-                "category":    doc.category,
-                "chunk_index": doc.chunk_index,
-                "chunk_text":  doc.chunk_text,
-                "embedding":   doc.embedding,
+                "id":               doc.id,
+                "bom_id":           doc.bom_id,
+                "filename":         doc.filename,
+                "vendor":           doc.vendor,
+                "category":         doc.category,
+                "chunk_index":      doc.chunk_index,
+                "chunk_text":       doc.chunk_text,
+                "embedding":        doc.embedding,
+                "sp_file_id":       doc.sp_file_id,
+                "content_hash":     doc.content_hash,
+                "sp_etag":          doc.sp_etag,
+                "folder_path":      doc.folder_path,
+                "sharepoint_path":  doc.sharepoint_path,
                 # NOTE: doc.metadata is NOT spread here — Azure Search index schema
                 # only contains the fields above; extra chunk metadata (e.g. "sheet")
                 # would cause a 400 from the service.

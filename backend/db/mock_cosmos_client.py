@@ -320,7 +320,7 @@ class MockCosmosDBClient:
         if user_id:
             items = [s for s in items if s.get("user_id") == user_id]
         items.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
-        # Return lightweight summary (no full conversation payload)
+        # Return lightweight summary including conversation for message_count + last_message
         return [
             {
                 "session_id": s.get("session_id") or s.get("_id"),
@@ -330,6 +330,8 @@ class MockCosmosDBClient:
                 "updated_at": s.get("updated_at"),
                 "message_count": len(s.get("conversation", [])),
                 "context": s.get("context", {}),
+                # Include conversation for title/last_message derivation in list_chat_history
+                "conversation": s.get("conversation", []),
             }
             for s in items[:limit]
         ]

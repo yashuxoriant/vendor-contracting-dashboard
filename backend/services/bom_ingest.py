@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional
 
 from services.bom_extractor import extract_chunks
 from services.embedding_service import embed_batch
-from services.search_service import BOMChunkDocument, ensure_index, upsert_chunks
+from services.search_service import BOMChunkDocument, delete_bom_chunks, ensure_index, upsert_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +35,9 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _chunk_id(bom_id: str, chunk_index: int) -> str:
-    raw = f"{bom_id}::{chunk_index}"
+def _chunk_id(bom_id: str, content_hash: str, chunk_index: int) -> str:
+    """Version-aware chunk ID: changes when file content changes, preventing stale duplicates."""
+    raw = f"{bom_id}::{content_hash[:16]}::{chunk_index}"
     return hashlib.sha256(raw.encode()).hexdigest()[:40]
 
 
@@ -126,46 +127,84 @@ def ingest_bom(
     filename: str,
     data: bytes,
     vendor: str = "",
-    category: str = "",
+    category: str = "",        # top-level SharePoint folder name (e.g. 'SD-WAN')
+    sp_file_id: str = "",      # SharePoint Graph item ID — stable across renames/moves
+    sp_etag: str = "",         # SharePoint eTag — stored for quick-skip on subsequent syncs
+    folder_path: str = "",     # parent folder(s) relative to drive root, e.g. 'SD-WAN'
+    sharepoint_path: str = "", # full relative path within the drive, e.g. 'SD-WAN/quote.xlsx'
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Full ingest pipeline for a single BOM file.
 
     Args:
-        bom_id:   Unique BOM identifier (matches the Cosmos BOM document id)
-        filename: Original filename (drives format detection)
-        data:     Raw file bytes
-        vendor:   Vendor name (stored as metadata on each chunk)
-        category: BOM category (e.g. 'Data Center', 'SD-WAN')
-        metadata: Optional extra fields stored in status record
+        bom_id:     Unique BOM identifier. For SP-sourced files this MUST be the
+                    SharePoint Graph item ID so it remains stable across renames.
+        filename:   Original filename (drives format detection)
+        data:       Raw file bytes
+        vendor:     Vendor name (stored as metadata on each chunk)
+        category:   BOM category (e.g. 'Data Center', 'SD-WAN')
+        sp_file_id: SharePoint Graph item ID (may equal bom_id for delta-pipeline files)
+        sp_etag:    SharePoint eTag — persisted so subsequent delta runs can skip unchanged files
+        metadata:   Optional extra fields stored in status record
 
     Returns:
         Status dict: {bom_id, status, chunks_total, chunks_upserted, adls_path, ...}
+        status == 'skipped' when content hash is unchanged (idempotent call).
     """
     logger.info("BOMIngest: starting | bom_id=%s filename=%s size=%d bytes",
                 bom_id, filename, len(data))
 
+    # ── Idempotency: compute content hash and skip if unchanged ────────────────────
+    content_hash = hashlib.sha256(data).hexdigest()
+
+    existing = get_ingest_status(bom_id)
+    if (
+        existing
+        and existing.get("status") == "indexed"
+        and existing.get("content_hash") == content_hash
+    ):
+        logger.info(
+            "BOMIngest: skipping unchanged content | bom_id=%s hash=%s...",
+            bom_id, content_hash[:8],
+        )
+        return {
+            "bom_id":       bom_id,
+            "status":       "skipped",
+            "reason":       "content unchanged",
+            "content_hash": content_hash,
+            "filename":     filename,
+        }
+
     _write_status(bom_id, "processing", detail="pipeline started", extra={
-        "filename": filename,
-        "vendor": vendor,
-        "category": category,
+        "filename":        filename,
+        "vendor":          vendor,
+        "category":        category,
+        "sp_file_id":      sp_file_id,
+        "sp_etag":         sp_etag,
+        "folder_path":     folder_path,
+        "sharepoint_path": sharepoint_path,
         **(metadata or {}),
     })
 
     # Step 1 — upload raw to ADLS
     adls_path = _upload_raw_to_adls(data, filename, bom_id)
 
-    # Step 2 — ensure Azure Search index exists
+    # Step 2 — ensure Azure Search index exists (adds sp_file_id/content_hash fields if needed)
     ensure_index()
 
-    # Step 3 — extract text chunks
+    # Step 3 — delete stale chunks if this is a re-ingest (content changed)
+    if existing and existing.get("status") == "indexed":
+        old_count = delete_bom_chunks(bom_id)
+        logger.info("BOMIngest: removed %d stale chunks for bom_id=%s", old_count, bom_id)
+
+    # Step 4 — extract text chunks
     chunks = extract_chunks(data, filename)
     if not chunks:
         _write_status(bom_id, "failed", detail="No extractable content found in file")
         return {"bom_id": bom_id, "status": "failed", "detail": "No extractable content"}
 
-    # Step 4 — embed all chunk texts in batch
+    # Step 5 — embed all chunk texts in batch
     texts = [chunk_text for chunk_text, _ in chunks]
     try:
         embeddings = embed_batch(texts)
@@ -173,11 +212,14 @@ def ingest_bom(
         _write_status(bom_id, "failed", detail=f"Embedding failed: {exc}")
         raise
 
-    # Step 5 — build BOMChunkDocument objects
+    # Step 6 — build BOMChunkDocument objects with version-aware IDs
+    # Chunk ID = sha256(bom_id::content_hash[:16]::chunk_index)
+    # → changes whenever content changes, so old chunks are never silently kept
+    effective_sp_file_id = sp_file_id or bom_id
     docs = []
     for i, ((chunk_text, chunk_meta), embedding) in enumerate(zip(chunks, embeddings)):
         docs.append(BOMChunkDocument(
-            id=_chunk_id(bom_id, i),
+            id=_chunk_id(bom_id, content_hash, i),
             bom_id=bom_id,
             filename=filename,
             vendor=vendor,
@@ -185,27 +227,37 @@ def ingest_bom(
             chunk_index=i,
             chunk_text=chunk_text,
             embedding=embedding,
+            sp_file_id=effective_sp_file_id,
+            content_hash=content_hash,
+            sp_etag=sp_etag,
+            folder_path=folder_path,
+            sharepoint_path=sharepoint_path or filename,
             metadata=chunk_meta,
         ))
 
-    # Step 6 — upsert into search index
+    # Step 7 — upsert into search index
     try:
         upserted = upsert_chunks(docs)
     except Exception as exc:
         _write_status(bom_id, "failed", detail=f"Search upsert failed: {exc}")
         raise
 
-    # Step 7 — update status
+    # Step 8 — update status with content hash for future dedup
     result = {
-        "bom_id":          bom_id,
-        "status":          "indexed",
-        "filename":        filename,
-        "vendor":          vendor,
-        "category":        category,
-        "chunks_total":    len(docs),
-        "chunks_upserted": upserted,
-        "adls_path":       adls_path,
-        "indexed_at":      _now(),
+        "bom_id":           bom_id,
+        "status":           "indexed",
+        "filename":         filename,
+        "vendor":           vendor,
+        "category":         category,
+        "chunks_total":     len(docs),
+        "chunks_upserted":  upserted,
+        "adls_path":        adls_path,
+        "indexed_at":       _now(),
+        "content_hash":     content_hash,
+        "sp_file_id":       effective_sp_file_id,
+        "sp_etag":          sp_etag,
+        "folder_path":      folder_path,
+        "sharepoint_path":  sharepoint_path or filename,
     }
     _write_status(bom_id, "indexed", detail=f"{upserted} chunks indexed", extra=result)
     logger.info("BOMIngest: complete | bom_id=%s chunks=%d/%d", bom_id, upserted, len(docs))
@@ -219,6 +271,10 @@ def ingest_bom_background(
     data: bytes,
     vendor: str = "",
     category: str = "",
+    sp_file_id: str = "",
+    sp_etag: str = "",
+    folder_path: str = "",
+    sharepoint_path: str = "",
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
@@ -232,6 +288,10 @@ def ingest_bom_background(
             data=data,
             vendor=vendor,
             category=category,
+            sp_file_id=sp_file_id,
+            sp_etag=sp_etag,
+            folder_path=folder_path,
+            sharepoint_path=sharepoint_path,
             metadata=metadata,
         )
     except Exception as exc:

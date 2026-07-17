@@ -274,10 +274,6 @@ class CosmosDBClient:
     # Specific Operations for Chat Sessions (dict-based)
     # ========================================================================
 
-    def create_session(self, session_data: dict) -> dict:
-        """Create session — dict in, dict out."""
-        return self.create_item(settings.cosmos_container_sessions, session_data)
-
     def get_session(self, session_id: str) -> Optional[dict]:
         """Get session by ID — cross-partition query (no user_id needed)."""
         try:
@@ -291,13 +287,22 @@ class CosmosDBClient:
             logger.error("get_session(%s) failed: %s", session_id, e)
             return None
 
+    def create_session(self, session_data: dict) -> dict:
+        """Create session — dict in, dict out."""
+        session_data["message_count"] = len(session_data.get("conversation") or [])
+        return self.create_item(settings.cosmos_container_sessions, session_data)
+
     def update_session(self, session_id: str, session_data: dict) -> dict:
         """Update session — dict in, dict out."""
+        session_data["message_count"] = len(session_data.get("conversation") or [])
         return self.update_item(settings.cosmos_container_sessions, session_id, session_data)
 
     def list_sessions(self, user_id: Optional[str] = None, limit: int = 50) -> list:
         """List recent sessions.  Sorted in Python (avoids Cosmos composite index requirement)."""
-        query = "SELECT c.session_id, c.user_id, c.status, c.created_at, c.updated_at, c.context FROM c"
+        query = (
+            "SELECT c.session_id, c.user_id, c.status, c.created_at, c.updated_at, "
+            "c.context, c.message_count FROM c"
+        )
         parameters: list = []
         if user_id:
             query += " WHERE c.user_id = @user_id"
@@ -315,7 +320,7 @@ class CosmosDBClient:
                 "status": s.get("status", "active"),
                 "created_at": s.get("created_at"),
                 "updated_at": s.get("updated_at"),
-                "message_count": len(s.get("conversation") or []),
+                "message_count": s.get("message_count") or 0,
                 "context": s.get("context", {}),
             }
             for s in items[:limit]

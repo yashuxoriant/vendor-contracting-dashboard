@@ -8,7 +8,8 @@ import {
 } from '@mui/material'
 import {
   Send, Add, AutoAwesome, Save, Build, Download,
-  Person, FolderOpen, CloudDone, CloudOff, RateReview, DeleteOutline, Close,
+  Person, FolderOpen, CloudDone, CloudOff, RateReview, DeleteOutline, Close, AttachFile,
+  InsertDriveFile, TableChart, PictureAsPdf, Article,
 } from '@mui/icons-material'
 import { saveBOM, deleteBOM, setCurrentBOM, setActiveBOMForRFQ } from '../store/slices/bomSlice'
 import { pushNotification } from '../store/slices/notificationsSlice'
@@ -550,6 +551,10 @@ export default function ChatPage() {
   // Chat history (from backend — persisted in Cosmos + ADLS)
   const [chatHistory, setChatHistory] = useState([])
 
+  // File attachment state (for chat-with-attachment endpoint)
+  const [attachFile, setAttachFile] = useState(null)
+  const attachFileRef = useRef(null)
+
   // Derive current phase (1-10) from progress percentage
   const currentPhase = phaseProgress > 0 ? Math.max(1, Math.min(10, Math.ceil(phaseProgress / 10))) : 0
   const phaseName = PHASE_NAMES[currentPhase] || ''
@@ -1041,6 +1046,102 @@ export default function ChatPage() {
     }, 600 + Math.random() * 400)
   }, [input, backendMode, sessionId, currentBOM, bomList, ctx, dispatch])
 
+  // ── Chat with file attachment ──────────────────────────────────────────────
+  const handleSendWithAttachment = async (text, file) => {
+    if (!file) { handleSend(text); return }
+    if (sendingRef.current) return
+    sendingRef.current = true
+    setAttachFile(null)
+    const displayText = text?.trim() || `📎 Attached: ${file.name}`
+    addMsg({ role: 'user', type: 'text', text: displayText })
+    setInput('')
+    setIsTyping(true)
+
+    try {
+      let sid = sessionId
+      // Ensure a backend session exists before uploading
+      if (!sid) {
+        const cat  = ctx.category || detectCategory(text || '') || 'Data Center / COLO'
+        const proj = ctx.project  || detectProject(text || '') || 'New Project'
+        const startResp = await chatApi.startSession(cat, proj, 'demo_user', null, false)
+        sid = startResp.session_id
+        setSessionId(sid)
+        localStorage.setItem('chat_session_id', sid)
+        sessionStorage.setItem('chat_session_id', sid)
+      }
+
+      // Use the category the user selected when starting this session
+      // Falls back through: ctx.category (from domain picker / session restore) → 'BOMs'
+      const category = ctx.category || 'BOMs'
+      const fd = new FormData()
+      fd.append('session_id', sid)
+      fd.append('message', text?.trim() || '')
+      fd.append('user_id', 'demo_user')
+      fd.append('category', category)
+      fd.append('file', file)
+
+      const resp = await fetch('/api/bom/chat-with-attachment', { method: 'POST', body: fd })
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}))
+        throw new Error(errData.detail || `Upload failed (${resp.status})`)
+      }
+      const data = await resp.json()
+
+      setIsTyping(false)
+      setPhaseProgress(data.progress || 0)
+
+      // Show SharePoint upload result as a separate info message
+      const att = data.attachment || {}
+      if (att.filename) {
+        const spMsg = att.web_url
+          ? `📎 **${att.filename}** uploaded to SharePoint \`${att.sharepoint_folder}\` — [View file](${att.web_url})`
+          : `📎 **${att.filename}** queued for processing (SharePoint: \`${att.sharepoint_folder}\`)`
+        addMsg({ role: 'ai', type: 'text', text: spMsg })
+      }
+
+      // Show AI response
+      const responseText = data.response || ''
+      if (responseText) {
+        // Check if BOM JSON is embedded
+        let bomSource = data.partial_bom
+        if (!bomSource && responseText) {
+          const m = responseText.match(/```json\s*([\s\S]*?)```/)
+          if (m) { try { bomSource = JSON.parse(m[1].trim()) } catch (_) {} }
+        }
+        if (bomSource) {
+          const proj = ctx.project || detectProject(text || '') || 'New Project'
+          const aiBOM = backendBOMtoFrontend(bomSource, proj)
+          if (aiBOM) {
+            aiBOM.creatingSessionId = sid
+            saveBOMSession(aiBOM.id, sid)
+            setLocalBOM(aiBOM)
+            dispatch(setCurrentBOM(aiBOM))
+            dispatch(saveBOM(aiBOM))
+            bomApi?.create?.(aiBOM).catch(() => {})
+            const cats = [...new Set(aiBOM.lineItems.map(li => li.category))]
+            addMsg({
+              role: 'ai', type: 'bom_created', bom: aiBOM, actions: ['library', 'rfq'],
+              text: `✅ Created **${aiBOM.name}**\n\n**${aiBOM.lineItems.length} line items** | Total: **${fmt(aiBOM.totalValue)}**\nCategories: ${cats.join(' · ')}`,
+            })
+          } else {
+            addMsg({ role: 'ai', type: 'text', text: responseText })
+          }
+        } else {
+          addMsg({ role: 'ai', type: 'text', text: responseText })
+        }
+      }
+
+      // Persist conversation cache
+      setMessages(prev => { saveConvCache(sid, prev); return prev })
+      backendFailCount.current = 0
+    } catch (err) {
+      setIsTyping(false)
+      addMsg({ role: 'ai', type: 'text', text: `⚠️ Attachment error: ${err.message}` })
+    } finally {
+      sendingRef.current = false
+    }
+  }
+
   const handleOption = (action) => {
     if (action.startsWith('project:')) {
       const project = action.replace('project:', '')
@@ -1442,21 +1543,101 @@ export default function ChatPage() {
               ))}
             </Box>
           )}
+          {/* Attached file — Claude-style compact card */}
+          {attachFile && (() => {
+            const ext = attachFile.name.split('.').pop().toLowerCase()
+            const iconMap = {
+              xlsx: { Icon: TableChart,      bg: '#DCFCE7', color: '#16A34A' },
+              xls:  { Icon: TableChart,      bg: '#DCFCE7', color: '#16A34A' },
+              csv:  { Icon: TableChart,      bg: '#DCFCE7', color: '#16A34A' },
+              pdf:  { Icon: PictureAsPdf,    bg: '#FEE2E2', color: '#DC2626' },
+              doc:  { Icon: Article,         bg: '#DBEAFE', color: '#2563EB' },
+              docx: { Icon: Article,         bg: '#DBEAFE', color: '#2563EB' },
+              txt:  { Icon: InsertDriveFile, bg: '#F3F4F6', color: '#6B7280' },
+            }
+            const { Icon, bg, color } = iconMap[ext] || { Icon: InsertDriveFile, bg: '#F3F4F6', color: '#6B7280' }
+            const sizeKB = (attachFile.size / 1024).toFixed(0)
+            const dest = ctx.category || 'BOMs'
+            return (
+              <Box sx={{ mb: 1 }}>
+                <Box sx={{
+                  display: 'inline-flex', alignItems: 'center', gap: 1,
+                  px: 1.25, py: 0.75, maxWidth: 360,
+                  bgcolor: '#FAFAFA', border: '1px solid #E5E7EB',
+                  borderRadius: '12px', position: 'relative',
+                }}>
+                  {/* File type icon badge */}
+                  <Box sx={{ width: 34, height: 34, borderRadius: '8px', bgcolor: bg,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <Icon sx={{ fontSize: 18, color }} />
+                  </Box>
+                  {/* File info */}
+                  <Box sx={{ flex: 1, minWidth: 0 }}>
+                    <Typography sx={{ fontSize: '0.78rem', fontWeight: 600, color: '#111827',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {attachFile.name}
+                    </Typography>
+                    <Typography sx={{ fontSize: '0.63rem', color: '#9CA3AF', mt: 0.1 }}>
+                      {sizeKB} KB &nbsp;·&nbsp; uploads to <strong style={{ color: '#6B7280' }}>{dest}</strong>
+                    </Typography>
+                  </Box>
+                  {/* Remove */}
+                  <IconButton size="small" onClick={() => setAttachFile(null)}
+                    sx={{ width: 18, height: 18, flexShrink: 0, color: '#9CA3AF',
+                      '&:hover': { color: '#374151', bgcolor: '#F3F4F6' } }}>
+                    <Close sx={{ fontSize: 12 }} />
+                  </IconButton>
+                </Box>
+              </Box>
+            )
+          })()}
           <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-end' }}>
+            {/* Hidden file input */}
+            <input
+              ref={attachFileRef}
+              type="file"
+              hidden
+              accept=".xlsx,.xls,.csv,.pdf,.doc,.docx,.txt"
+              onChange={e => { if (e.target.files[0]) setAttachFile(e.target.files[0]); e.target.value = '' }}
+            />
+            {/* Attach file button */}
+            <Tooltip title="Attach file (PDF, Excel, Word, CSV) — uploaded to SharePoint">
+              <IconButton
+                onClick={() => attachFileRef.current?.click()}
+                size="small"
+                disabled={isTyping}
+                sx={{
+                  width: 36, height: 36, flexShrink: 0, borderRadius: '8px',
+                  border: '1px solid', transition: 'all 0.15s',
+                  borderColor: attachFile ? '#D04A02' : '#E5E7EB',
+                  color: attachFile ? '#D04A02' : '#9CA3AF',
+                  '&:hover': { borderColor: '#D04A02', color: '#D04A02', bgcolor: '#FDF3ED' },
+                }}>
+                <AttachFile sx={{ fontSize: 17 }} />
+              </IconButton>
+            </Tooltip>
             <TextField
               multiline maxRows={4} fullWidth
-              placeholder="Ask me to create, update, or analyze a BOM..."
+              placeholder={attachFile ? 'Add a message (optional) and press Enter to send…' : 'Ask me to create, update, or analyze a BOM…'}
               value={input} onChange={e => setInput(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !sendingRef.current) { e.preventDefault(); handleSend() } }}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey && !sendingRef.current) {
+                  e.preventDefault()
+                  if (attachFile) handleSendWithAttachment(input, attachFile)
+                  else handleSend()
+                }
+              }}
               sx={{ bgcolor: '#F9FAFB', '& .MuiInputBase-input': { fontSize: '0.8rem', py: '8px' }, '& .MuiOutlinedInput-root': { '& fieldset': { borderColor: '#E5E7EB' }, '&:hover fieldset': { borderColor: '#D04A02' }, '&.Mui-focused fieldset': { borderColor: '#D04A02' } } }}
             />
-            <IconButton onClick={() => handleSend()} disabled={!input.trim() || isTyping}
+            <IconButton
+              onClick={() => attachFile ? handleSendWithAttachment(input, attachFile) : handleSend()}
+              disabled={(!input.trim() && !attachFile) || isTyping}
               sx={{ width: 40, height: 40, bgcolor: '#D04A02', color: 'white', borderRadius: '8px', flexShrink: 0, '&:hover': { bgcolor: '#A33A00' }, '&.Mui-disabled': { bgcolor: '#F3F4F6', color: '#9CA3AF' } }}>
               <Send sx={{ fontSize: 18 }} />
             </IconButton>
           </Box>
           <Typography sx={{ fontSize: '0.58rem', color: '#9CA3AF', mt: 0.5, textAlign: 'center' }}>
-            Press Enter to send | Shift+Enter for new line
+            Enter to send · Shift+Enter for new line · Clip icon to attach a file
           </Typography>
         </Box>
       </Box>

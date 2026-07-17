@@ -81,6 +81,7 @@ async def ingest_bom_upload(
                 data=data,
                 vendor=vendor,
                 category=category,
+                # No sp_file_id/sp_etag for direct uploads — content hash dedup still applies
             )
             return result
         except Exception as exc:
@@ -155,6 +156,8 @@ async def reingest_bom(
         data=data,
         vendor=vendor,
         category=category,
+        sp_file_id=doc.get("sp_file_id", ""),
+        # Don't pass sp_etag so ingest_bom does a fresh content-hash check
     )
     return {
         "bom_id": bom_id,

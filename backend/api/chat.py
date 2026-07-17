@@ -771,24 +771,34 @@ async def send_message_with_attachment(
         bom_id = str(_uuid.uuid4())
         filename = file.filename or "attachment"
 
-        # ── 1. Upload to SharePoint (category as folder name) ──────────────
+        # ── 1. Upload to SharePoint (nested inside drive_path/category) ─────────
         try:
             from db.sharepoint_client import get_sharepoint_client
             sp = get_sharepoint_client()
-            folder_path = category.strip() or "BOMs"
+            # Use the category from the form; fall back to the session's stored category
+            effective_category = category.strip() or session.context.category or "BOMs"
+            drive_root = sp.drive_path if sp is not None else "PWC_Vendor_Contracting_Hub"
+            # Always nest inside drive root: Shared Documents/<drive_root>/<category>/file
+            folder_path = f"{drive_root}/{effective_category}"
             if sp is not None:
                 sp_result = sp.upload_file(content, filename, folder_path=folder_path)
                 attachment_info["web_url"] = sp_result.get("web_url", "")
                 attachment_info["sharepoint_folder"] = folder_path
+                # Capture the SP Graph item ID for stable bom_id tracking
+                sp_file_id = sp_result.get("id") or ""
+                if sp_file_id:
+                    attachment_info["sp_file_id"] = sp_file_id
                 logger.info("Chat attachment uploaded to SharePoint folder='%s' file='%s'", folder_path, filename)
             else:
                 logger.info("SharePoint mock — attachment '%s' not actually uploaded", filename)
                 attachment_info["web_url"] = ""
                 attachment_info["sharepoint_folder"] = folder_path
+                sp_file_id = ""
         except Exception as exc:
             logger.warning("SharePoint upload for chat attachment failed (non-fatal): %s", exc)
             attachment_info["web_url"] = ""
             attachment_info["sharepoint_folder"] = category
+            sp_file_id = ""
 
         attachment_info.update({
             "bom_id": bom_id,
@@ -806,7 +816,10 @@ async def send_message_with_attachment(
                 filename=filename,
                 data=content,
                 vendor="",
-                category=category,
+                category=effective_category,
+                sp_file_id=sp_file_id,
+                folder_path=folder_path,
+                sharepoint_path=f"{folder_path}/{filename}",
                 metadata={"source": "chat_attachment", "session_id": session_id},
             )
         except Exception as exc:
@@ -997,7 +1010,7 @@ async def list_chat_history(user_id: str = "demo_user", limit: int = 30):
             status=s.get("status", "active"),
             created_at=s.get("created_at"),
             updated_at=s.get("updated_at"),
-            message_count=s.get("message_count", 0),
+            message_count=s.get("message_count") or len(conversation),
             category=category_label,
             project=project,
             progress=int(ctx.get("progress_percentage", 0)),
@@ -1211,8 +1224,11 @@ async def _process_message(session: ChatSession, message: str) -> tuple:
         orch = BOMOrchestrator()
         session_dict = session.model_dump(mode="json")
         response_text, partial_bom, progress, complete = orch.process(session_dict, message)
-        # Sync phase back to session context
-        session.context.current_phase = session_dict.get("context", {}).get("current_phase", 1)
+        # Sync ALL context fields back to session so the stored session is complete
+        updated_ctx = session_dict.get("context", {})
+        session.context.current_phase = updated_ctx.get("current_phase", 1)
+        session.context.current_phase_name = updated_ctx.get("current_phase_name", "intake")
+        session.context.agent_state = updated_ctx.get("agent_state", {})
         return response_text, partial_bom, progress, complete
     except Exception as e:
         logger.warning("Orchestrator error: %s — falling back", e)

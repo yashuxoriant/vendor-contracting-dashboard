@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 
 # BOM ingest pipeline — imported lazily so SharePoint still works without search deps
 def _trigger_ingest(background_tasks: BackgroundTasks, bom_id: str, filename: str,
-                    data: bytes, vendor: str, category: str) -> None:
+                    data: bytes, vendor: str, category: str,
+                    sp_file_id: str = "", sp_etag: str = "",
+                    folder_path: str = "", sharepoint_path: str = "") -> None:
     try:
         from services.bom_ingest import ingest_bom_background
         background_tasks.add_task(
@@ -26,9 +28,14 @@ def _trigger_ingest(background_tasks: BackgroundTasks, bom_id: str, filename: st
             data=data,
             vendor=vendor,
             category=category,
+            sp_file_id=sp_file_id,
+            sp_etag=sp_etag,
+            folder_path=folder_path,
+            sharepoint_path=sharepoint_path,
             metadata={"source": "sharepoint_upload"},
         )
-        logger.info("BOM ingest pipeline queued | bom_id=%s filename=%s", bom_id, filename)
+        logger.info("BOM ingest pipeline queued | bom_id=%s sp_file_id=%s filename=%s",
+                    bom_id, sp_file_id or "(none)", filename)
     except Exception as exc:
         logger.warning("Could not queue ingest pipeline: %s", exc)
 
@@ -73,28 +80,40 @@ async def upload_to_sharepoint(
     effective_bom_id = bom_id or str(uuid.uuid4())
 
     sp = get_sharepoint_client()
+    # Resolve the effective folder: always nest category inside the configured drive root
+    # Result path: Shared Documents/<drive_path>/<category>/filename
+    drive_root = sp.drive_path if sp else "PWC_Vendor_Contracting_Hub"
+    if folder and folder not in ("BOMs", ""):
+        effective_folder = f"{drive_root}/{folder.strip('/')}"
+    else:
+        effective_folder = drive_root
+
     if sp is None:
         # Graceful mock response when SharePoint is disabled
-        logger.info("SharePoint mock: would upload '%s' to folder '%s'", file.filename, folder)
+        logger.info("SharePoint mock: would upload '%s' to folder '%s'", file.filename, effective_folder)
         _trigger_ingest(background_tasks, effective_bom_id, file.filename or "bom.xlsx",
-                        content, vendor, category)
+                        content, vendor, category,
+                        folder_path=effective_folder,
+                        sharepoint_path=f"{effective_folder}/{file.filename}")
         return {
             "success": True,
             "mock": True,
             "bom_id": effective_bom_id,
             "filename": file.filename,
-            "folder": folder,
-            "web_url": f"https://xoriant.sharepoint.com/sites/PWC_Project_Planning_Hub/Shared%20Documents/PWC_Vendor_Contracting_Hub/{file.filename}",
+            "folder": effective_folder,
+            "web_url": f"https://xoriant.sharepoint.com/sites/PWC_Project_Planning_Hub/Shared%20Documents/{effective_folder}/{file.filename}",
             "message": "SharePoint is in demo mode — file was not actually uploaded. Embedding pipeline started.",
             "ingest_status_url": f"/api/ingest/status/{effective_bom_id}",
         }
 
-    # Use the configured drive_path as folder if caller passed generic default
-    effective_folder = folder if folder != "BOMs" else sp.drive_path
     try:
         result = sp.upload_file(content, file.filename, folder_path=effective_folder)
+        sp_file_id = result.get("id") or ""
         _trigger_ingest(background_tasks, effective_bom_id, file.filename or "bom.xlsx",
-                        content, vendor, category)
+                        content, vendor, category,
+                        sp_file_id=sp_file_id,
+                        folder_path=effective_folder,
+                        sharepoint_path=f"{effective_folder}/{file.filename}")
         return {
             "success": True,
             "mock": False,

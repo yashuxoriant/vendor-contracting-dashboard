@@ -115,7 +115,7 @@ def run_bom_delta_pipeline(force_full_sync: bool = False) -> Dict[str, Any]:
         resolve_folder_item_id,
         save_delta_state,
     )
-    from services.bom_ingest import ingest_bom
+    from services.bom_ingest import get_ingest_status, ingest_bom
     from services.search_service import delete_bom_chunks
     import hashlib
 
@@ -157,46 +157,75 @@ def run_bom_delta_pipeline(force_full_sync: bool = False) -> Dict[str, Any]:
 
         # Step 5: handle deletions
         for item in deleted_items:
-            rel_path = item_rel_path(item, folder_key) or item.get("id", "unknown")
-            # Use stable bom_id derived from path
-            bom_id = hashlib.sha256(rel_path.encode()).hexdigest()[:32]
+            # Use the SharePoint Graph item ID directly — it's stable and
+            # was used as bom_id when the file was originally ingested.
+            sp_file_id = item.get("id", "")
+            bom_id = sp_file_id
+            if not bom_id:
+                logger.warning("BOMDeltaPipeline: deleted item has no id, skipping")
+                summary["skipped"] += 1
+                continue
             try:
                 count = delete_bom_chunks(bom_id)
-                logger.info("BOMDeltaPipeline: deleted %d chunks | path=%s", count, rel_path)
+                logger.info("BOMDeltaPipeline: deleted %d chunks | sp_file_id=%s", count, sp_file_id)
                 summary["deleted"] += 1
             except Exception as exc:
-                summary["errors"].append(f"delete:{rel_path}:{exc}")
+                summary["errors"].append(f"delete:{sp_file_id}:{exc}")
                 summary["failed"] += 1
 
         # Step 6: handle additions / modifications
         for item in added_modified:
-            rel_path = item_rel_path(item, folder_key) or item.get("name", "unknown")
-            item_id  = item.get("id", "")
-            filename = item.get("name", "file")
-            file_size = item.get("size") or 0
+            # Stable identity: SharePoint Graph item ID (survives renames and moves)
+            sp_file_id = item.get("id", "")
+            sp_etag    = (item.get("eTag") or "").strip('"')  # strip surrounding quotes from Graph
+            filename   = item.get("name", "file")
+            file_size  = item.get("size") or 0
+            rel_path   = item_rel_path(item, folder_key) or filename
+
+            # bom_id = SP Graph item ID (stable, unique, survives renames)
+            # Fall back to path hash only if Graph didn't return an ID (shouldn't happen)
+            bom_id = sp_file_id if sp_file_id else hashlib.sha256(rel_path.encode()).hexdigest()[:32]
 
             if file_size > 100 * 1024 * 1024:
                 logger.warning("BOMDeltaPipeline: skipping oversized file %s (%d bytes)", rel_path, file_size)
                 summary["skipped"] += 1
                 continue
 
-            # Derive a stable bom_id from the file path (consistent across re-syncs)
-            bom_id = hashlib.sha256(rel_path.encode()).hexdigest()[:32]
+            # ── Quick-skip: compare eTag before downloading ────────────────────────
+            # The Graph delta API only returns items that changed SINCE the last delta
+            # token — so this check is mainly useful during force_full_sync where all
+            # items are returned regardless of change.
+            if sp_etag:
+                existing_status = get_ingest_status(bom_id)
+                if (
+                    existing_status
+                    and existing_status.get("status") == "indexed"
+                    and existing_status.get("sp_etag") == sp_etag
+                ):
+                    logger.info(
+                        "BOMDeltaPipeline: eTag unchanged — skipping download | path=%s", rel_path
+                    )
+                    summary["skipped"] += 1
+                    continue
 
-            # Download from SharePoint
+            # ── Download from SharePoint ─────────────────────────────────
             try:
-                content = download_item_content(token, drive_id, item_id)
+                content = download_item_content(token, drive_id, sp_file_id or bom_id)
             except Exception as exc:
                 logger.error("BOMDeltaPipeline: download failed | %s | %s", rel_path, exc)
                 summary["errors"].append(f"download:{rel_path}:{exc}")
                 summary["failed"] += 1
                 continue
 
-            # Infer vendor/category from folder structure
-            # Convention: BOMs/{Vendor}/{Category}/{filename}
+            # Derive category, vendor, and path metadata from folder structure.
+            # SharePoint layout: PWC_Vendor_Contracting_Hub/{Category}/{filename}
+            #                 or PWC_Vendor_Contracting_Hub/{Category}/{Vendor}/{filename}
+            # The first subfolder is always the category (e.g. 'SD-WAN', 'Data Center - COLO').
+            # If a second subfolder exists it is treated as the vendor.
             parts = rel_path.split("/")
-            vendor   = parts[0] if len(parts) > 1 else ""
-            category = parts[1] if len(parts) > 2 else ""
+            category    = parts[0] if len(parts) >= 1 else ""
+            vendor      = parts[1] if len(parts) > 2 else ""   # optional vendor sub-folder
+            folder_path = "/".join(parts[:-1])                  # directory without filename
 
             try:
                 result = ingest_bom(
@@ -205,13 +234,21 @@ def run_bom_delta_pipeline(force_full_sync: bool = False) -> Dict[str, Any]:
                     data=content,
                     vendor=vendor,
                     category=category,
-                    metadata={"sharepoint_path": rel_path, "source": "delta_pipeline"},
+                    sp_file_id=sp_file_id,
+                    sp_etag=sp_etag,
+                    folder_path=folder_path,
+                    sharepoint_path=rel_path,
+                    metadata={"source": "delta_pipeline"},
                 )
-                logger.info(
-                    "BOMDeltaPipeline: ingested %s | chunks=%s",
-                    rel_path, result.get("chunks_upserted", "?"),
-                )
-                summary["processed"] += 1
+                if result.get("status") == "skipped":
+                    logger.info("BOMDeltaPipeline: content hash unchanged — skipped | path=%s", rel_path)
+                    summary["skipped"] += 1
+                else:
+                    logger.info(
+                        "BOMDeltaPipeline: ingested %s | chunks=%s",
+                        rel_path, result.get("chunks_upserted", "?"),
+                    )
+                    summary["processed"] += 1
             except Exception as exc:
                 logger.error("BOMDeltaPipeline: ingest failed | %s | %s", rel_path, exc)
                 summary["errors"].append(f"ingest:{rel_path}:{exc}")

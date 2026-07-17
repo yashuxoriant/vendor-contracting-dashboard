@@ -9,7 +9,7 @@ import {
 } from '@mui/material'
 import {
   Search, Download, AutoAwesome, Send, Archive, CheckCircle,
-  RateReview, Refresh, CloudUpload, Close, ArrowBack, FilterList,
+  RateReview, Refresh, CloudUpload, Close, ArrowBack, FilterList, Sync,
 } from '@mui/icons-material'
 import { setActiveBOMForRFQ, setCurrentBOM, archiveBOM, saveBOM } from '../store/slices/bomSlice'
 import { bomService } from '../services/api'
@@ -379,6 +379,27 @@ export default function BOMLibraryPage() {
   const [loading, setLoading] = useState(false)
   const [backendError, setBackendError] = useState(null)
 
+  // SharePoint delta sync state
+  const [syncing, setSyncing] = useState(false)
+  const [syncResult, setSyncResult] = useState(null)
+
+  const handleSyncSharePoint = async () => {
+    setSyncing(true)
+    setSyncResult(null)
+    try {
+      const resp = await fetch('/api/ingest/delta?force_full_sync=true', { method: 'POST' })
+      const data = await resp.json()
+      if (!resp.ok) throw new Error(data.detail || 'Sync failed')
+      setSyncResult({ ok: true, msg: 'SharePoint sync started in background. Check back in a minute.' })
+      // Refresh the BOM list after a short delay
+      setTimeout(() => loadFromBackend(), 5000)
+    } catch (err) {
+      setSyncResult({ ok: false, msg: err.message })
+    } finally {
+      setSyncing(false)
+    }
+  }
+
   // SharePoint upload state
   const [spUploadOpen, setSpUploadOpen] = useState(false)
   const [spFile, setSpFile] = useState(null)
@@ -418,13 +439,14 @@ export default function BOMLibraryPage() {
     try {
       const fd = new FormData()
       fd.append('file', spFile)
-      fd.append('folder', 'BOMs')
+      // Use the selected category as the SharePoint folder name (e.g. 'SD-WAN', 'Data Center / COLO')
+      fd.append('folder', spCategory.trim() || 'BOMs')
       if (spVendor) fd.append('vendor', spVendor)
       if (spCategory) fd.append('category', spCategory)
       const resp = await fetch('/api/sharepoint/upload', { method: 'POST', body: fd })
       const data = await resp.json()
       if (!resp.ok) throw new Error(data.detail || 'Upload failed')
-      setSpResult({ ok: true, url: data.web_url, bomId: data.bom_id })
+      setSpResult({ ok: true, url: data.web_url, bomId: data.bom_id, folder: data.folder || spCategory || 'BOMs' })
       if (data.bom_id) pollIngestStatus(data.bom_id)
     } catch (err) {
       setSpResult({ ok: false, msg: err.message })
@@ -496,6 +518,13 @@ export default function BOMLibraryPage() {
           </Box>
         </Box>
         <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+          <Button size="small" startIcon={syncing ? <CircularProgress size={12} sx={{ color: '#fff' }} /> : <Sync sx={{ fontSize: 14 }} />}
+            onClick={handleSyncSharePoint}
+            disabled={syncing}
+            sx={{ bgcolor: '#1D4ED8', color: '#fff', fontWeight: 700, fontSize: '0.75rem',
+              '&:hover': { bgcolor: '#1E40AF' }, borderRadius: 2, px: 2, py: 0.75, textTransform: 'none' }}>
+            {syncing ? 'Syncing...' : 'Sync from SharePoint'}
+          </Button>
           <Button size="small" startIcon={<CloudUpload sx={{ fontSize: 14 }} />}
             onClick={() => setSpUploadOpen(true)}
             sx={{ bgcolor: '#D04A02', color: '#fff', fontWeight: 700, fontSize: '0.75rem',
@@ -509,6 +538,12 @@ export default function BOMLibraryPage() {
       </Box>
 
       {backendError && <Alert severity="warning" sx={{ mb: 2, fontSize: '0.78rem' }}>{backendError}</Alert>}
+      {syncResult && (
+        <Alert severity={syncResult.ok ? 'info' : 'error'} sx={{ mb: 2, fontSize: '0.78rem' }}
+          onClose={() => setSyncResult(null)}>
+          {syncResult.msg}
+        </Alert>
+      )}
 
       {/* Search + Vendor filter strip */}
       <Box sx={{ display: 'flex', gap: 2, mb: 3, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -616,7 +651,9 @@ export default function BOMLibraryPage() {
             </Box>
             {spResult && (
               <Alert severity={spResult.ok ? 'success' : 'error'} sx={{ fontSize: '0.78rem' }}>
-                {spResult.ok ? 'Uploaded successfully. RAG embedding pipeline started.' : spResult.msg}
+                {spResult.ok
+                  ? <>Uploaded to <strong>SharePoint/PWC_Vendor_Contracting_Hub/{spResult.folder}</strong>. RAG embedding pipeline started.{spResult.url && <> <a href={spResult.url} target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>View file ↗</a></>}</>
+                  : spResult.msg}
               </Alert>
             )}
             {ingestStatus && (
