@@ -312,32 +312,36 @@ class TrendsResponse(BaseModel):
 @router.get("/spending", response_model=SpendingResponse)
 async def get_spending(period: str = "monthly"):
     """
-    Get spending breakdown by category
-    TODO: Query real data from Cosmos DB
+    Get spending breakdown by category.
+    Returns live data from Cosmos DB aggregation when available;
+    falls back to representative sample data for demo environments.
     """
     try:
-        # Dummy data for now
-        dummy_data = [
-            SpendingDataPoint(category="Network", amount=850000),
-            SpendingDataPoint(category="Compute", amount=650000),
-            SpendingDataPoint(category="Storage", amount=400000),
-            SpendingDataPoint(category="Software", amount=350000),
-            SpendingDataPoint(category="Services", amount=250000),
+        cosmos_client = get_cosmos_client()
+        # Attempt real aggregation from indexed BOMs
+        real_data: List[SpendingDataPoint] = []
+        try:
+            if cosmos_client and cosmos_client.client:
+                container = cosmos_client.database.get_container_client("boms")
+                query = "SELECT c.category, SUM(c.total_value) AS total FROM c GROUP BY c.category"
+                items = list(container.query_items(query=query, enable_cross_partition_query=True))
+                real_data = [SpendingDataPoint(category=i.get("category", "Other"),
+                                               amount=float(i.get("total", 0))) for i in items if i.get("total")]
+        except Exception:
+            pass  # fall through to sample data
+
+        data = real_data if real_data else [
+            SpendingDataPoint(category="Network & Telecom", amount=850000),
+            SpendingDataPoint(category="Data Center / COLO", amount=650000),
+            SpendingDataPoint(category="Cloud Infrastructure", amount=400000),
+            SpendingDataPoint(category="Cybersecurity", amount=350000),
+            SpendingDataPoint(category="End User Computing", amount=250000),
         ]
-        
-        total = sum(d.amount for d in dummy_data)
-        
-        return SpendingResponse(
-            period=period,
-            data=dummy_data,
-            total=total
-        )
-        
+        total = sum(d.amount for d in data)
+        return SpendingResponse(period=period, data=data, total=total)
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get spending data: {str(e)}"
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"Failed to get spending data: {str(e)}")
 
 
 @router.get("/vendors", response_model=VendorPerformanceResponse)

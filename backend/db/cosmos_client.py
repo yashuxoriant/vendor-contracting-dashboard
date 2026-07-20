@@ -341,10 +341,14 @@ class CosmosDBClient:
 
 # Global Cosmos DB client instance
 cosmos_client = CosmosDBClient()
+_cosmos_init_lock = __import__("threading").Lock()
 
 
 def get_cosmos_client() -> CosmosDBClient:
-    """Get Cosmos DB client instance"""
+    """Get Cosmos DB client instance (thread-safe singleton initialisation)."""
     if not cosmos_client.client:
-        cosmos_client.connect()
+        with _cosmos_init_lock:
+            # Re-check inside the lock to prevent double-init
+            if not cosmos_client.client:
+                cosmos_client.connect()
     return cosmos_client

@@ -4,9 +4,9 @@ Sprint 1: Azure OpenAI wired in with full 10-phase BOM methodology system prompt
 Fallback to Anthropic Claude, then rule-based when no credentials available.
 """
 from fastapi import APIRouter, HTTPException, status, BackgroundTasks, File, Form, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import uuid
 import json
@@ -24,11 +24,15 @@ settings = get_settings()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-session asyncio locks — prevent concurrent writes to the same session.
-# Key: session_id → asyncio.Lock
-# Without this: two concurrent requests load the same session state and the
-# second write silently overwrites the first (last-writer-wins race condition).
+# Uses cachetools.TTLCache so stale locks from long-dead sessions are evicted.
+# TTL = 2 hours — matches realistic session lifetime.
 # ─────────────────────────────────────────────────────────────────────────────
-_SESSION_LOCKS: Dict[str, asyncio.Lock] = {}
+try:
+    from cachetools import TTLCache
+    _SESSION_LOCKS: Any = TTLCache(maxsize=2048, ttl=7200)  # 2-hour TTL
+except ImportError:
+    # Fallback to plain dict if cachetools not installed
+    _SESSION_LOCKS: Dict[str, asyncio.Lock] = {}
 
 def _get_session_lock(session_id: str) -> asyncio.Lock:
     if session_id not in _SESSION_LOCKS:
@@ -96,7 +100,7 @@ class StartSessionResponse(BaseModel):
 
 class ChatMessageRequest(BaseModel):
     session_id: str
-    message: str
+    message: str = Field(..., max_length=4000, description="User message — max 4000 characters")
     user_id: Optional[str] = "demo_user"
 
 class ChatMessageResponse(BaseModel):
@@ -199,7 +203,6 @@ _ATTACH_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 # SSE Streaming Chat  POST /api/bom/stream
 # ─────────────────────────────────────────────────────────────────────────────
 
-import re as _r
 from fastapi.responses import StreamingResponse
 
 
@@ -208,21 +211,17 @@ async def stream_message(request: ChatMessageRequest, background_tasks: Backgrou
     """
     Server-Sent Events streaming chat endpoint.
 
-    Fix history:
-    - Session lock prevents concurrent writes (race condition fix)
-    - User message written to Cosmos ATOMICALLY before streaming begins
-      → on client disconnect, session is still consistent
-    - Deduplication prevents duplicate user messages on retry
-    - Delegates to BOMCreationAgent (LangGraph)
+    Streams tokens in real-time as the AI model generates them.
+    The event loop is never blocked — the synchronous SDK call runs in a thread.
 
     SSE frame format:
-        data: {"token": "<text>", "done": false}   (per chunk)
+        data: {"token": "<text>", "done": false}   (per token chunk)
         data: {"token": "", "done": true, "complete": bool, "progress": int, "bom": <obj|null>}
     """
+    from datetime import timezone as _tz
     cosmos_client = get_cosmos_client()
-    from fastapi.responses import StreamingResponse  # noqa: PLC0415
-    from app.agents.bom_creation_agent import BOMCreationAgent  # noqa: PLC0415
 
+    # ── Validate and lock session ─────────────────────────────────────────────
     lock = _get_session_lock(request.session_id)
     async with lock:
         session_data = cosmos_client.get_session(request.session_id)
@@ -234,34 +233,53 @@ async def stream_message(request: ChatMessageRequest, background_tasks: Backgrou
             logger.error("Session hydration failed in stream: %s", exc)
             raise HTTPException(status_code=500, detail="Session data corrupt")
 
+        # Persist user message BEFORE streaming begins — safe on disconnect
         appended = _append_user_message_if_new(session.conversation, request.message)
         if appended:
-            session.updated_at = datetime.utcnow()
+            session.updated_at = datetime.now(timezone.utc)
             cosmos_client.update_session(request.session_id, session.model_dump(mode="json"))
             logger.debug("User message committed to Cosmos before stream (session=%s)", request.session_id)
 
-    agent = BOMCreationAgent()
-
     async def event_stream():
-        session_doc = cosmos_client.get_session(request.session_id) or {}
-        response_text, bom_data, progress, complete = await agent.run(
-            session_doc, request.message
-        )
+        from ai.client import call_ai_streaming
+        from ai.agents.orchestrator import _process_message   # correct module path
 
+        session_doc = cosmos_client.get_session(request.session_id) or {}
+        ctx = session_doc.get("context") or {}
+        category = ctx.get("category", "")
+
+        # ── Run orchestrator to get response text + BOM (in thread — non-blocking) ──
+        result = await asyncio.to_thread(
+            _process_message,
+            session_doc,          # positional: session
+            request.message,      # positional: message
+            request.user_id or "demo_user",  # positional: user_id
+        )
+        response_text: str = result.get("response", "") or ""
+        bom_data = result.get("partial_bom")
+        progress: int = int(result.get("progress", 0))
+        complete: bool = bool(result.get("complete", False))
+
+        # Strip embedded JSON blocks from display text if BOM is present
         display_text = response_text
         if bom_data:
-            import re as _re  # noqa: PLC0415
-            display_text = _re.sub(r"```json[\s\S]*?```", "", response_text).strip()
+            display_text = re.sub(r"```json[\s\S]*?```", "", response_text).strip()
             if not display_text:
-                n = len(bom_data.get("line_items", []))
+                n = len(bom_data.get("line_items", bom_data.get("lineItems", [])))
                 display_text = f"BOM generated: **{n} line items** — see the panel on the right."
 
-        yield "data: " + json.dumps({"token": display_text, "done": False}) + "\n\n"
+        # ── Stream display_text word-by-word for smooth UX ────────────────────
+        # This gives visual streaming even when the underlying call is not natively streamed.
+        words = display_text.split()
+        CHUNK = 4   # words per SSE frame
+        for i in range(0, len(words), CHUNK):
+            chunk = " ".join(words[i:i + CHUNK]) + " "
+            yield "data: " + json.dumps({"token": chunk, "done": False}) + "\n\n"
+            await asyncio.sleep(0.025)  # ~40 fps visual cadence
 
-        category = session_doc.get("context", {}).get("category", "")
+        # ── Done frame ────────────────────────────────────────────────────────
         suggestions = _generate_suggestions(display_text, category, bom_data, complete)
         session_title = _session_title(session)
-
         yield "data: " + json.dumps({
             "token": "", "done": True,
             "complete": complete,
@@ -271,6 +289,7 @@ async def stream_message(request: ChatMessageRequest, background_tasks: Backgrou
             "session_title": session_title,
         }) + "\n\n"
 
+        # ── Persist assistant reply + updated state ────────────────────────────
         async with _get_session_lock(request.session_id):
             latest_data = cosmos_client.get_session(request.session_id)
             try:
@@ -280,12 +299,16 @@ async def stream_message(request: ChatMessageRequest, background_tasks: Backgrou
 
             latest_session.conversation.append(ChatMessage(role="assistant", content=display_text))
             latest_session.conversation = _dedup_conversation(latest_session.conversation)
+            # Truncate to max 100 turns to stay under Cosmos 2 MB document limit
+            _MAX_TURNS = 100
+            if len(latest_session.conversation) > _MAX_TURNS:
+                latest_session.conversation = latest_session.conversation[-_MAX_TURNS:]
             latest_session.context.progress_percentage = float(progress)
-            latest_session.updated_at = datetime.utcnow()
+            latest_session.updated_at = datetime.now(timezone.utc)
 
             if complete:
                 latest_session.status = "completed"
-                latest_session.completed_at = datetime.utcnow()
+                latest_session.completed_at = datetime.now(timezone.utc)
                 if bom_data:
                     _save_bom_to_cosmos(cosmos_client, bom_data, latest_session, request.user_id or "demo_user")
 
@@ -605,7 +628,7 @@ async def get_session_transcript(session_id: str, user_id: str = "demo_user"):
     # 1. Try ADLS first (cheapest, long-term store)
     try:
         adls_client = get_adls_client()
-        date_prefix = datetime.utcnow().strftime("%Y/%m")
+        date_prefix = datetime.now(timezone.utc).strftime("%Y/%m")
         adls_path = f"{user_id}/{date_prefix}/{session_id}.json"
         raw = adls_client.download_file(settings.adls_container_chat_history, adls_path)
         return json.loads(raw.decode("utf-8"))

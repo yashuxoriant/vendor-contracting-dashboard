@@ -26,9 +26,16 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-ROWS_PER_CHUNK: int = int(os.getenv("BOM_ROWS_PER_CHUNK", "40"))
-PROSE_CHUNK_SIZE: int = int(os.getenv("BOM_PROSE_CHUNK_SIZE", "800"))
-PROSE_CHUNK_OVERLAP: int = int(os.getenv("BOM_PROSE_CHUNK_OVERLAP", "120"))
+try:
+    from config import get_settings as _get_settings
+    _s = _get_settings()
+    ROWS_PER_CHUNK: int  = _s.bom_rows_per_chunk
+    PROSE_CHUNK_SIZE: int = _s.bom_prose_chunk_size
+    PROSE_CHUNK_OVERLAP: int = _s.bom_prose_chunk_overlap
+except Exception:
+    ROWS_PER_CHUNK   = int(os.getenv("BOM_ROWS_PER_CHUNK", "40"))
+    PROSE_CHUNK_SIZE = int(os.getenv("BOM_PROSE_CHUNK_SIZE", "800"))
+    PROSE_CHUNK_OVERLAP = int(os.getenv("BOM_PROSE_CHUNK_OVERLAP", "120"))
 
 # Common BOM column synonyms used for structured text formatting
 _COL_SYNONYMS = {

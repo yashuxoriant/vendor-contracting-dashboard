@@ -18,7 +18,32 @@ from services.embedding_service import EMBEDDING_DIM, embed_text
 
 logger = logging.getLogger(__name__)
 
-INDEX_NAME = "bom-embeddings"
+# Legacy global index — kept as fallback for direct-upload files with no category
+_LEGACY_INDEX = "bom-embeddings"
+
+
+def category_to_index_name(category: str) -> str:
+    """
+    Derive a deterministic Azure Search index name from a category string.
+
+    Rules:
+      • Lowercase, replace all non-alphanumeric chars with hyphens
+      • Collapse consecutive hyphens, strip leading/trailing hyphens
+      • Prefix with 'bom-' so all BOM indexes are easily identified
+      • Max 128 chars (Azure Search limit)
+
+    Examples:
+      'SD-WAN'              → 'bom-sd-wan'
+      'Data Center - COLO'  → 'bom-data-center-colo'
+      'Network & Telecom'   → 'bom-network-telecom'
+      'Cybersecurity'       → 'bom-cybersecurity'
+      ''                    → 'bom-embeddings'  (legacy fallback)
+    """
+    if not category or not category.strip():
+        return _LEGACY_INDEX
+    slug = re.sub(r"[^a-z0-9]+", "-", category.lower()).strip("-")
+    slug = re.sub(r"-+", "-", slug)
+    return f"bom-{slug}"[:128]
 
 
 # ── Document model ─────────────────────────────────────────────────────────────
@@ -108,7 +133,7 @@ def _chunk_doc_id(bom_id: str, content_hash: str, chunk_index: int) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:40]
 
 
-def _get_search_clients():
+def _get_search_clients(index_name: str = _LEGACY_INDEX):
     """Return (SearchClient, SearchIndexClient) or (None, None) if unconfigured."""
     try:
         from config import get_settings
@@ -124,19 +149,21 @@ def _get_search_clients():
 
         cred = AzureKeyCredential(key)
         idx_client = SearchIndexClient(endpoint=endpoint, credential=cred)
-        sc = SearchClient(endpoint=endpoint, index_name=INDEX_NAME, credential=cred)
+        sc = SearchClient(endpoint=endpoint, index_name=index_name, credential=cred)
         return sc, idx_client
     except Exception as exc:
         logger.warning("SearchService: client init failed (%s) — using mock", exc)
         return None, None
 
 
-def ensure_index() -> bool:
+def ensure_index(index_name: str = _LEGACY_INDEX) -> bool:
     """
-    Create the Azure Search index if it doesn't exist.
+    Create (or update) an Azure Search index for the given category.
     Returns True if Azure Search is available, False if using mock.
+
+    index_name should come from category_to_index_name(category).
     """
-    _, idx_client = _get_search_clients()
+    _, idx_client = _get_search_clients(index_name)
     if idx_client is None:
         logger.info("SearchService: using in-memory mock index")
         return False
@@ -198,28 +225,28 @@ def ensure_index() -> bool:
         )
 
         index = SearchIndex(
-            name=INDEX_NAME,
+            name=index_name,
             fields=fields,
             vector_search=vector_search,
             semantic_search=semantic_search,
         )
         idx_client.create_or_update_index(index)
-        logger.info("SearchService: Azure Search index '%s' ready", INDEX_NAME)
+        logger.info("SearchService: Azure Search index '%s' ready", index_name)
         return True
     except Exception as exc:
-        logger.error("ensure_index failed: %s", exc)
+        logger.error("ensure_index failed for '%s': %s", index_name, exc)
         return False
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def get_bom_indexed_state(bom_id: str) -> Optional[Dict[str, str]]:
+def get_bom_indexed_state(bom_id: str, index_name: str = _LEGACY_INDEX) -> Optional[Dict[str, str]]:
     """
     Return the stored {content_hash, sp_file_id} for an already-indexed BOM,
     or None if no chunks exist for this bom_id.
     Used by the ingest pipeline to skip re-embedding unchanged content.
     """
-    sc, _ = _get_search_clients()
+    sc, _ = _get_search_clients(index_name)
     if sc is None:
         chunks = [d for d in _mock_store if d["bom_id"] == bom_id]
         if chunks:
@@ -242,15 +269,17 @@ def get_bom_indexed_state(bom_id: str) -> Optional[Dict[str, str]]:
         return None
 
 
-def upsert_chunks(docs: List[BOMChunkDocument]) -> int:
+def upsert_chunks(docs: List[BOMChunkDocument], index_name: str = _LEGACY_INDEX) -> int:
     """
-    Upload/merge BOM chunk documents into the search index.
+    Upload/merge BOM chunk documents into the category-specific search index.
     Returns the number of documents upserted.
+
+    index_name should come from category_to_index_name(docs[0].category).
     """
     if not docs:
         return 0
 
-    sc, _ = _get_search_clients()
+    sc, _ = _get_search_clients(index_name)
     if sc is None:
         return _mock_upsert(docs)
 
@@ -365,25 +394,29 @@ def search_bom_context(
     bom_id: Optional[str] = None,
     category: str = "",
     vendor: str = "",
+    index_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Semantic vector search over BOM chunks, optionally scoped to a
-    specific category and/or vendor.
+    Semantic vector search over BOM chunks.
 
-    Priority of filtering:
-      1. bom_id    — most specific: search only within one document
-      2. category  — folder-level: only BOMs in the matching category/folder
-      3. vendor    — narrow further to a specific vendor
+    index_name routing:
+      • Explicitly supplied → use that index directly
+      • category provided, index_name omitted → derive from category_to_index_name(category)
+      • Neither supplied → use legacy global index (bom-embeddings)
 
-    If the category/vendor filter returns 0 results, automatically retries
-    without the filter so the agent never gets an empty context.
+    3-attempt graceful degradation (within the chosen index):
+      1. category + vendor filter
+      2. category filter only (drop vendor)
+      3. No filter (full index scan)
     """
+    # Resolve which index to query
+    resolved_index = index_name or (category_to_index_name(category) if category else _LEGACY_INDEX)
+
     query_vec = embed_text(query)
 
-    sc, _ = _get_search_clients()
+    sc, _ = _get_search_clients(resolved_index)
     if sc is None:
         results = _mock_search_filtered(query_vec, top_k, bom_id or "", category, vendor)
-        # graceful degradation: retry without filters
         if not results and (category or vendor):
             results = _mock_search_filtered(query_vec, top_k, bom_id or "", "", "")
         return results
@@ -422,34 +455,60 @@ def search_bom_context(
         ]
 
     try:
-        # Attempt 1: with category/vendor filter
+        # Since we're already in the category-specific index, the vendor filter
+        # is the only one needed. category filter kept as belt-and-suspenders.
         filter_expr = _build_category_filter(category, vendor, bom_id or "")
         hits = _run_search(filter_expr)
 
-        # Attempt 2: graceful degradation — drop vendor filter, keep category
         if not hits and vendor and category:
             filter_expr = _build_category_filter(category, "", bom_id or "")
             hits = _run_search(filter_expr)
             if hits:
-                logger.info("SearchService: vendor filter removed; %d results with category only", len(hits))
+                logger.info("SearchService[%s]: vendor filter removed; %d results",
+                            resolved_index, len(hits))
 
-        # Attempt 3: no filter at all — ensures agent always has some context
         if not hits and (category or vendor):
             hits = _run_search(None)
             if hits:
-                logger.info("SearchService: category/vendor filter removed; returning global top-%d results", top_k)
+                logger.info("SearchService[%s]: all filters removed; top-%d global results",
+                            resolved_index, top_k)
 
         return hits
     except Exception as exc:
-        logger.error("search_bom_context failed: %s", exc)
+        logger.error("search_bom_context[%s] failed: %s", resolved_index, exc)
         return []
 
 
-def delete_bom_chunks(bom_id: str) -> int:
-    """Remove all indexed chunks for a given BOM (e.g. on re-ingestion or deletion)."""
-    sc, _ = _get_search_clients()
+def delete_bom_chunks(bom_id: str, index_name: str = _LEGACY_INDEX) -> int:
+    """Remove all indexed chunks for a given BOM from the specified index.
+    Paginates in batches of 1000 so large BOMs are fully cleaned up.
+    """
+    sc, _ = _get_search_clients(index_name)
     if sc is None:
         return _mock_delete_by_bom(bom_id)
+
+    try:
+        total_deleted = 0
+        while True:
+            results = list(sc.search(
+                search_text="*",
+                filter=f"bom_id eq '{bom_id}'",
+                select=["id"],
+                top=1000,
+            ))
+            if not results:
+                break
+            keys = [{"id": r["id"]} for r in results]
+            sc.delete_documents(documents=keys)
+            total_deleted += len(keys)
+            logger.info("SearchService: deleted %d chunks (batch) for bom_id=%s index=%s",
+                        len(keys), bom_id, index_name)
+            if len(results) < 1000:
+                break   # last page
+        return total_deleted
+    except Exception as exc:
+        logger.error("delete_bom_chunks failed: %s", exc)
+        return 0
 
     try:
         # Search for all chunks belonging to this bom_id

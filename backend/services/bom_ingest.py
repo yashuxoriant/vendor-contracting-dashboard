@@ -24,7 +24,13 @@ from typing import Any, Dict, Optional
 
 from services.bom_extractor import extract_chunks
 from services.embedding_service import embed_batch
-from services.search_service import BOMChunkDocument, delete_bom_chunks, ensure_index, upsert_chunks
+from services.search_service import (
+    BOMChunkDocument,
+    category_to_index_name,
+    delete_bom_chunks,
+    ensure_index,
+    upsert_chunks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +161,10 @@ def ingest_bom(
     logger.info("BOMIngest: starting | bom_id=%s filename=%s size=%d bytes",
                 bom_id, filename, len(data))
 
+    # Derive the category-specific Azure Search index name
+    # e.g. 'SD-WAN' → 'bom-sd-wan', 'Data Center - COLO' → 'bom-data-center-colo'
+    index_name = category_to_index_name(category)
+
     # ── Idempotency: compute content hash and skip if unchanged ────────────────────
     content_hash = hashlib.sha256(data).hexdigest()
 
@@ -180,6 +190,7 @@ def ingest_bom(
         "filename":        filename,
         "vendor":          vendor,
         "category":        category,
+        "index_name":      index_name,
         "sp_file_id":      sp_file_id,
         "sp_etag":         sp_etag,
         "folder_path":     folder_path,
@@ -190,13 +201,16 @@ def ingest_bom(
     # Step 1 — upload raw to ADLS
     adls_path = _upload_raw_to_adls(data, filename, bom_id)
 
-    # Step 2 — ensure Azure Search index exists (adds sp_file_id/content_hash fields if needed)
-    ensure_index()
+    # Step 2 — ensure the category-specific Azure Search index exists
+    ensure_index(index_name)
 
-    # Step 3 — delete stale chunks if this is a re-ingest (content changed)
+    # Step 3 — delete stale chunks from the correct index if this is a re-ingest
     if existing and existing.get("status") == "indexed":
-        old_count = delete_bom_chunks(bom_id)
-        logger.info("BOMIngest: removed %d stale chunks for bom_id=%s", old_count, bom_id)
+        # Use the stored index_name in case the category changed since last ingest
+        prev_index = existing.get("index_name") or index_name
+        old_count = delete_bom_chunks(bom_id, prev_index)
+        logger.info("BOMIngest: removed %d stale chunks for bom_id=%s from index=%s",
+                    old_count, bom_id, prev_index)
 
     # Step 4 — extract text chunks
     chunks = extract_chunks(data, filename)
@@ -235,20 +249,21 @@ def ingest_bom(
             metadata=chunk_meta,
         ))
 
-    # Step 7 — upsert into search index
+    # Step 7 — upsert into the category-specific search index
     try:
-        upserted = upsert_chunks(docs)
+        upserted = upsert_chunks(docs, index_name)
     except Exception as exc:
         _write_status(bom_id, "failed", detail=f"Search upsert failed: {exc}")
         raise
 
-    # Step 8 — update status with content hash for future dedup
+    # Step 8 — update status with content hash and index_name for future dedup + routing
     result = {
         "bom_id":           bom_id,
         "status":           "indexed",
         "filename":         filename,
         "vendor":           vendor,
         "category":         category,
+        "index_name":       index_name,
         "chunks_total":     len(docs),
         "chunks_upserted":  upserted,
         "adls_path":        adls_path,
@@ -259,8 +274,9 @@ def ingest_bom(
         "folder_path":      folder_path,
         "sharepoint_path":  sharepoint_path or filename,
     }
-    _write_status(bom_id, "indexed", detail=f"{upserted} chunks indexed", extra=result)
-    logger.info("BOMIngest: complete | bom_id=%s chunks=%d/%d", bom_id, upserted, len(docs))
+    _write_status(bom_id, "indexed", detail=f"{upserted} chunks indexed in {index_name}", extra=result)
+    logger.info("BOMIngest: complete | bom_id=%s index=%s chunks=%d/%d",
+                bom_id, index_name, upserted, len(docs))
     return result
 
 

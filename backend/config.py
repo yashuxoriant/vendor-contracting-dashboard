@@ -133,6 +133,11 @@ class Settings(BaseSettings):
     
     # Rate Limiting
     rate_limit_per_minute: int = Field(default=60)
+
+    # BOM pipeline tuning
+    bom_rows_per_chunk: int = Field(default=40, alias="BOM_ROWS_PER_CHUNK")
+    bom_prose_chunk_size: int = Field(default=800, alias="BOM_PROSE_CHUNK_SIZE")
+    bom_prose_chunk_overlap: int = Field(default=120, alias="BOM_PROSE_CHUNK_OVERLAP")
     
     class Config:
         env_file = _ENV_FILE

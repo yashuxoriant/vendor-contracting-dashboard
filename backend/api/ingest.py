@@ -188,8 +188,12 @@ async def get_ingest_status_endpoint(bom_id: str):
 async def delete_bom_index(bom_id: str):
     """Remove all indexed chunks for a BOM from the search index."""
     from services.search_service import delete_bom_chunks
-    deleted = delete_bom_chunks(bom_id)
-    return {"bom_id": bom_id, "chunks_deleted": deleted}
+    from services.bom_ingest import get_ingest_status
+    # Use the index_name stored in the Cosmos status record (set at ingest time)
+    status_doc = get_ingest_status(bom_id)
+    index_name = (status_doc or {}).get("index_name") if status_doc else None
+    deleted = delete_bom_chunks(bom_id, index_name) if index_name else delete_bom_chunks(bom_id)
+    return {"bom_id": bom_id, "index_name": index_name, "chunks_deleted": deleted}
 
 
 # ── POST /api/ingest/search  (semantic search for testing) ────────────────────
@@ -197,19 +201,34 @@ async def delete_bom_index(bom_id: str):
 @router.post("/search")
 async def search_bom_index(body: Dict[str, Any]):
     """
-    Semantic search over all indexed BOM chunks.
-    Body: { "query": "...", "top_k": 5, "bom_id": null }
+    Semantic search over BOM chunks.
+    Body: { "query": "...", "top_k": 5, "bom_id": null, "category": "SD-WAN", "vendor": "Cisco" }
+
+    If category is supplied the search is routed to the category-specific index
+    (e.g. category='SD-WAN' → index 'bom-sd-wan').
     """
-    query  = body.get("query", "").strip()
-    top_k  = int(body.get("top_k", 5))
-    bom_id = body.get("bom_id")
+    query    = body.get("query", "").strip()
+    top_k    = int(body.get("top_k", 5))
+    bom_id   = body.get("bom_id")
+    category = body.get("category", "").strip()
+    vendor   = body.get("vendor", "").strip()
 
     if not query:
         raise HTTPException(status_code=400, detail="'query' is required")
 
-    from services.search_service import search_bom_context
-    results = search_bom_context(query=query, top_k=top_k, bom_id=bom_id)
-    return {"query": query, "results": results, "count": len(results)}
+    from services.search_service import search_bom_context, category_to_index_name
+    index_name = category_to_index_name(category) if category else None
+    results = search_bom_context(
+        query=query, top_k=top_k, bom_id=bom_id,
+        category=category, vendor=vendor, index_name=index_name,
+    )
+    return {
+        "query":      query,
+        "category":   category,
+        "index_used": index_name or "bom-embeddings",
+        "results":    results,
+        "count":      len(results),
+    }
 
 
 # ── POST /api/ingest/delta  (manual SharePoint delta trigger) ─────────────────

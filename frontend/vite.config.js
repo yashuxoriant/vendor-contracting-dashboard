@@ -1,9 +1,14 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 
 // https://vitejs.dev/config/
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '')
+  const backendUrl = env.VITE_BACKEND_URL || 'http://localhost:8000'
+  const backendWs  = backendUrl.replace(/^http/, 'ws')
+
+  return {
   plugins: [react()],
   resolve: {
     alias: {
@@ -14,22 +19,23 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8001',
+        target: backendUrl,
         changeOrigin: true,
         configure: (proxy) => {
           proxy.on('error', (err) => {
-            console.warn('[Vite proxy] Backend unreachable:', err.message)
+            console.warn('[Vite proxy] Backend unreachable at ' + backendUrl + ':', err.message)
           })
         },
       },
       '/health': {
-        target: 'http://localhost:8001',
+        target: backendUrl,
         changeOrigin: true,
       },
       '/ws': {
-        target: 'ws://localhost:8001',
+        target: backendWs,
         ws: true,
       },
     },
   },
+  }
 })

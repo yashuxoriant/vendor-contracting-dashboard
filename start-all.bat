@@ -6,9 +6,9 @@ echo ========================================
 echo   IT BOM Creation System
 echo ========================================
 echo.
-echo   Backend  : http://localhost:8001
+echo   Backend  : http://localhost:8000
   echo   Frontend : http://localhost:5173
-  echo   API Docs : http://localhost:8001/api/docs
+  echo   API Docs : http://localhost:8000/api/docs
 echo.
 echo   Starting both servers...
 echo ========================================
@@ -28,7 +28,7 @@ if not exist "%ROOT%frontend\node_modules" (
 
 REM Start backend in new window
 echo [3/4] Starting backend (FastAPI)...
-start "IT-BOM Backend" cmd /k "cd /d "%ROOT%backend" && python -m uvicorn main:app --reload --port 8001"
+start "IT-BOM Backend" cmd /k "cd /d "%ROOT%backend" && python -m uvicorn main:app --reload --port 8000"
 
 REM Wait for backend to initialize
 timeout /t 3 /nobreak > nul

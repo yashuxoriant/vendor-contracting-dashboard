@@ -29,6 +29,36 @@ logger = logging.getLogger(__name__)
 
 # ── APScheduler (optional — only used when poll interval > 0) ─────────────────
 _scheduler = None
+_consecutive_failures = 0
+_MAX_CONSECUTIVE_FAILURES = 5
+
+
+def _run_with_backoff() -> None:
+    """
+    Scheduler-facing wrapper that tracks consecutive failures.
+    After _MAX_CONSECUTIVE_FAILURES successive errors, it logs a critical alert
+    and skips subsequent runs until a successful run resets the counter.
+    This prevents log flooding during sustained Graph API outages.
+    """
+    global _consecutive_failures
+    if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+        logger.critical(
+            "BOMDeltaPipeline: %d consecutive failures — skipping run (check SharePoint/Graph connectivity)",
+            _consecutive_failures,
+        )
+        return
+    result = run_bom_delta_pipeline(force_full_sync=False)
+    if result.get("status") in ("ok", "skipped"):
+        if _consecutive_failures > 0:
+            logger.info("BOMDeltaPipeline: recovered after %d failures", _consecutive_failures)
+        _consecutive_failures = 0
+    else:
+        _consecutive_failures += 1
+        logger.warning(
+            "BOMDeltaPipeline: failure %d/%d | errors: %s",
+            _consecutive_failures, _MAX_CONSECUTIVE_FAILURES,
+            result.get("errors", [])[:3],
+        )
 
 
 def start_scheduler() -> None:
@@ -46,7 +76,7 @@ def start_scheduler() -> None:
 
         _scheduler = BackgroundScheduler(daemon=True)
         _scheduler.add_job(
-            run_bom_delta_pipeline,
+            _run_with_backoff,    # use backoff wrapper instead of direct call
             trigger=IntervalTrigger(minutes=interval),
             id="bom_delta_pipeline",
             name="BOM SharePoint Delta Pipeline",

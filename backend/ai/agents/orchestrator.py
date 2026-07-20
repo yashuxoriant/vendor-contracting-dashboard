@@ -82,49 +82,48 @@ def _retrieve_bom_context(
     category: str = "",
     vendor: str = "",
     top_k: int = 6,
+    index_name: Optional[str] = None,
 ) -> str:
     """
-    Search indexed BOMs for relevant chunks scoped to the session category and vendor.
+    Search the category-specific Azure Search index for relevant BOM chunks.
 
-    Filtering priority:
-      bom_id   — exact document scope (overrides category/vendor)
-      category — folder-level scope (e.g. 'SD-WAN', 'Data Center / COLO')
-      vendor   — additional vendor sub-scope (e.g. 'Cisco', 'Palo Alto')
+    Routing:
+      index_name explicitly given  → use that index
+      category given, no index_name → derive via category_to_index_name()
+      Neither                       → legacy bom-embeddings fallback
 
-    Falls back to global search if filtered results are empty so the agent
-    always has at least some context.
+    Falls back to global search if the category index returns empty results.
     """
     try:
-        from services.search_service import search_bom_context
+        from services.search_service import search_bom_context, category_to_index_name
+        resolved_index = index_name or (category_to_index_name(category) if category else None)
         results = search_bom_context(
             query=query,
             top_k=top_k,
             bom_id=bom_id,
             category=category,
             vendor=vendor,
+            index_name=resolved_index,
         )
         if not results:
             return ""
         lines = []
         for r in results:
-            # Build a rich source citation: prefer sharepoint_path > filename
             source = r.get("sharepoint_path") or r.get("filename") or "unknown"
-            cat_label  = r.get("category") or r.get("folder_path") or ""
+            cat_label    = r.get("category") or r.get("folder_path") or ""
             vendor_label = r.get("vendor") or ""
             meta_parts = [f"Source: {source}"]
-            if cat_label:   meta_parts.append(f"Category: {cat_label}")
+            if cat_label:    meta_parts.append(f"Category: {cat_label}")
             if vendor_label: meta_parts.append(f"Vendor: {vendor_label}")
             meta_parts.append(f"Score: {r.get('score', 0):.2f}")
             lines.append(f"[{' | '.join(meta_parts)}]\n{r['chunk_text']}")
-        scope_note = ""
-        if category or vendor:
-            scope_note = f"(scoped to category='{category}'"
-            if vendor:
-                scope_note += f", vendor='{vendor}'"
-            scope_note += f", {len(results)} chunks matched)"
+        scope_note = f"index={resolved_index}"
+        if category: scope_note += f", category='{category}'"
+        if vendor:   scope_note += f", vendor='{vendor}'"
+        scope_note   += f", {len(results)} chunks"
         return (
             "\n\n" + "=" * 60
-            + "\nREFERENCE BOM DATA (from indexed library) " + scope_note
+            + f"\nREFERENCE BOM DATA ({scope_note})"
             + "\n" + "=" * 60 + "\n"
             + "\n\n".join(lines)
         )
@@ -420,13 +419,16 @@ class BOMOrchestrator:
         # ── Build system prompt ───────────────────────────────────────
         base_prompt = get_system_prompt(category)
         bom_id = context.get("bom_id")
-        # Retrieve vendor preference already captured in this session (for tighter RAG scope)
+        # Derive the category-specific index name once; pass to both ingest and search
+        from services.search_service import category_to_index_name
+        cat_index = category_to_index_name(category)
         vendor_for_rag = agent_state.get("vendor_standard", "")
         bom_rag = _retrieve_bom_context(
             message,
             bom_id=bom_id,
             category=category,
             vendor=vendor_for_rag,
+            index_name=cat_index,
         )
 
         requirements = context.get("requirements", {})
@@ -471,8 +473,17 @@ class BOMOrchestrator:
         while msgs and msgs[0]["role"] == "assistant":
             msgs.pop(0)
 
-        # ── Call AI ────────────────────────────────────────────────────────
-        response_text = call_ai(msgs, system=system)
+        # ── Call AI — route to fast model for cheap intake phases ──────────
+        # INTAKE and QUALIFY are simple Q&A turns; use the faster, cheaper model.
+        # SIZING, GENERATE, VALIDATE need the full-power model for BOM accuracy.
+        _FAST_PHASES = {BOMPhase.INTAKE, BOMPhase.QUALIFY}
+        try:
+            from config import get_settings as _get_settings
+            _s = _get_settings()
+            _model = _s.claude_model_fast if current_phase in _FAST_PHASES else _s.claude_model_complex
+        except Exception:
+            _model = None   # let call_ai pick its default
+        response_text = call_ai(msgs, system=system, model=_model)
         if response_text is None:
             user_turns = sum(1 for m in history if m.get("role") == "user")
             response_text = self._rule_based(category, current_phase, message, agent_state, user_turns)
@@ -828,3 +839,29 @@ class BOMOrchestrator:
             return 100
         phase_map = {1: 5, 2: 15, 3: 25, 4: 35, 5: 45, 6: 55, 7: 70, 8: 80, 9: 90, 10: 95}
         return phase_map.get(phase, 5)
+
+
+# ── Module-level entry point (used by the streaming endpoint) ─────────────────
+
+def _process_message(
+    session: Dict[str, Any],
+    message: str,
+    user_id: str = "demo_user",
+) -> Dict[str, Any]:
+    """
+    Synchronous wrapper around BOMOrchestrator.process().
+    Returns a dict with keys: response, partial_bom, progress, complete, state.
+    Designed to be called via asyncio.to_thread() from async endpoints.
+    """
+    orchestrator = BOMOrchestrator()
+    response_text, partial_bom, progress, complete = orchestrator.process(
+        session=session,
+        message=message,
+        user_id=user_id,
+    )
+    return {
+        "response":    response_text or "",
+        "partial_bom": partial_bom,
+        "progress":    progress,
+        "complete":    complete,
+    }

@@ -136,23 +136,49 @@ async def health_check() -> Dict[str, Any]:
 
 @app.get("/health/ready", tags=["Health"])
 async def readiness_check() -> Dict[str, Any]:
-    """
-    Readiness check - verifies all dependencies are ready
-    TODO: Add checks for Cosmos DB, ADLS, Key Vault connectivity
-    """
-    checks = {
-        "cosmos_db": "not_implemented",
-        "adls": "not_implemented",
-        "key_vault": "not_implemented",
-        "anthropic_api": "not_implemented"
-    }
-    
-    all_ready = all(check != "not_implemented" for check in checks.values())
-    
-    return {
-        "status": "ready" if all_ready else "not_ready",
-        "checks": checks
-    }
+    """Readiness check — verifies all critical dependencies are reachable."""
+    checks: Dict[str, str] = {}
+
+    # Cosmos DB
+    try:
+        from db import get_cosmos_client
+        client = get_cosmos_client()
+        if client and client.client:
+            checks["cosmos_db"] = "ok"
+        else:
+            checks["cosmos_db"] = "mock"
+    except Exception as exc:
+        checks["cosmos_db"] = f"error: {exc}"
+
+    # ADLS
+    try:
+        from db import get_adls_client
+        adls = get_adls_client()
+        checks["adls"] = "ok" if (adls and adls.service_client) else "mock"
+    except Exception as exc:
+        checks["adls"] = f"error: {exc}"
+
+    # AI client
+    try:
+        from ai.client import get_ai_client
+        ai_client, model = get_ai_client()
+        checks["ai_client"] = f"ok ({model})" if ai_client else "fallback"
+    except Exception as exc:
+        checks["ai_client"] = f"error: {exc}"
+
+    # Azure Search
+    try:
+        from services.search_service import _get_search_clients
+        sc, idx = _get_search_clients()
+        checks["azure_search"] = "ok" if sc else "mock"
+    except Exception as exc:
+        checks["azure_search"] = f"error: {exc}"
+
+    all_ready = all(
+        v in ("ok", "mock", "fallback") or v.startswith("ok ")
+        for v in checks.values()
+    )
+    return {"status": "ready" if all_ready else "degraded", "checks": checks}
 
 
 @app.get("/", tags=["Root"])

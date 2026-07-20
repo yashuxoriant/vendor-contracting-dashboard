@@ -76,7 +76,9 @@ def embed_text(text: str) -> List[float]:
     """
     Embed a single text string.
     Returns a float list of length EMBEDDING_DIM.
+    Falls back to mock embedding if the Azure endpoint is slow (> 8 s) or fails.
     """
+    import signal
     text = text.strip()
     if not text:
         return _mock_embedding("")
@@ -88,7 +90,8 @@ def embed_text(text: str) -> List[float]:
     try:
         from config import get_settings
         deployment = get_settings().azure_openai_embedding_deployment
-        resp = client.embeddings.create(input=[text], model=deployment)
+        # timeout=30 is set on the client; enforce an 8-second ceiling at call level
+        resp = client.embeddings.create(input=[text], model=deployment, timeout=8.0)
         return resp.data[0].embedding
     except Exception as exc:
         logger.warning("embed_text failed (%s) — falling back to mock", exc)
