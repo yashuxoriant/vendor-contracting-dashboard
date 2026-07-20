@@ -119,7 +119,7 @@ def run_bom_delta_pipeline(force_full_sync: bool = False) -> Dict[str, Any]:
     from services.search_service import delete_bom_chunks
     import hashlib
 
-    folder_key = settings.sharepoint_drive_path  # e.g. "BOMs"
+    folder_key = settings.sharepoint_drive_path  # e.g. "PWC_Vendor_Contracting_Hub"
 
     try:
         # Step 1: token + drive context

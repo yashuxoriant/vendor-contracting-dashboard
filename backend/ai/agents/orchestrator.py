@@ -76,21 +76,56 @@ _PHASE_ORDER = [
 ]
 
 
-def _retrieve_bom_context(query: str, bom_id: Optional[str] = None, top_k: int = 5) -> str:
-    """Search indexed BOMs for relevant chunks to inject into the system prompt."""
+def _retrieve_bom_context(
+    query: str,
+    bom_id: Optional[str] = None,
+    category: str = "",
+    vendor: str = "",
+    top_k: int = 6,
+) -> str:
+    """
+    Search indexed BOMs for relevant chunks scoped to the session category and vendor.
+
+    Filtering priority:
+      bom_id   — exact document scope (overrides category/vendor)
+      category — folder-level scope (e.g. 'SD-WAN', 'Data Center / COLO')
+      vendor   — additional vendor sub-scope (e.g. 'Cisco', 'Palo Alto')
+
+    Falls back to global search if filtered results are empty so the agent
+    always has at least some context.
+    """
     try:
         from services.search_service import search_bom_context
-        results = search_bom_context(query=query, top_k=top_k, bom_id=bom_id)
+        results = search_bom_context(
+            query=query,
+            top_k=top_k,
+            bom_id=bom_id,
+            category=category,
+            vendor=vendor,
+        )
         if not results:
             return ""
-        lines = [
-            f"[Source: {r.get('filename','unknown')} | Vendor: {r.get('vendor','')} "
-            f"| Score: {r.get('score', 0):.2f}]\n{r['chunk_text']}"
-            for r in results
-        ]
+        lines = []
+        for r in results:
+            # Build a rich source citation: prefer sharepoint_path > filename
+            source = r.get("sharepoint_path") or r.get("filename") or "unknown"
+            cat_label  = r.get("category") or r.get("folder_path") or ""
+            vendor_label = r.get("vendor") or ""
+            meta_parts = [f"Source: {source}"]
+            if cat_label:   meta_parts.append(f"Category: {cat_label}")
+            if vendor_label: meta_parts.append(f"Vendor: {vendor_label}")
+            meta_parts.append(f"Score: {r.get('score', 0):.2f}")
+            lines.append(f"[{' | '.join(meta_parts)}]\n{r['chunk_text']}")
+        scope_note = ""
+        if category or vendor:
+            scope_note = f"(scoped to category='{category}'"
+            if vendor:
+                scope_note += f", vendor='{vendor}'"
+            scope_note += f", {len(results)} chunks matched)"
         return (
-            "\n\n" + "=" * 60 + "\nREFERENCE BOM DATA (from indexed library)\n"
-            + "=" * 60 + "\n"
+            "\n\n" + "=" * 60
+            + "\nREFERENCE BOM DATA (from indexed library) " + scope_note
+            + "\n" + "=" * 60 + "\n"
             + "\n\n".join(lines)
         )
     except Exception as exc:
@@ -385,7 +420,14 @@ class BOMOrchestrator:
         # ── Build system prompt ───────────────────────────────────────
         base_prompt = get_system_prompt(category)
         bom_id = context.get("bom_id")
-        bom_rag = _retrieve_bom_context(message, bom_id=bom_id)
+        # Retrieve vendor preference already captured in this session (for tighter RAG scope)
+        vendor_for_rag = agent_state.get("vendor_standard", "")
+        bom_rag = _retrieve_bom_context(
+            message,
+            bom_id=bom_id,
+            category=category,
+            vendor=vendor_for_rag,
+        )
 
         requirements = context.get("requirements", {})
         project = requirements.get("project", "New Project")

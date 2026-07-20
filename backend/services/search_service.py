@@ -160,16 +160,17 @@ def ensure_index() -> bool:
         fields = [
             SimpleField(name="id",              type=SearchFieldDataType.String, key=True),
             SimpleField(name="bom_id",          type=SearchFieldDataType.String, filterable=True),
-            SimpleField(name="filename",        type=SearchFieldDataType.String, filterable=True),
-            SimpleField(name="vendor",          type=SearchFieldDataType.String, filterable=True),
-            SimpleField(name="category",        type=SearchFieldDataType.String, filterable=True),
-            SimpleField(name="chunk_index",     type=SearchFieldDataType.Int32),
-            # Version-tracking & provenance fields — enable idempotent upserts, dedup, and RAG source attribution
             SimpleField(name="sp_file_id",      type=SearchFieldDataType.String, filterable=True),
             SimpleField(name="content_hash",    type=SearchFieldDataType.String, filterable=True),
             SimpleField(name="sp_etag",         type=SearchFieldDataType.String, filterable=True),
-            SimpleField(name="folder_path",     type=SearchFieldDataType.String, filterable=True),
-            SimpleField(name="sharepoint_path", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="chunk_index",     type=SearchFieldDataType.Int32),
+            # Searchable + filterable provenance fields
+            # SearchableField enables search.ismatch() for flexible category/vendor filtering
+            SearchableField(name="filename",        type=SearchFieldDataType.String, filterable=True),
+            SearchableField(name="vendor",          type=SearchFieldDataType.String, filterable=True),
+            SearchableField(name="category",        type=SearchFieldDataType.String, filterable=True),
+            SearchableField(name="folder_path",     type=SearchFieldDataType.String, filterable=True),
+            SearchableField(name="sharepoint_path", type=SearchFieldDataType.String, filterable=True),
             SearchableField(name="chunk_text", type=SearchFieldDataType.String),
             SearchField(
                 name="embedding",
@@ -284,52 +285,161 @@ def upsert_chunks(docs: List[BOMChunkDocument]) -> int:
         raise
 
 
+def _build_category_filter(category: str, vendor: str, bom_id: str) -> Optional[str]:
+    """
+    Build an OData filter expression that scopes the search to BOMs matching
+    the session category and/or vendor.
+
+    Uses search.ismatch() on the searchable category/folder_path/vendor fields
+    for flexible, case-insensitive, partial matching.
+    e.g. category='Network & Telecom' matches folder 'Networking', 'SD-WAN', etc.
+    """
+    parts: list = []
+
+    if bom_id:
+        safe = bom_id.replace("'", "''")
+        parts.append(f"bom_id eq '{safe}'")
+        return parts[0]  # bom_id is the most specific filter; skip category
+
+    if category:
+        # Normalise: take meaningful tokens, strip punctuation
+        tokens = [t.strip() for t in re.split(r"[&/,\-]+", category) if len(t.strip()) >= 3]
+        if tokens:
+            # Match any token against category OR folder_path
+            token_filters = [
+                f"search.ismatch('{t.replace(chr(39), chr(39)*2)}', 'category, folder_path, sharepoint_path')"
+                for t in tokens[:3]   # cap at 3 tokens to keep filter simple
+            ]
+            parts.append("(" + " or ".join(token_filters) + ")")
+
+    if vendor:
+        safe_v = vendor.replace("'", "''")
+        parts.append(
+            f"search.ismatch('{safe_v}', 'vendor, folder_path, sharepoint_path')"
+        )
+
+    return " and ".join(parts) if parts else None
+
+
+def _mock_search_filtered(
+    query_vector: List[float],
+    top_k: int,
+    bom_id: str,
+    category: str,
+    vendor: str,
+) -> List[Dict]:
+    """Mock store search with optional category/vendor filtering."""
+    candidates = _mock_store
+    if bom_id:
+        candidates = [d for d in candidates if d["bom_id"] == bom_id]
+    elif category:
+        # Case-insensitive partial match on category or folder_path
+        cat_lower = category.lower()
+        candidates = [
+            d for d in candidates
+            if cat_lower in (d.get("category") or "").lower()
+            or cat_lower in (d.get("folder_path") or "").lower()
+        ]
+    if vendor:
+        vnd_lower = vendor.lower()
+        candidates = [
+            d for d in candidates
+            if vnd_lower in (d.get("vendor") or "").lower()
+            or vnd_lower in (d.get("folder_path") or "").lower()
+        ]
+    scored = [
+        (d, _cosine_similarity(query_vector, d["embedding"]))
+        for d in candidates
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [
+        {**d, "score": round(s, 4)}
+        for d, s in scored[:top_k]
+        if s > 0.0
+    ]
+
+
 def search_bom_context(
     query: str,
     top_k: int = 5,
     bom_id: Optional[str] = None,
+    category: str = "",
+    vendor: str = "",
 ) -> List[Dict[str, Any]]:
     """
-    Semantic vector search over BOM chunks.
-    Returns a list of matching chunk dicts with a 'score' key.
-    Optionally scoped to a specific bom_id.
+    Semantic vector search over BOM chunks, optionally scoped to a
+    specific category and/or vendor.
+
+    Priority of filtering:
+      1. bom_id    — most specific: search only within one document
+      2. category  — folder-level: only BOMs in the matching category/folder
+      3. vendor    — narrow further to a specific vendor
+
+    If the category/vendor filter returns 0 results, automatically retries
+    without the filter so the agent never gets an empty context.
     """
     query_vec = embed_text(query)
 
     sc, _ = _get_search_clients()
     if sc is None:
-        return _mock_search(query_vec, top_k=top_k, bom_id=bom_id)
+        results = _mock_search_filtered(query_vec, top_k, bom_id or "", category, vendor)
+        # graceful degradation: retry without filters
+        if not results and (category or vendor):
+            results = _mock_search_filtered(query_vec, top_k, bom_id or "", "", "")
+        return results
 
-    try:
+    def _run_search(filter_expr: Optional[str]) -> List[Dict]:
         from azure.search.documents.models import VectorizedQuery
-
         vector_query = VectorizedQuery(
             vector=query_vec,
             k_nearest_neighbors=top_k,
             fields="embedding",
         )
-        filter_expr = f"bom_id eq '{bom_id}'" if bom_id else None
-
         results = sc.search(
             search_text=None,
             vector_queries=[vector_query],
             filter=filter_expr,
-            select=["id", "bom_id", "filename", "vendor", "category", "chunk_text", "chunk_index"],
+            select=[
+                "id", "bom_id", "filename", "vendor", "category",
+                "chunk_text", "chunk_index", "folder_path", "sharepoint_path",
+            ],
             top=top_k,
         )
         return [
             {
-                "id":          r["id"],
-                "bom_id":      r["bom_id"],
-                "filename":    r["filename"],
-                "vendor":      r.get("vendor", ""),
-                "category":    r.get("category", ""),
-                "chunk_text":  r["chunk_text"],
-                "chunk_index": r.get("chunk_index", 0),
-                "score":       round(r.get("@search.score", 0.0), 4),
+                "id":              r["id"],
+                "bom_id":         r["bom_id"],
+                "filename":       r["filename"],
+                "vendor":         r.get("vendor", ""),
+                "category":       r.get("category", ""),
+                "folder_path":    r.get("folder_path", ""),
+                "sharepoint_path": r.get("sharepoint_path", ""),
+                "chunk_text":     r["chunk_text"],
+                "chunk_index":    r.get("chunk_index", 0),
+                "score":          round(r.get("@search.score", 0.0), 4),
             }
             for r in results
         ]
+
+    try:
+        # Attempt 1: with category/vendor filter
+        filter_expr = _build_category_filter(category, vendor, bom_id or "")
+        hits = _run_search(filter_expr)
+
+        # Attempt 2: graceful degradation — drop vendor filter, keep category
+        if not hits and vendor and category:
+            filter_expr = _build_category_filter(category, "", bom_id or "")
+            hits = _run_search(filter_expr)
+            if hits:
+                logger.info("SearchService: vendor filter removed; %d results with category only", len(hits))
+
+        # Attempt 3: no filter at all — ensures agent always has some context
+        if not hits and (category or vendor):
+            hits = _run_search(None)
+            if hits:
+                logger.info("SearchService: category/vendor filter removed; returning global top-%d results", top_k)
+
+        return hits
     except Exception as exc:
         logger.error("search_bom_context failed: %s", exc)
         return []
