@@ -153,6 +153,11 @@ def build_llm_messages(
         if m.get("role") in ("user", "assistant")
     ]
 
+    # Anthropic requires the message list to start with a user turn.
+    # Drop any leading assistant messages (e.g. the session welcome message).
+    while messages and messages[0]["role"] != "user":
+        messages = messages[1:]
+
     if config.system_as_first_message and system_prompt:
         messages = [{"role": "user", "content": system_prompt}] + messages
         return "", messages

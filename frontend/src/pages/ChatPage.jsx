@@ -510,14 +510,14 @@ const BOM_DOMAINS = [
 // Steps used to compute live progress % in the BOM Preview panel sidebar.
 // Progress = (steps answered / total steps) * 100
 const INTAKE_STEPS = [
-  { key: 'ma_phase',              label: 'M&A Phase' },
-  { key: 'workstream_category',   label: 'Category' },
-  { key: 'conveyance_status',     label: 'Conveyance Status' },
-  { key: 'site_count',            label: 'Sites in Scope' },
-  { key: 'user_count',            label: 'Users per Site' },
-  { key: 'required_by_date',      label: 'Required-By Date' },
-  { key: 'vendor_standard',       label: 'Preferred Vendor' },
-  { key: 'site_criticality',      label: 'Site Criticality' },
+  { key: 'ma_phase',                        label: 'M&A Phase' },
+  { key: 'workstream_category',             label: 'Category' },
+  { key: 'conveyance_status',               label: 'Conveyance Status' },
+  { key: 'site_entity_scope',               label: 'Sites in Scope' },
+  { key: 'site_classification_size',        label: 'Users / Scale' },
+  { key: 'required_by_date',                label: 'Required-By Date' },
+  { key: 'vendor_standard_preferred',       label: 'Preferred Vendor' },
+  { key: 'site_classification_criticality', label: 'Site Criticality' },
 ]
 
 export default function ChatPage() {
@@ -530,7 +530,7 @@ export default function ChatPage() {
   const [input, setInput] = useState('')
   const [isTyping, setIsTyping] = useState(false)
   const [currentBOM, setLocalBOM] = useState(savedCurrentBOM || null)
-  const [ctx, setCtx] = useState({ project: null, category: null })
+  const [ctx, setCtx] = useState({ project: null, category: null, domainPreselected: false })
   const msgEndRef = useRef(null)
   const backendWarnedRef = useRef(false)
   const sendingRef = useRef(false)
@@ -753,27 +753,31 @@ export default function ChatPage() {
     setDomainPickerOpen(false)
     setLocalBOM(null)
     dispatch(setCurrentBOM(null))
-    setCtx({ category, project: null })
+    setCtx({ category, project: null, domainPreselected: true })
     setSessionId(null)
     setPhaseProgress(0)
     setIntakeFields({})
     sessionStorage.removeItem('chat_session_id')
 
     const domainObj = BOM_DOMAINS.find(d => d.key === category) || { icon: '📋' }
-    setMessages([{
-      id: Date.now(), role: 'ai', type: 'text',
-      text: `${domainObj.icon} **${category} BOM** selected.\n\nI've loaded the ${category} skill file and qualification checklist.\n\n**Step 1 — M&A Phase:** What phase is this engagement in?\n\n- **Day-1 Readiness** — minimum viable cutover to legally close\n- **TSA Exit / Cutover** — active migration off TSA-provided services\n- **Full Integration / Standalone Build** — post-TSA steady-state build-out`,
-    }])
 
-    if (backendMode) {
-      try {
-        const resp = await chatApi.startSession(category, 'New Project', 'demo_user', null, true)
-        setSessionId(resp.session_id)
-        localStorage.setItem('chat_session_id', resp.session_id)
-        sessionStorage.setItem('chat_session_id', resp.session_id)
-      } catch (_) {
-        // Session will be created lazily on first message send
-      }
+    // Always call the backend directly — do not gate on the backendMode state
+    // snapshot, which may still be false if the user clicks before the initial
+    // ping has resolved (race condition on page load).
+    try {
+      const resp = await chatApi.startSession(category, 'New Project', 'demo_user', null, true)
+      setSessionId(resp.session_id)
+      localStorage.setItem('chat_session_id', resp.session_id)
+      sessionStorage.setItem('chat_session_id', resp.session_id)
+      setBackendMode(true)
+      // Use the backend welcome message — it owns the greeting and first question
+      setMessages([{ id: Date.now(), role: 'ai', type: 'text', text: resp.message }])
+    } catch (_) {
+      // Backend genuinely unavailable — neutral placeholder, no workflow assumptions
+      setMessages([{
+        id: Date.now(), role: 'ai', type: 'text',
+        text: `${domainObj.icon} **${category}** selected. Tell me about the environment you're working with and I'll guide you through procurement qualification.`,
+      }])
     }
   }
 
@@ -827,9 +831,10 @@ export default function ChatPage() {
         let sid = sessionId
         // Start a session if we don't have one yet
         if (!sid) {
-          const cat  = detectCategory(userText) || savedCurrentBOM?.category || 'Data Center / COLO'
+          const cat  = detectCategory(userText) || ctx.category || savedCurrentBOM?.category || 'Data Center / COLO'
           const proj = detectProject(userText) || savedCurrentBOM?.project || 'New Project'
-          const startResp = await chatApi.startSession(cat, proj, 'demo_user', savedCurrentBOM || null)
+          const domainPreselected = Boolean(ctx.domainPreselected && ctx.category === cat)
+          const startResp = await chatApi.startSession(cat, proj, 'demo_user', savedCurrentBOM || null, domainPreselected)
           sid = startResp.session_id
           setSessionId(sid)
           localStorage.setItem('chat_session_id', sid)
@@ -875,17 +880,17 @@ export default function ChatPage() {
                   if (/m.?a phase|^phase$/i.test(f))                          updates.ma_phase = v
                   if (/workstream|^category$|domain/i.test(f))                updates.workstream_category = v
                   if (/conveyance|conveying/i.test(f))                        updates.conveyance_status = v
-                  if (/site.*scope|sites in scope|site count|number of site/i.test(f)) updates.site_count = v
-                  if (/user.*site|user.*count|user per site/i.test(f))        updates.user_count = v
+                  if (/site.*scope|sites in scope|site count|number of site|entity|location/i.test(f)) updates.site_entity_scope = v
+                  if (/user.*site|user.*count|user per site|scale|size/i.test(f)) updates.site_classification_size = v
                   if (/required.by|timeline|cutover date/i.test(f))           updates.required_by_date = v
-                  if (/preferred vendor|vendor standard/i.test(f))            updates.vendor_standard = v
-                  if (/criticality|site.*critical|ha\s*pair/i.test(f))        updates.site_criticality = v
+                  if (/preferred vendor|vendor standard/i.test(f))            updates.vendor_standard_preferred = v
+                  if (/criticality|site.*critical|ha\s*pair/i.test(f))        updates.site_classification_criticality = v
                 }
               })
               // Priority 2: heuristic scan for when no table present
               const txt = streamedText.toLowerCase()
-              if (!updates.ma_phase            && /tsa exit|day.?1|full integration|standalone/i.test(txt))         updates.ma_phase = true
-              if (!updates.workstream_category  && /sd.?wan|data center|cybersecurity|end user|m365|network equipment/i.test(txt)) updates.workstream_category = true
+              if (!updates.site_entity_scope          && /\d+\s*site|\d+\s*branch|\d+\s*location/i.test(txt))       updates.site_entity_scope = true
+              if (!updates.vendor_standard_preferred  && /cisco|meraki|palo alto|fortinet|juniper/i.test(txt))       updates.vendor_standard_preferred = true
               if (!updates.site_count           && /\d+\s*site|\d+\s*branch|\d+\s*location/i.test(txt))            updates.site_count = true
               if (!updates.vendor_standard      && /cisco|meraki|palo alto|fortinet|juniper/i.test(txt))            updates.vendor_standard = true
               if (!updates.required_by_date     && /december|january|february|march|q[1-4]\s*20\d\d/i.test(txt))   updates.required_by_date = true

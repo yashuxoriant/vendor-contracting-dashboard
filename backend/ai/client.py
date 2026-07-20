@@ -1,5 +1,3 @@
-import logging
-from typing import List, Dict, Optional, Generator
 """
 AI Client — multi-provider wrapper
 Priority order:
@@ -97,18 +95,4 @@ def call_ai(messages, system, model=None, max_tokens=8192, temperature=0.3):
         return None
 
 
-def stream_ai(messages, system, model=None, max_tokens=8192, temperature=0.3):
-    client, default_model = get_ai_client()
-    if not client:
-        return None
-    use_model = model or default_model
-    def _gen():
-        try:
-            with client.messages.stream(model=use_model, max_tokens=max_tokens,
-                    system=system, messages=messages) as stream:
-                for chunk in stream.text_stream:
-                    yield chunk
-        except Exception as e:
-            logger.error(f'AI stream failed (model={use_model}): {e}')
-            yield '__STREAM_ERROR__'
-    return _gen()
+

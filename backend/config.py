@@ -8,6 +8,9 @@ from pydantic_settings import BaseSettings
 from pydantic import Field
 import os
 
+# Resolve .env relative to this file so it loads regardless of CWD.
+_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables"""
@@ -132,15 +135,17 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = Field(default=60)
     
     class Config:
-        env_file = ".env"
+        env_file = _ENV_FILE
         case_sensitive = False
         extra = "ignore"  # ignore unknown env vars (e.g. SHAREPOINT_DRIVE_PATH)
 
 
-# Global settings instance
-settings = Settings()
+_settings: "Settings | None" = None
 
 
 def get_settings() -> Settings:
-    """Get application settings"""
-    return settings
+    """Get application settings (lazy-init singleton)."""
+    global _settings
+    if _settings is None:
+        _settings = Settings()
+    return _settings
