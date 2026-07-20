@@ -17,9 +17,9 @@ msal==1.26.0
 anthropic>=0.39.0
 langchain==0.1.6
 langchain-community==0.0.19
+langchain-core==0.1.23
 langgraph==0.0.20
 openai>=1.12.0
-langchain-core==1.4.8
 
 # Azure AI Search (BOM embedding pipeline)
 azure-search-documents>=11.4.0
@@ -61,7 +61,7 @@ python-json-logger==2.0.7
 
 # Testing
 pytest==8.0.0
-pytest-asyncio==0.23.4
+pytest-asyncio==0.23.5
 pytest-cov==4.1.0
 pytest-mock==3.12.0
 httpx==0.26.0

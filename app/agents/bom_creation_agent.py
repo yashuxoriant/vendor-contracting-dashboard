@@ -58,24 +58,48 @@ logger = logging.getLogger(__name__)
 
 async def _build_context_node(state: BOMGraphState) -> dict:
     """
-    Load category skill instructions and assemble the LLM message list.
-    Relies on:
-        app.agents.bom_prompt_config.make_prompt_config
-        framework.agents.prompt_builder.build_llm_messages
-        framework.instructions.store.load_skill
+    Load category skill instructions, retrieve relevant reference BOM chunks via
+    vector search (RAG), and assemble the LLM message list.
     """
     from app.agents.bom_prompt_config import make_prompt_config          # noqa: PLC0415
     from framework.agents.prompt_builder import build_llm_messages       # noqa: PLC0415
     from framework.instructions.store import load_skill                  # noqa: PLC0415
 
     session_doc: dict = state["session_doc"]
+    context: dict = session_doc.get("context") or {}
+    agent_state: dict = context.get("agent_state") or {}
+
     category: str = (
         state.get("category")
-        or session_doc.get("context", {}).get("category", "Data Center / COLO")
+        or context.get("category", "Data Center / COLO")
     )
 
     skill_text = load_skill(category)
-    config = make_prompt_config(session_doc, skill_text=skill_text)
+
+    # RAG: retrieve relevant reference BOM chunks from the indexed library.
+    # Runs on every turn — query gets richer as intake fields are filled in.
+    rag_block = ""
+    try:
+        rag_block = await _retrieve_reference_bom_context(
+            session_doc=session_doc,
+            agent_state=agent_state,
+            category=category,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("RAG reference BOM retrieval failed (non-fatal): %s", exc)
+
+    # Detect confirmation message → force immediate BOM JSON output from the LLM
+    _CONFIRM_RE = re.compile(
+        r"^(confirm(ed)?|yes|ok|looks good|generate( bom)?|go ahead|proceed|approved?|send it)$",
+        re.IGNORECASE,
+    )
+    _message: str = state.get("message", "")
+    _force_gen = bool(_CONFIRM_RE.match(_message.strip()))
+
+    config = make_prompt_config(
+        session_doc, skill_text=skill_text, rag_context=rag_block,
+        force_generation=_force_gen,
+    )
     system_prompt, messages = build_llm_messages(config, session_doc)
 
     return {
@@ -83,6 +107,76 @@ async def _build_context_node(state: BOMGraphState) -> dict:
         "system_prompt": system_prompt,
         "messages": messages,
     }
+
+
+async def _retrieve_reference_bom_context(
+    *,
+    session_doc: dict,
+    agent_state: dict,
+    category: str,
+) -> str:
+    """
+    Build a search query from known intake fields + the last user message,
+    call search_bom_context, and render top-k results as a REFERENCE BOMs block.
+    Returns empty string if no results or search service is unavailable.
+    """
+    import asyncio  # noqa: PLC0415
+
+    # Compose query: category + any known intake fields + last user message
+    query_parts: list[str] = [category]
+    for key in ("subcategory", "site_type", "vendor_standard", "triggering_event",
+                "technology_type", "network_environment"):
+        val = agent_state.get(key)
+        if val and isinstance(val, str):
+            query_parts.append(val)
+
+    conversation: list[dict] = session_doc.get("conversation") or []
+    for msg in reversed(conversation[-6:]):
+        if msg.get("role") == "user":
+            query_parts.append(msg.get("content", "")[:300])
+            break
+
+    query = " ".join(query_parts).strip()
+    if not query:
+        return ""
+
+    # Scope to the session's bom_id when the user uploaded a specific reference BOM
+    scoped_bom_id: str | None = (
+        (session_doc.get("context") or {}).get("bom_id") or None
+    )
+
+    loop = asyncio.get_event_loop()
+
+    def _search() -> list:
+        try:
+            from services.search_service import search_bom_context  # noqa: PLC0415
+            return search_bom_context(query=query, top_k=5, bom_id=scoped_bom_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("search_bom_context call failed: %s", exc)
+            return []
+
+    results: list[dict] = await loop.run_in_executor(None, _search)
+    if not results:
+        return ""
+
+    sep = "\u2500" * 50
+    lines = [
+        "\n\n\u2550" * 52,
+        "REFERENCE BOMs \u2014 retrieved from indexed BOM library",
+        "Use these as reference baselines when generating line items.",
+        "Do NOT copy verbatim; adapt quantities and specs to the user\u2019s requirements.",
+        "\u2550" * 52,
+    ]
+    for i, chunk in enumerate(results, 1):
+        lines.append(
+            f"\n[Ref {i}] Source: {chunk.get('filename', 'unknown')} "
+            f"| Category: {chunk.get('category', '')} "
+            f"| Vendor: {chunk.get('vendor', '')} "
+            f"| Score: {chunk.get('score', 0):.3f}\n"
+            f"{sep}\n"
+            f"{chunk.get('chunk_text', '').strip()}"
+        )
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,26 +235,16 @@ def _extract_bom_node(state: BOMGraphState) -> dict:
 
 def _rule_fallback_node(state: BOMGraphState) -> dict:
     """
-    Generate a rule-based response when the LLM returns nothing.
-    Uses BOMOrchestrator._rule_based() — the existing production fallback.
+    Generate a canned response when the LLM returns nothing (empty response or
+    transient error).  This node must never import removed modules — it is
+    self-contained so the graph can always complete a turn even without the LLM.
     """
-    try:
-        from ai.agents.orchestrator import BOMOrchestrator  # noqa: PLC0415
-
-        session_doc: dict = state["session_doc"]
-        category: str = state.get("category", "Data Center / COLO")
-        phase: int = session_doc.get("context", {}).get("current_phase", 1) or 1
-        history: list = session_doc.get("conversation", [])
-        user_turns = sum(1 for m in history if m.get("role") == "user")
-
-        orch = BOMOrchestrator()
-        fallback_text = orch._rule_based(category, phase, state["message"], user_turns)
-    except Exception as exc:
-        logger.warning("Rule-based fallback also failed: %s", exc)
-        fallback_text = (
-            "I'm unable to connect to the AI service right now. "
-            "Please verify your API credentials and try again."
-        )
+    logger.warning("LLM returned empty response; serving canned fallback.")
+    fallback_text = (
+        "I'm having trouble reaching the AI service right now. "
+        "Please check your API credentials and try again. "
+        "If the problem persists, contact your system administrator."
+    )
 
     return {
         "response_text": fallback_text,

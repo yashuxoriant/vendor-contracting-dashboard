@@ -61,21 +61,26 @@ BOM_DEFAULT_STEP_MAP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 BOM_EXTRACTION_DECISION_KEYS: tuple[str, ...] = (
-    "ma_phase",                  # Pre-close / Day 1 / Post-close / Steady-state
-    "workstream_category",       # Data Center / SD-WAN / Cybersecurity / EUC / etc.
-    "triggering_event",          # What is driving this BOM request
-    "site_entity_scope",         # Legal entity / site name(s) in scope
-    "site_classification_type",  # New build / existing DC / co-lo / cloud / hybrid
-    "site_classification_size",  # Small (<50 users) / Medium / Large / Enterprise
-    "site_classification_criticality",  # Mission-critical / Standard / Dev-test
-    "conveyance_status",         # Which assets are conveyed in the deal
-    "asset_lifecycle_status",    # Age, warranty, EOL/EOS flags
-    "required_by_date",          # Hard Day 1 cutover or procurement deadline
-    "vendor_standard_preferred", # Preferred vendor (CDW / SHI / Dell / etc.)
-    "vendor_open_to_competitive",# Whether competitive quotes are acceptable
-    "existing_inventory_ref",    # Reference to existing inventory/BOM if any
-    "requestor",                 # Who is requesting (Buyer IT / Seller IT / SI)
-    "vendor_engagement_required",# True / False — does this need vendor outreach
+    # ── Generic fields — BOMAgent collects these for ALL categories ──────
+    "ma_phase",                   # Pre-close / Day 1 / Post-close / Steady-state
+    "workstream_category",        # Data Center / SD-WAN / Cybersecurity / EUC / etc.
+    "triggering_event",           # What is driving this BOM request
+    "site_entity_scope",          # Legal entity / site name(s) in scope
+    "required_by_date",           # Hard Day 1 cutover or procurement deadline
+    "vendor_standard_preferred",  # Preferred vendor (CDW / SHI / Dell / etc.)
+    "vendor_open_to_competitive", # Whether competitive quotes are acceptable
+    "existing_inventory_ref",     # Reference to existing inventory/BOM if any
+    "requestor",                  # Who is requesting (Buyer IT / Seller IT / SI)
+    "vendor_engagement_required", # True / False — outcome of BOMAgent Step 3 gate
+
+    # ── NOTE: the following fields are intentionally NOT here ────────────
+    # site_classification_type/size/criticality — domain-owned (meaning differs
+    #   per category: Network shared/dedicated ≠ M365 ≠ Cloud ≠ Identity)
+    # asset_lifecycle_status — domain-owned (EOL/EOS assessment is per-layer
+    #   in Network, per-license in M365, per-SKU in EUC, etc.)
+    # conveyance_status — resolved at the layer level by each Skill File;
+    #   BOMAgent Step 3 only needs the binary "does vendor engagement apply?"
+    #   answer, captured above as vendor_engagement_required.
 )
 
 # ---------------------------------------------------------------------------

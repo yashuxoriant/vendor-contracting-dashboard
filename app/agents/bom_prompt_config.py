@@ -34,11 +34,21 @@ import json
 from typing import Any
 
 from framework.agents.prompt_builder import PromptConfig
-from app.memory_config import step_label, missing_decision_keys, BOM_EXTRACTION_DECISION_KEYS
+from app.memory_config import (
+    step_label,
+    missing_decision_keys,
+    BOM_EXTRACTION_DECISION_KEYS,
+    step_index,
+)
 
-# Minimum number of intake fields that must be known before the skill file is
-# injected.  15 total keys; requiring 10 allows up to 5 unknowns (flagged as
-# assumptions) — consistent with BOMAgent.md Step 7 rule.
+# The skill file is injected once BOMAgent has confirmed the category (Step 8).
+# Using the explicit pipeline step instead of a field-count threshold means the
+# trigger is deterministic and category-agnostic — each Skill File then owns its
+# own domain-specific qualification sequence from that point forward.
+_SKILL_INJECTION_STEP: str = "08_category_resolved"
+
+# Kept for backward-compatibility with any callers that import this name.
+# Value reflects the new 10-field generic-only extraction keys.
 INTAKE_SUFFICIENT_FIELDS: int = 10
 
 
@@ -133,9 +143,19 @@ def build_bom_context(loaded_bom: dict[str, Any]) -> str:
 
 
 def is_intake_complete(agent_state: dict) -> bool:
-    """Return True when enough intake fields are known to invoke the skill file."""
-    missing = missing_decision_keys(agent_state)
-    return len(missing) <= (len(BOM_EXTRACTION_DECISION_KEYS) - INTAKE_SUFFICIENT_FIELDS)
+    """
+    Return True when BOMAgent has reached Step 8 (category confirmed), which is
+    the handoff point where the category Skill File takes over.
+
+    Using the pipeline step rather than a field-count threshold keeps this
+    trigger deterministic and avoids coupling it to domain-specific fields
+    that belong to individual Skill Files.
+    """
+    current = agent_state.get("current_step") or "01_ma_phase"
+    try:
+        return step_index(current) >= step_index(_SKILL_INJECTION_STEP)
+    except ValueError:
+        return False
 
 
 def make_session_block(session_doc: dict[str, Any]) -> str:
@@ -155,6 +175,12 @@ def make_session_block(session_doc: dict[str, Any]) -> str:
     project    = (context.get("requirements") or {}).get("project") or "New Project"
     phase      = context.get("current_phase") or 1
 
+    # For this application, Day-1 is the standing business assumption — the user is
+    # always building a BOM for a Day-1 environment. Pre-populate ma_phase so BOMAgent
+    # never asks about M&A phase, TSA exit, or integration phase.
+    if not agent_state.get("ma_phase"):
+        agent_state["ma_phase"] = "Day-1 Readiness"
+
     current_step = agent_state.get("current_step") or "01_ma_phase"
 
     lines: list[str] = [
@@ -163,17 +189,19 @@ def make_session_block(session_doc: dict[str, Any]) -> str:
         f"BOM Pipeline Step: {current_step} — {step_label(current_step)}",
     ]
 
-    # When the domain was pre-selected from the UI picker, Step 2 is already done.
-    # Tell the agent to skip "what category are you in?" and go straight to Step 3.
+    # When the user selected a category from the UI picker, BOMAgent Steps 1-3 are
+    # pre-satisfied (Day-1 assumed, category confirmed, vendor engagement = true).
+    # current_step is set to 08_category_resolved at session creation, so the Skill
+    # file is injected from turn 1. Reinforce this in the context block.
     domain_preselected = context.get("domain_preselected", False)
     if domain_preselected:
         lines.append(
-            f"\nDOMAIN PRE-SELECTED BY USER: '{category}' was chosen from the domain picker before "
-            f"this session started. BOMAgent pipeline steps are adjusted:\n"
-            f"  - Step 1 (M&A Phase): Still required — ask if not yet answered.\n"
-            f"  - Step 2 (Category): ALREADY CONFIRMED = '{category}'. Do NOT ask again.\n"
-            f"  - Step 3+ onward: Proceed with {category}-specific qualification questions.\n"
-            f"Do not ask 'what technology category' or 'what type of BOM' — it is already set."
+            f"\nDOMAIN PRE-SELECTED BY USER — BOMAgent Steps 1-3 are already satisfied:\n"
+            f"  ✓ Step 1 (M&A Phase): Day-1 Readiness (standing business assumption — do NOT ask).\n"
+            f"  ✓ Step 2 (Category): '{category}' confirmed by user selection — do NOT ask again.\n"
+            f"  ✓ Step 3 (Vendor Engagement): True — user is explicitly creating a BOM.\n"
+            f"  → Skill File is active. Follow the Skill File's qualification sequence.\n"
+            f"  → Do NOT ask about M&A phase, TSA exit, integration phase, or BOM category."
         )
 
     # Show collected intake fields so the agent doesn't re-ask answered questions
@@ -233,6 +261,7 @@ def make_prompt_config(
     session_doc: dict[str, Any],
     *,
     skill_text: str = "",
+    rag_context: str = "",
     history_window: int = 14,
     system_as_first_message: bool = False,
     force_generation: bool = False,
@@ -308,21 +337,29 @@ def make_prompt_config(
     if intake_done:
         generation_directive = (
             "\n\n" + "=" * 52 + "\n"
-            "STEP 9 ACTIVATED - BOM GENERATION MODE\n"
+            "STEP 9 ACTIVATED - SKILL FILE HANDOFF\n"
             + "=" * 52 + "\n"
-            "The user has confirmed the intake summary (BOMAgent Step 7 complete).\n"
-            "All qualifying fields are in the INTAKE PACKAGE below.\n\n"
-            "MANDATORY DIRECTIVE (overrides ALL other instructions above):\n"
-            "- Do NOT ask Phase 1, 2, 3, 4, or 5 questions -- already answered.\n"
-            "- Do NOT ask any further intake questions. Generate the BOM now.\n"
-            "- Disregard BOMAgent.md rule 'you do not generate line items' --\n"
-            "  that governs Steps 1-8 only; you are now operating as the Skill File.\n"
-            "- Your FIRST output must be the COMPLETE BOM JSON inside ```json...``` fences.\n"
+            "BOMAgent Steps 1-8 are complete. The category is confirmed.\n"
+            "Control now passes to the Category Skill File.\n\n"
+            "MANDATORY RULES (override all earlier instructions):\n"
+            "- You are now operating as the Skill File, not BOMAgent.\n"
+            "- The INTAKE PACKAGE below contains all generic fields already confirmed.\n"
+            "- Do NOT re-ask: M&A phase, category, triggering event, site scope,\n"
+            "  required-by date, requestor, vendor standard, or vendor engagement status.\n"
+            "- Follow the Skill File's qualification sequence from the beginning,\n"
+            "  starting at the subcategory step (skip any category-confirmation step).\n"
+            "- Ask only the Skill File's domain-specific questions that are not already\n"
+            "  answered by the intake package.\n"
+            "- Select the closest reference BOM BEFORE generating line items.\n"
+            "  State which reference BOM you are using and why.\n"
+            "- Ask only the multiplier inputs that the selected reference BOM requires.\n"
+            "- Output the ```json...``` BOM block only after the Skill File's\n"
+            "  qualification sequence is complete and the user has confirmed.\n"
             "- After the closing ``` fence, write a 4-6 sentence plain-English summary:\n"
-            "  1. What was sized and why  2. Key risks/warnings\n"
+            "  1. What was sized and why  2. Key assumptions and risks\n"
             "  3. Next approval step  4. What would trigger a cycle restart.\n"
-            "IMPORTANT: Output the ```json...``` block FIRST. If you output prose first\n"
-            "without the JSON block, the BOM will not appear in the user's panel."
+            "IMPORTANT: Do not output the BOM JSON prematurely. The Skill File\n"
+            "qualification sequence must run first."
         )
         # Append directive to base_system (highest priority — LLM reads
         # the system prompt top-to-bottom; final instructions dominate)
@@ -330,6 +367,8 @@ def make_prompt_config(
 
     # ── Session block ────────────────────────────────────────────────────
     session_block = make_session_block(session_doc)
+    if rag_context:
+        session_block += rag_context
 
     return PromptConfig(
         base_system=base_system,

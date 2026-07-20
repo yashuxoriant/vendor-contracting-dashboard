@@ -3,6 +3,16 @@ FastAPI Main Application
 Entry point for the IT BOM Creation System backend
 """
 
+import os
+import sys
+
+# ── Ensure project root (parent of backend/) is on sys.path ──────────────
+# Required so that `app.*` and `framework.*` packages resolve correctly when
+# the backend is launched from the backend/ directory.
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware

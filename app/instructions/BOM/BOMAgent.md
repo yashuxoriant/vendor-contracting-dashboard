@@ -98,13 +98,14 @@ Collect the following mandatory generic fields (populate from prior context firs
 | Workstream/Category | From Step 2 |
 | Triggering Event | e.g., TSA exit date, cutover date, new site build, lease expiry |
 | Site/Entity Scope | Which site(s), business unit(s), or entity(ies) this applies to |
-| Site Classification | Shared vs. dedicated; small/medium/large; critical vs. non-critical |
-| Conveyance Status | Conveying / not conveying / unknown (must be resolved — see Step 3) |
-| Asset Lifecycle Status | End-of-life, end-of-support, active, unknown |
+| Vendor Engagement Required | True / False — outcome of Step 3 qualification logic |
 | Timeline / Required-By Date | When the contract or service must be in place |
 | Vendor Standard/Preference | Existing enterprise standard vendor(s) for this category |
+| Open to Competitive Quotes | Whether competitive bids are acceptable alongside the preferred vendor |
 | Existing Inventory Reference | Link or upload of current-state inventory, if available |
 | Requestor / Business Owner | Who is accountable for validating this request |
+
+**Note:** Site classification (shared vs. dedicated, size, criticality), conveyance status at the asset layer, and asset lifecycle status are **not** collected here. These have different meanings across technology categories and are owned by the relevant Skill File. The binary vendor-engagement decision (above) is the only conveyance-adjacent field this agent needs.
 
 ---
 
@@ -162,13 +163,7 @@ Pass the following generic package to the Skill File:
   "workstream_category": "string",
   "triggering_event": "string",
   "site_entity_scope": ["string"],
-  "site_classification": {
-    "type": "shared | dedicated",
-    "size": "small | medium | large",
-    "criticality": "critical | standard"
-  },
-  "conveyance_status": "conveying | not_conveying | unknown_resolved_as_x",
-  "asset_lifecycle_status": "eol | eos | active | unknown_resolved_as_x",
+  "vendor_engagement_required": true,
   "required_by_date": "date",
   "vendor_standard": {
     "preferred_vendors": ["string"],
@@ -176,10 +171,11 @@ Pass the following generic package to the Skill File:
   },
   "existing_inventory_ref": "string | null",
   "assumptions_flagged": ["string"],
-  "requestor": "string",
-  "reference_bom_ref": "string | null"
+  "requestor": "string"
 }
 ```
+
+**Note:** Site classification, conveyance status, and asset lifecycle status are intentionally absent from this package. They are domain-specific concepts whose meaning and valid values differ per category. Each Skill File collects and interprets them independently during its own qualification sequence.
 
 **Rule:** You are only responsible for producing this generic package correctly and completely. The Skill File translates it into category-specific line items, SKUs, quantities, and BOM structure.
 

@@ -52,6 +52,21 @@ def _get_client_and_model():
         from ai.client import get_ai_client  # noqa: PLC0415
         return get_ai_client()
     except ImportError:
+        pass
+
+    # When called from framework/ (project root on sys.path but backend/ not),
+    # add backend/ explicitly so `ai.client` resolves correctly.
+    import os, sys  # noqa: E401
+    _backend = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "backend",
+    )
+    if _backend not in sys.path:
+        sys.path.insert(0, _backend)
+    try:
+        from ai.client import get_ai_client  # noqa: PLC0415
+        return get_ai_client()
+    except ImportError:
         logger.warning("llm_client: backend/ai/client.py not importable; no LLM available")
         return None, None
 
@@ -104,18 +119,22 @@ async def astream_llm(
     loop = asyncio.get_event_loop()
 
     def _produce() -> None:
-        """Blocking producer: streams from Anthropic SDK into the queue."""
+        """Blocking producer: calls Anthropic SDK and puts text into the queue."""
         try:
-            with client.messages.stream(
+            # Use non-streaming create() — compatible with Azure AI Foundry.
+            # Streaming via .stream() can fail on Azure endpoints.
+            r = client.messages.create(
                 model=use_model,
                 max_tokens=max_tokens,
                 system=system,
                 messages=messages,
-            ) as stream:
-                for chunk in stream.text_stream:
-                    chunk_queue.put(chunk)
+            )
+            chunk_queue.put(r.content[0].text)
         except Exception as exc:
-            logger.error("astream_llm producer error: %s", exc)
+            logger.error(
+                "astream_llm producer error (model=%s): %s",
+                use_model, exc, exc_info=True,
+            )
             chunk_queue.put(_STREAM_ERROR_TOKEN)
         finally:
             chunk_queue.put(_SENTINEL)
