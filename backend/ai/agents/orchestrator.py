@@ -50,10 +50,10 @@ class BOMPhase(str, Enum):
 # Fields checked at each phase gate (what must be known before advancing)
 _PHASE_GATES: Dict[BOMPhase, List[str]] = {
     BOMPhase.INTAKE:   [],                                                          # Always enter
-    BOMPhase.QUALIFY:  ["ma_phase", "workstream_category"],                         # Need M&A + category
+    BOMPhase.QUALIFY:  ["workstream_category"],                                     # Need category (ma_phase assumed Day-1)
     BOMPhase.SCOPE:    ["conveyance_status"],                                       # Need conveying decision
     BOMPhase.SIZING:   ["site_count"],                                              # Need site count
-    BOMPhase.GENERATE: ["site_count", "required_by_date"],                         # Need count + date
+    BOMPhase.GENERATE: ["site_count"],                                              # Need count (date optional)
     BOMPhase.VALIDATE: [],                                                          # Auto after generate
     BOMPhase.COMPLETE: [],                                                          # Auto after validate
 }
@@ -258,39 +258,43 @@ def _phase_addendum(phase: BOMPhase, agent_state: Dict) -> str:
     if phase == BOMPhase.INTAKE:
         return (
             "\n\n[CURRENT PHASE: INTAKE]\n"
-            "Ask ONLY these questions — one message, no more:\n"
-            "1. What is the M&A phase? (Day-1 Readiness / TSA Exit / Full Integration)\n"
-            "2. What category? (Data Center/COLO, Network & Telecom, SD-WAN, Cybersecurity, M365, Cloud, EOL)\n"
-            "3. Project name / client name?\n"
-            "Do NOT ask about sites, vendors, or conveyance yet. Collect category first."
+            "ASSUME Day-1 Readiness — do NOT ask M&A phase.\n"
+            "Ask ONLY (in one message):\n"
+            "1. Subcategory: Office/Branch/Manufacturing Site | Colo/Datacenter Hub | Cloud Network Hub?\n"
+            "2. Is infrastructure dedicated or shared (multi-tenant/MSP-owned)?\n"
+            "3. Project/client name (if not already known).\n"
+            "Do NOT ask about vendors, sites, or conveyance yet."
         )
 
     if phase == BOMPhase.QUALIFY:
         cat = known.get("workstream_category", "Network & Telecom")
+        subcategory = known.get("subcategory", "")
         return (
-            f"\n\n[CURRENT PHASE: QUALIFICATION — {cat}]\n"
-            "Apply the Conveying/Shared/Dedicated Decision Tree:\n"
-            "STEP 1: Is the infrastructure shared (multi-tenant / MSP-owned) or dedicated?\n"
-            "  → Shared: buy NET NEW for all layers. Skip to SCOPE.\n"
-            "  → Dedicated: go to STEP 2.\n"
-            "STEP 2: Is dedicated equipment conveying (transferring in deal)?\n"
-            "  → Not conveying: buy NET NEW.\n"
-            "  → Conveying: go to STEP 3.\n"
-            "STEP 3: Is conveying equipment EOL/EOS?\n"
-            "  → EOL/EOS: generate REPLACEMENT bundle.\n"
-            "  → Active: scope = integration only (licenses, maintenance, config changes).\n"
+            f"\n\n[CURRENT PHASE: QUALIFICATION — {cat} / {subcategory}]\n"
+            "Follow the skill's conveying decision tree:\n"
+            "SHARED sites → buy NET NEW for all layers (router, switch, firewall, WAN-CPE, WLAN). Skip to SCOPE.\n"
+            "DEDICATED sites:\n"
+            "  → Is network equipment conveying? (LAN, WLAN, Firewall, WAN-CPE, on-prem WLC, NAC)\n"
+            "    Note: WAN-CPE may be carrier-managed (AT&T) → return to telco, not a purchase.\n"
+            "  → Are circuits conveying?\n"
+            "    Circuit NOT conveying → new circuit order BOM needed.\n"
+            "    Circuit conveying → contract + cutover-day changes via telco.\n"
+            "  → Any EOL/EOS replacements needed?\n"
+            "Typical dedicated-site BOMs: SD-WAN CPE, firewalls, EOL routers/switches/APs.\n"
             f"KNOWN SO FAR: {json.dumps(known, default=str)}"
         )
 
     if phase == BOMPhase.SCOPE:
+        conveyance = known.get("conveyance_status", "unknown")
         return (
-            "\n\n[CURRENT PHASE: SCOPE]\n"
-            "Collect (ask in one message):\n"
-            "1. Number of sites (this is the MULTIPLIER for all quantities)\n"
-            "2. Users per site (controls port density, AP count, firewall sessions)\n"
-            "3. Hard Day-1 cutover date (drives all lead-time warnings)\n"
-            "4. Vendor standard (Cisco / Fortinet / Aruba / Juniper / Palo Alto)\n"
-            "5. Site criticality (critical = HA pair mandatory, standard = HA at firewall only)\n"
+            f"\n\n[CURRENT PHASE: SCOPE — conveyance={conveyance}]\n"
+            "Collect (ask in one message, only what is still unknown):\n"
+            "1. Number of sites — this is the MULTIPLIER for all quantities.\n"
+            "2. Technology/vendor in place — like-for-like or new post-cutover standard?\n"
+            "   Rule: conveying + NOT EOL → keep it, no BOM. Not conveying + standard exists → use standard.\n"
+            "   Pick per layer: LAN switching, wireless, SD-WAN/WAN-CPE, firewall (e.g. Cisco, Meraki, VeloCloud).\n"
+            "   No reference BOM for that technology → say so, offer ~4 typical line items from comparable vendor.\n"
+            "3. Site address + local IT contact (for shipping and smart-hands BOM).\n"
             f"KNOWN SO FAR: {json.dumps(known, default=str)}"
         )
 
@@ -378,6 +382,9 @@ class BOMOrchestrator:
 
         # ── Extract fields deterministically from this message ─────────────
         agent_state = _extract_fields_from_message(message, agent_state)
+        # Assume Day-1 — skill says never ask M&A phase
+        if not agent_state.get("ma_phase"):
+            agent_state["ma_phase"] = "Day-1 Readiness"
         # Use category from session context as ground truth
         if category and not agent_state.get("workstream_category"):
             agent_state["workstream_category"] = category

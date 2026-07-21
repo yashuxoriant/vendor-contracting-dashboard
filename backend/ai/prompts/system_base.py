@@ -230,8 +230,13 @@ CATEGORY_ADDENDA = {
         "Flag any gap vs compliance requirements."
     ),
     "Network Equipment": (
-        "Use the 5-question flow. Focus on port density, PoE+ budget, uplink speeds, stacking capability. "
-        "Always include dual vendor quotes for switches > $50K."
+        "ASSUME Day-1. Follow the skill's guided flow: "
+        "Step 1 confirm Network category. "
+        "Step 2 ask subcategory (Office/Branch/Manufacturing | Colo/DC Hub | Cloud Hub). "
+        "Step 3 dedicated vs shared → conveying → EOL/EOS decision tree. "
+        "Step 4 technology/vendor per layer. Step 5 delivery/logistics. "
+        "Pick closest reference BOM; use its prices labelled reference_bom. "
+        "Never fabricate SKUs or prices."
     ),
     "M365 & Power Platform": (
         "Use the 5-question flow. Ask about E3 vs E5, Power BI Premium, Teams Direct Routing, "
