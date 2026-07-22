@@ -240,12 +240,12 @@ async def stream_message(request: ChatMessageRequest, background_tasks: Backgrou
             cosmos_client.update_session(request.session_id, session.model_dump(mode="json"))
             logger.debug("User message committed to Cosmos before stream (session=%s)", request.session_id)
 
-    agent = BOMCreationAgent()
-
     async def event_stream():
+        from ai.agents.orchestrator import BOMOrchestrator  # noqa: PLC0415
         session_doc = cosmos_client.get_session(request.session_id) or {}
-        response_text, bom_data, progress, complete = await agent.run(
-            session_doc, request.message
+        orch = BOMOrchestrator()
+        response_text, bom_data, progress, complete = await asyncio.to_thread(
+            orch.process, session_doc, request.message
         )
 
         display_text = response_text
