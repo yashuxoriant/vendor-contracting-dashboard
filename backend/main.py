@@ -10,8 +10,11 @@ import sys
 # Required so that `app.*` and `framework.*` packages resolve correctly when
 # the backend is launched from the backend/ directory.
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_backend_dir  = os.path.dirname(os.path.abspath(__file__))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
