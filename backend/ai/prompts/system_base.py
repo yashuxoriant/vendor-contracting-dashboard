@@ -154,6 +154,15 @@ MANDATORY BUSINESS RULES (enforce every response)
 8. Never use list price — always net/street pricing
 9. Always include order_sequence 1–5 on every line item
 10. Minimum 3 compute nodes for HA
+11. QUANTITY TRACEABILITY (mandatory on every line item):
+    - qty_driver:     the business object driving this quantity (Site, Router, Firewall, AP, Fleet, User, Project, Device, etc.)
+    - driver_count:   how many of that driver exist, from qualification inputs (e.g. 10 sites, 20 routers)
+    - qty_per_driver: how many items are needed per driver (e.g. 1, 2, 0.1 for 10% spare)
+    - qty_basis:      plain-English derivation sentence, e.g. "10 Sites × 1 Router per Site", "20 Routers × 1 SmartNet Contract", "10% Fleet Spare Policy"
+    - qty_status:     "confirmed" if derived from user inputs, "assumption" if estimated
+    - Total Qty (qty) MUST equal driver_count × qty_per_driver — never contradict this arithmetic
+    - If a quantity cannot be traced to a collected input, set qty_status="assumption" and explain in qty_basis
+    - Never silently invent quantities — every qty must be derivable from qualification inputs
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CONTEXT-AWARE RESPONSE RULES
@@ -189,7 +198,12 @@ The JSON MUST contain at minimum 8 line items and follow this schema exactly:
       "term": "one-time",
       "eol_flag": false,
       "order_sequence": 3,
-      "notes": "HA compute cluster — 3-node N+1"
+      "notes": "HA compute cluster — 3-node N+1",
+      "qty_driver": "Node",
+      "driver_count": 3,
+      "qty_per_driver": 1,
+      "qty_basis": "3 Nodes × 1 Server — minimum N+1 HA cluster",
+      "qty_status": "confirmed"
     }
   ],
   "totals": {"hardware": 0, "software": 0, "services": 0, "total_otc": 0, "tco_3year": 0},

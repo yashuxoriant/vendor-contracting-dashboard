@@ -11,7 +11,7 @@ import {
   Person, FolderOpen, CloudDone, CloudOff, RateReview, DeleteOutline, Close, AttachFile,
   InsertDriveFile, TableChart, PictureAsPdf, Article,
 } from '@mui/icons-material'
-import { saveBOM, deleteBOM, setCurrentBOM, setActiveBOMForRFQ } from '../store/slices/bomSlice'
+import { saveBOM, deleteBOM, setCurrentBOM, setActiveBOMForRFQ, setBOMList } from '../store/slices/bomSlice'
 import { pushNotification } from '../store/slices/notificationsSlice'
 import { chatApi, bomApi } from '../services/api'
 
@@ -116,7 +116,7 @@ const PROJECTS = ['Panasonic', 'Idemia', 'Tenneco']
 function detectCategory(msg) {
   const m = msg.toLowerCase()
   if (m.match(/data.?cent|colo/)) return 'Data Center / COLO'
-  if (m.match(/sd.?wan|wan|branch/)) return 'SD-WAN'
+  if (m.match(/sd.?wan|wan|branch/)) return 'Network Equipment'
   if (m.match(/cyber|security|siem|edr|firewall|soc/)) return 'Cybersecurity'
   if (m.match(/network equip|switch|router|cisco cat|asr|patch/)) return 'Network Equipment'
   if (m.match(/m365|365|office|teams|sharepoint|power.?bi/)) return 'M365 & Power Platform'
@@ -449,6 +449,12 @@ function backendBOMtoFrontend(backendBOM, projectName) {
     term: item.term || item.unit || 'one-time',
     orderSeq: item.order_sequence || '',
     notes: item.notes || '',
+    // Quantity traceability fields (Sprint 3)
+    qtyDriver:    item.qty_driver    ?? '',
+    driverCount:  item.driver_count  ?? null,
+    qtyPerDriver: item.qty_per_driver ?? null,
+    qtyBasis:     item.qty_basis     ?? '',
+    qtyStatus:    item.qty_status    ?? 'confirmed',
   }))
   const totalValue = lineItems.reduce((s, i) => s + i.extPrice, 0)
   const cat = backendBOM.category || 'Data Center / COLO'
@@ -480,6 +486,12 @@ async function exportBOMExcel(bom, dispatchFn) {
         sku: i.sku || '', qty: i.qty, unit: i.unit, unit_price: i.unitPrice,
         extended_price: i.extPrice, vendor: i.vendor, term: i.term || 'one-time',
         eol_flag: i.status === 'eol_flagged', order_sequence: i.orderSeq || '',
+        // Quantity traceability fields (Sprint 3)
+        qty_driver:     i.qtyDriver    || null,
+        driver_count:   i.driverCount  ?? null,
+        qty_per_driver: i.qtyPerDriver ?? null,
+        qty_basis:      i.qtyBasis     || null,
+        qty_status:     i.qtyStatus    || 'confirmed',
       })),
       totals: { total_otc: bom.totalValue, hardware: 0, software: 0, services: 0, tco_3year: 0 },
       warnings: bom.warnings || [],
@@ -499,7 +511,6 @@ async function exportBOMExcel(bom, dispatchFn) {
 // ── BOM domain options shown in the picker modal ─────────────────────────
 const BOM_DOMAINS = [
   { key: 'Data Center / COLO',    label: 'Data Center / COLO',    icon: '🏢', desc: 'DC builds, colocation, server infra' },
-  { key: 'SD-WAN',                label: 'SD-WAN / WAN',          icon: '🌐', desc: 'SD-WAN edges, MPLS, branch networking' },
   { key: 'Cybersecurity',         label: 'Cybersecurity',         icon: '🔒', desc: 'EDR, SIEM, PAM, Zero Trust, WAF' },
   { key: 'End User Computing',    label: 'End User Computing',    icon: '💻', desc: 'Laptops, VDI, peripherals, EUC fleet' },
   { key: 'M365 & Power Platform', label: 'M365 & Power Platform', icon: '☁️', desc: 'Microsoft 365, Teams, SharePoint' },
@@ -581,6 +592,69 @@ export default function ChatPage() {
         chatApi.getHistory('demo_user', 50)
           .then(sessions => setChatHistory(filterSessions(sessions)))
           .catch(() => {})
+        // Fetch persisted BOMs from Cosmos and merge into Redux so that
+        // AI-created BOMs survive a page refresh or backend restart.
+        bomApi.list({ limit: 100 })
+          .then(resp => {
+            const backendBOMs = (resp?.boms || [])
+            if (!backendBOMs.length) return
+            // Convert backend snake_case BOM → frontend camelCase shape used by Redux
+            // Also restore creatingSessionId from the persistent localStorage bom_session_map
+            const storedSessionMap = JSON.parse(localStorage.getItem('bom_session_map') || '{}')
+            const toFrontend = (b) => {
+              const feId = b.bom_id || b.id || b._id
+              return {
+              id:          feId,
+              name:        b.name || (b.project_name ? `${b.project_name} — ${b.category || ''} BOM` : (b.category || 'BOM')),
+              project:     b.project_name || b.project || '',
+              category:    b.category || '',
+              status:      b.status || 'draft',
+              version:     b.version || 1,
+              createdAt:   b.created_at || new Date().toISOString(),
+              updatedAt:   b.updated_at || b.created_at || new Date().toISOString(),
+              createdBy:   b.created_by || 'AI Agent',
+              totalValue:  b.totals?.total_otc || 0,
+              // Restore the session link from localStorage so the sidebar can reverse-look up BOM name
+              creatingSessionId: storedSessionMap[feId] || null,
+              lineItems:   (b.line_items || []).map((item, i) => ({
+                id:          `li_${feId}_${i}`,
+                lineNo:      item.line_number || i + 1,
+                category:    item.category || '',
+                description: item.description || '',
+                unit:        item.unit || '/unit',
+                qty:         item.quantity || item.qty || 1,
+                unitPrice:   item.unit_price || 0,
+                extPrice:    item.extended_price || 0,
+                vendor:      item.vendor || '',
+                status:      item.eol_flag ? 'eol_flagged' : 'draft',
+                sku:         item.sku || '',
+                term:        item.term || 'one-time',
+              })),
+              warnings:          b.warnings || [],
+              approvalsRequired: ['Buyer IT', 'Seller IT', 'SI Technical Team'],
+              history:           [],
+            }}
+            // Merge backend BOMs into Redux. setBOMList takes a plain array,
+            // so we compute the merge using the current bomList from useSelector.
+            const deletedIds = new Set(JSON.parse(localStorage.getItem('bom_deleted_ids') || '[]'))
+            const existingIds = new Set(bomList.map(b => b.id))
+            const merged = [...bomList]
+            backendBOMs.forEach(b => {
+              const fe = toFrontend(b)
+              if (deletedIds.has(fe.id)) return  // tombstoned — don't resurrect
+              if (!existingIds.has(fe.id)) {
+                merged.push(fe)
+              } else {
+                // Patch the display name when the stored one is just the category
+                const idx = merged.findIndex(x => x.id === fe.id)
+                if (idx >= 0 && fe.name && !merged[idx].name?.includes('—')) {
+                  merged[idx] = { ...merged[idx], name: fe.name, project: fe.project }
+                }
+              }
+            })
+            dispatch(setBOMList(merged))
+          })
+          .catch(() => {})
         // Restore session from localStorage so context persists across page refresh AND tab close
         const savedSid = localStorage.getItem('chat_session_id') || sessionStorage.getItem('chat_session_id')
         if (savedSid) {
@@ -643,8 +717,30 @@ export default function ChatPage() {
   // CONV_CACHE_PREFIX: conversation per sessionId (survives backend restarts)
   // BOM_SESSION_MAP_KEY: stable bomId→sessionId map (survives page refresh +
   //   backend restart so any BOM, including seed BOMs, restores its conversation)
+  // SESSION_LABEL_KEY: sessionId→display label — written on session start and
+  //   updated to the BOM name once a BOM is generated. Most reliable fallback.
   const CONV_CACHE_PREFIX = 'chat_conv_'
   const BOM_SESSION_MAP_KEY = 'bom_session_map'
+  const SESSION_LABEL_KEY = 'session_label_map'
+
+  const saveSessionLabel = (sid, label) => {
+    if (!sid || !label || label === 'New Project') return
+    try {
+      const map = JSON.parse(localStorage.getItem(SESSION_LABEL_KEY) || '{}')
+      // Only upgrade: don't overwrite a specific BOM name with a generic category
+      const existing = map[sid]
+      const isUpgrade = !existing || existing === 'New Project' || label.includes('—')
+      if (isUpgrade) {
+        map[sid] = label
+        localStorage.setItem(SESSION_LABEL_KEY, JSON.stringify(map))
+      }
+    } catch (_) {}
+  }
+  const getSessionLabel = (sid) => {
+    if (!sid) return null
+    try { return JSON.parse(localStorage.getItem(SESSION_LABEL_KEY) || '{}')[sid] || null }
+    catch (_) { return null }
+  }
 
   const saveBOMSession = (bomId, sid) => {
     if (!bomId || !sid) return
@@ -769,6 +865,7 @@ export default function ChatPage() {
       setSessionId(resp.session_id)
       localStorage.setItem('chat_session_id', resp.session_id)
       sessionStorage.setItem('chat_session_id', resp.session_id)
+      saveSessionLabel(resp.session_id, category)  // initial label = category
       setBackendMode(true)
       // Use the backend welcome message — it owns the greeting and first question
       setMessages([{ id: Date.now(), role: 'ai', type: 'text', text: resp.message }])
@@ -839,6 +936,10 @@ export default function ChatPage() {
           setSessionId(sid)
           localStorage.setItem('chat_session_id', sid)
           sessionStorage.setItem('chat_session_id', sid)  // persist for page-refresh resume
+          // Write an initial label so the sidebar shows something better than
+          // "New Project" immediately — will be upgraded to BOM name once generated
+          const initialLabel = (proj !== 'New Project' ? proj + ' — ' : '') + cat
+          saveSessionLabel(sid, initialLabel)
           // Link this new session to the currently loaded BOM (if any) so clicking
           // the BOM in the sidebar later will restore this conversation.
           if (currentBOM?.id) saveBOMSession(currentBOM.id, sid)
@@ -866,6 +967,12 @@ export default function ChatPage() {
             if (finalEvt.agent_state && Object.keys(finalEvt.agent_state).length) {
               // Backend sends authoritative agent_state — use it directly
               setIntakeFields(prev => ({ ...prev, ...finalEvt.agent_state }))
+              // Upgrade the session label if we now know the real project name
+              const stateProj = finalEvt.agent_state.project || finalEvt.agent_state.client_name || ''
+              const stateCat  = finalEvt.agent_state.workstream_category || finalEvt.agent_state.category || ''
+              if (stateProj && stateProj !== 'New Project' && sid) {
+                saveSessionLabel(sid, stateCat ? `${stateProj} \u2014 ${stateCat}` : stateProj)
+              }
             } else if (finalEvt.intake_fields) {
               setIntakeFields(prev => ({ ...prev, ...finalEvt.intake_fields }))
             } else {
@@ -950,6 +1057,9 @@ export default function ChatPage() {
               if (aiBOM && sid) {
                 aiBOM.creatingSessionId = sid
                 saveBOMSession(aiBOM.id, sid)  // persist to localStorage (survives page refresh)
+                // Upgrade the session label to the full BOM name — this is the
+                // most reliable label source and survives hard refresh + backend restart
+                saveSessionLabel(sid, aiBOM.name)
               }
               if (aiBOM) { setLocalBOM(aiBOM); dispatch(setCurrentBOM(aiBOM)) }
             }
@@ -1073,6 +1183,7 @@ export default function ChatPage() {
         setSessionId(sid)
         localStorage.setItem('chat_session_id', sid)
         sessionStorage.setItem('chat_session_id', sid)
+        saveSessionLabel(sid, (proj !== 'New Project' ? proj + ' — ' : '') + cat)
       }
 
       // Use the category the user selected when starting this session
@@ -1119,6 +1230,7 @@ export default function ChatPage() {
           if (aiBOM) {
             aiBOM.creatingSessionId = sid
             saveBOMSession(aiBOM.id, sid)
+            saveSessionLabel(sid, aiBOM.name)  // upgrade label to BOM name
             setLocalBOM(aiBOM)
             dispatch(setCurrentBOM(aiBOM))
             dispatch(saveBOM(aiBOM))
@@ -1241,7 +1353,7 @@ export default function ChatPage() {
           <Button fullWidth variant="contained" size="small" startIcon={<Add sx={{ fontSize: 14 }} />}
             onClick={() => setDomainPickerOpen(true)}
             sx={{ textTransform: 'none', fontSize: '0.72rem', fontWeight: 700, bgcolor: '#D04A02', '&:hover': { bgcolor: '#A33A00' } }}>
-            + New BOM Chat
+            New BOM Chat
           </Button>
         </Box>
 
@@ -1265,15 +1377,44 @@ export default function ChatPage() {
         <Box sx={{ flex: 1, overflowY: 'auto', px: 1, pb: 1 }}>
           {/* Merge chat sessions + saved BOMs into one time-sorted list */}
           {(() => {
-            const chatItems = chatHistory.map(s => ({
-              key: 'chat_' + s.session_id,
-              type: 'chat',
-              label: s.category || s.project || 'Chat Session',
-              sub: s.message_count + ' msgs',
-              date: s.updated_at || '',
-              active: s.session_id === sessionId,
-              raw: s,
-            }))
+            // Build a reverse map: sessionId → BOM, from two sources:
+            //   1. BOMs in Redux that have creatingSessionId set (in-memory + restored from backend load)
+            //   2. localStorage bom_session_map (bomId → sessionId) — invert it
+            const sessionToBOM = {}
+            bomList.forEach(b => { if (b.creatingSessionId) sessionToBOM[b.creatingSessionId] = b })
+            try {
+              const lsMap = JSON.parse(localStorage.getItem('bom_session_map') || '{}')
+              Object.entries(lsMap).forEach(([bomId, sid]) => {
+                if (!sessionToBOM[sid]) {
+                  const bom = bomList.find(b => b.id === bomId)
+                  if (bom) sessionToBOM[sid] = bom
+                }
+              })
+            } catch (_) {}
+
+            const chatItems = chatHistory.map(s => {
+              const linkedBOM = sessionToBOM[s.session_id]
+              // Label priority: 1) BOM name generated in this session (most specific)
+              //                 2) localStorage session_label_map (written on session start + BOM gen)
+              //                 3) backend-derived title (first user message or project+category)
+              //                 4) project from backend session context
+              //                 5) category fallback
+              const label = linkedBOM?.name
+                || getSessionLabel(s.session_id)
+                || (s.title && !s.title.startsWith('New Project') ? s.title : null)
+                || (s.project && s.project !== 'New Project' ? s.project : null)
+                || s.category
+                || 'Chat Session'
+              return {
+                key: 'chat_' + s.session_id,
+                type: 'chat',
+                label,
+                sub: s.message_count + ' msgs',
+                date: s.updated_at || '',
+                active: s.session_id === sessionId,
+                raw: s,
+              }
+            })
             const bomItems = bomList.map(b => ({
               key: 'bom_' + b.id,
               type: 'bom',

@@ -169,6 +169,54 @@ A draft quotation BOM containing:
 Mark the output **DRAFT** — human validation required before sharing with the
 vendor.
 
+### Quantity Traceability (mandatory for every line item)
+
+Every line item **must** include these five quantity fields so the exported BOM
+is self-explanatory without referring back to the conversation:
+
+| Field | Purpose | Example |
+|---|---|---|
+| `qty_driver` | The business object driving this quantity | `"Site"`, `"Router"`, `"Fleet"`, `"AP"`, `"Circuit"`, `"User"` |
+| `driver_count` | How many of that driver exist (from qualification inputs) | `10` (sites), `20` (routers) |
+| `qty_per_driver` | Units required per driver | `1`, `2`, `0.1` (10% spare) |
+| `qty_basis` | Plain-English derivation sentence | `"10 Sites × 1 Router per Site"` |
+| `qty_status` | `"confirmed"` if from user input, `"assumption"` if estimated | `"confirmed"` |
+
+**Rules:**
+- `qty` (Total Qty) **must equal** `driver_count × qty_per_driver` — never contradict.
+- Dependent lines (e.g. license per router, SmartNet per device) must reference the
+  parent count as the driver
+  (e.g. `qty_driver: "Router"`, `driver_count: 20`, `qty_basis: "20 Routers × 1 SmartNet Contract"`).
+- Spares use fractional `qty_per_driver`
+  (e.g. `qty_driver: "Fleet"`, `driver_count: 10`, `qty_per_driver: 0.1`, `qty_basis: "10% Fleet Spare Policy"`).
+- If a quantity cannot be traced to a collected input, set `qty_status: "assumption"`
+  and explain in `qty_basis`. Never silently invent a number.
+
+**Examples by scenario:**
+
+*10 sites, single router:*
+```
+Router:       qty_driver="Site"    driver_count=10  qty_per_driver=1    qty=10  qty_basis="10 Sites × 1 Router per Site"
+DNA License:  qty_driver="Router"  driver_count=10  qty_per_driver=1    qty=10  qty_basis="10 Routers × 1 DNA License per Router"
+SmartNet:     qty_driver="Router"  driver_count=10  qty_per_driver=1    qty=10  qty_basis="10 Routers × 1 SmartNet Contract"
+Smart Hands:  qty_driver="Site"    driver_count=10  qty_per_driver=1    qty=10  qty_basis="10 Sites × 1 Installation Visit"
+```
+
+*10 sites, HA pair:*
+```
+Primary Router:    qty_driver="Site"    driver_count=10  qty_per_driver=1  qty=10  qty_basis="10 Sites × 1 Primary Router"
+Secondary Router:  qty_driver="Site"    driver_count=10  qty_per_driver=1  qty=10  qty_basis="10 Sites × 1 Standby Router (HA)"
+Redundant PSU:     qty_driver="Router"  driver_count=20  qty_per_driver=1  qty=20  qty_basis="20 Routers × 1 Redundant PSU"
+Spare Router:      qty_driver="Fleet"   driver_count=10  qty_per_driver=0.1 qty=1  qty_basis="10% Fleet Spare Policy"
+```
+
+*Tiered sites (3 Small, 3 Medium, 4 Large):*
+```
+Small Router:   qty_driver="Small Site"   driver_count=3  qty_per_driver=1  qty=3  qty_basis="3 Small Sites × 1 Router"
+Medium Router:  qty_driver="Medium Site"  driver_count=3  qty_per_driver=1  qty=3  qty_basis="3 Medium Sites × 1 Router"
+Large Router:   qty_driver="Large Site"   driver_count=4  qty_per_driver=1  qty=4  qty_basis="4 Large Sites × 1 Router"
+```
+
 ---
 
 ## Learning Loop

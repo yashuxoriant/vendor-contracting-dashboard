@@ -96,6 +96,12 @@ class LineItem(BaseModel):
     eol_flag: bool = False                  # True if SKU is end-of-life
     eol_warning: Optional[str] = None       # Human-readable EOL warning
     replacement_sku: Optional[str] = None   # Recommended replacement SKU
+    # Sprint 3 — Quantity traceability (driver-based model)
+    qty_driver:     Optional[str]   = None   # business object driving the qty: Site, Router, Fleet, AP, etc.
+    driver_count:   Optional[float] = None   # count of those driver objects, e.g. 10 (sites), 20 (routers)
+    qty_per_driver: Optional[float] = None   # units required per driver, e.g. 1, 2, 0.1 (10% spare)
+    qty_basis:      Optional[str]   = None   # human-readable derivation: "10 Sites × 1 Router per Site"
+    qty_status:     Optional[str]   = "confirmed"  # "confirmed" | "assumption"
 
 
 class BOMTotals(BaseModel):
@@ -125,6 +131,7 @@ class BOM(BaseModel):
     id: Optional[str] = Field(default=None, alias="_id")
     bom_id: str
     project_name: str
+    name: Optional[str] = None          # display name: "ABB — Network Equipment BOM Rev 1"
     category: str
     region: Optional[str] = None
     country: Optional[str] = None

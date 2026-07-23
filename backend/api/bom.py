@@ -101,6 +101,13 @@ def _normalize_bom_doc(doc: dict) -> dict:
     if not doc.get("project_name"):
         doc["project_name"] = doc.get("name") or doc.get("project") or "Unknown"
 
+    # name: synthesise from project_name + category if absent so the frontend
+    # sidebar always has a meaningful display label after a page refresh.
+    if not doc.get("name"):
+        pname = doc.get("project_name", "")
+        cat   = doc.get("category", "")
+        doc["name"] = f"{pname} — {cat} BOM" if pname and cat else (pname or cat or "BOM")
+
     # created_by: try camelCase alias
     if not doc.get("created_by"):
         doc["created_by"] = doc.get("createdBy") or "unknown"
@@ -215,6 +222,9 @@ async def create_bom(request: BOMCreateRequest):
         # Resolve both camelCase (frontend) and snake_case (backend) field names
         proj  = request.project_name or request.project or request.name or "New Project"
         cat   = request.category or "Data Center / COLO"
+        # Preserve the full display name the LLM generated (e.g. "ABB — Network Equipment BOM Rev 1")
+        # Fall back to synthesising it so it always exists in Cosmos.
+        display_name = request.name or f"{proj} — {cat} BOM"
         items = request.line_items or request.lineItems or []
         by    = request.created_by or request.createdBy or "system"
 
@@ -253,6 +263,7 @@ async def create_bom(request: BOMCreateRequest):
         bom = BOM(
             bom_id=bom_id,
             project_name=proj,
+            name=display_name,
             category=cat,
             line_items=[LineItem(**li) for li in normalised_items],
             totals=totals,
@@ -911,6 +922,32 @@ def _validate_bom_for_export(bom_data: dict) -> list[str]:
                 "vendor_ready requires all BLOCKING assumptions to be resolved."
             )
 
+    # ── 6. Quantity traceability checks ──
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        line_ref = f"Line {item.get('line_number', i + 1)} ({str(item.get('description') or '')[:30]!r})"
+        if not item.get("qty_basis"):
+            issues.append(
+                f"{line_ref}: missing qty_basis — quantity is not traceable to qualification inputs. "
+                "Set qty_status='assumption' and describe the source in qty_basis."
+            )
+        # Validate driver_count × qty_per_driver == qty when both are provided
+        dc  = item.get("driver_count")
+        qpd = item.get("qty_per_driver")
+        qty = item.get("qty") or item.get("quantity")
+        if dc is not None and qpd is not None and qty is not None:
+            try:
+                expected = round(float(dc) * float(qpd), 4)
+                actual   = round(float(qty), 4)
+                if abs(expected - actual) > 0.01:
+                    issues.append(
+                        f"{line_ref}: qty arithmetic mismatch — "
+                        f"driver_count({dc}) × qty_per_driver({qpd}) = {expected} but Total Qty = {actual}."
+                    )
+            except (TypeError, ValueError):
+                pass
+
     return issues
 
 
@@ -947,20 +984,23 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
     center        = Alignment(horizontal="center", vertical="center")
     wrap          = Alignment(wrap_text=True, vertical="top")
 
-    ws.column_dimensions["A"].width = 6
-    ws.column_dimensions["B"].width = 22
-    ws.column_dimensions["C"].width = 40
-    ws.column_dimensions["D"].width = 18
-    ws.column_dimensions["E"].width = 10
-    ws.column_dimensions["F"].width = 12
-    ws.column_dimensions["G"].width = 14
-    ws.column_dimensions["H"].width = 16
-    ws.column_dimensions["I"].width = 8
-    ws.column_dimensions["J"].width = 5
+    ws.column_dimensions["A"].width = 5   # #
+    ws.column_dimensions["B"].width = 20  # Category
+    ws.column_dimensions["C"].width = 38  # Description
+    ws.column_dimensions["D"].width = 18  # SKU
+    ws.column_dimensions["E"].width = 14  # Qty Driver
+    ws.column_dimensions["F"].width = 10  # Driver Count
+    ws.column_dimensions["G"].width = 12  # Qty Per Driver
+    ws.column_dimensions["H"].width = 10  # Total Qty
+    ws.column_dimensions["I"].width = 8   # Unit
+    ws.column_dimensions["J"].width = 14  # Unit Price
+    ws.column_dimensions["K"].width = 15  # Ext Price
+    ws.column_dimensions["L"].width = 10  # Term
+    ws.column_dimensions["M"].width = 36  # Quantity Basis
 
     row = 1
     # ── Title bar ──
-    ws.merge_cells(f"A{row}:J{row}")
+    ws.merge_cells(f"A{row}:M{row}")
     cell = ws[f"A{row}"]
     cell.value = "BILL OF MATERIALS"
     cell.font = Font(name="Calibri", bold=True, color=WHITE, size=14)
@@ -1003,8 +1043,21 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
     row += 1  # blank separator
 
     # ── Column headers ──
-    headers = ["#", "Category", "Description / Specification", "SKU / Part Number",
-               "Qty", "Unit", "Unit Price (USD)", "Ext Price (USD)", "Term", "Order Seq"]
+    headers = [
+        "#",              # A
+        "Category",       # B
+        "Description / Specification",  # C
+        "SKU / Part Number",            # D
+        "Qty Driver",     # E
+        "Driver Count",   # F
+        "Qty Per Driver", # G
+        "Total Qty",      # H
+        "Unit",           # I
+        "Unit Price (USD)",   # J
+        "Ext Price (USD)",    # K
+        "Term",           # L
+        "Quantity Basis", # M
+    ]
     for col_idx, h in enumerate(headers, start=1):
         c = ws.cell(row=row, column=col_idx, value=h)
         c.font = header_font
@@ -1026,32 +1079,47 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
     for i, item in enumerate(raw_items):
         fill = grey_fill if i % 2 == 0 else PatternFill("solid", fgColor=WHITE)
         eol  = bool(_get(item, "eol_flag", False))
-        row_fill = warn_fill if eol else fill
+        assumption = str(_get(item, "qty_status", "confirmed")).lower() == "assumption"
+        row_fill = warn_fill if eol else (PatternFill("solid", fgColor="FEF9C3") if assumption else fill)
+        qty_basis_val    = _get(item, "qty_basis", "")
+        driver_count_val  = _get(item, "driver_count", None)
+        qty_per_driver_val = _get(item, "qty_per_driver", None)
+        # Auto-generate qty_basis from driver_count × qty_per_driver if not provided
+        if not qty_basis_val and driver_count_val is not None and qty_per_driver_val is not None:
+            driver = str(_get(item, "qty_driver", "unit"))
+            desc_short = str(_get(item, "description", ""))[:30]
+            qty_basis_val = f"{driver_count_val} {driver}s × {qty_per_driver_val} — {desc_short}"
         vals = [
-            _get(item, "line_number", i + 1),
-            _get(item, "category", ""),
-            _get(item, "description", ""),
-            _get(item, "sku", ""),
-            _get(item, "qty", 1),
-            _get(item, "unit", "/unit"),
-            _get(item, "unit_price", 0),
-            _get(item, "extended_price", 0),
-            _get(item, "term", "one-time"),
-            _get(item, "order_sequence", ""),
+            _get(item, "line_number", i + 1),    # A — #
+            _get(item, "category", ""),            # B — Category
+            _get(item, "description", ""),         # C — Description
+            _get(item, "sku", ""),                 # D — SKU
+            _get(item, "qty_driver", ""),          # E — Qty Driver
+            driver_count_val,                       # F — Driver Count
+            qty_per_driver_val,                     # G — Qty Per Driver
+            _get(item, "qty", 1),                  # H — Total Qty
+            _get(item, "unit", "/unit"),            # I — Unit
+            _get(item, "unit_price", 0),            # J — Unit Price
+            _get(item, "extended_price", 0),        # K — Ext Price
+            _get(item, "term", "one-time"),         # L — Term
+            qty_basis_val,                           # M — Quantity Basis
         ]
         for col_idx, val in enumerate(vals, start=1):
             c = ws.cell(row=row, column=col_idx, value=val)
             c.font = warn_font if eol else item_font
             c.fill = row_fill
             c.border = thin_border
-            if col_idx in (5,):
+            if col_idx in (6, 7, 8):     # Sites, Qty/Site, Total Qty
                 c.alignment = center
-            if col_idx in (7, 8):
+            if col_idx in (10, 11):      # Unit Price, Ext Price
                 c.number_format = '"$"#,##0.00'
-            if col_idx == 3:
+            if col_idx in (3, 13):       # Description, Qty Basis
                 c.alignment = wrap
         if eol:
             ws.cell(row=row, column=3).value = "⚠ EOL: " + str(_get(item, "description", ""))
+        if assumption and not qty_basis_val:
+            ws.cell(row=row, column=13).value = "⚠ ASSUMPTION — no qualification input recorded"
+            ws.cell(row=row, column=13).font = warn_font
         row += 1
     data_end_row = row - 1  # last line item row (inclusive)
 
@@ -1068,17 +1136,13 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
     tco3      = totals.get("tco_3year", 0) or 0
     tco5      = totals.get("tco_5year", 0) or 0
 
-    # OTC-only rows: SUMIF on column I (term) = "one-time" variants; SUM(H) as cross-check.
-    # Using backend-calculated values (most reliable). Formula in TOTAL OTC acts as
-    # an independent in-spreadsheet verification — it sums the Ext Price column directly.
-    ext_col  = "H"
-    term_col = "I"
-    # Build a SUMIF that counts only OTC terms
-    # Simplest reliable approach: SUM all Ext Price — ARC lines are labelled so reviewer can verify
+    # OTC/ARC SUMIF formulas reference column K (Ext Price) and column L (Term) — updated for 13-col layout.
+    ext_col  = "K"
+    term_col = "L"
     if data_start_row <= data_end_row:
-        hw_formula  = f'=SUMIF({term_col}{data_start_row}:{term_col}{data_end_row},"one-time",{ext_col}{data_start_row}:{ext_col}{data_end_row})'
+        hw_formula        = f'=SUMIF({term_col}{data_start_row}:{term_col}{data_end_row},"one-time",{ext_col}{data_start_row}:{ext_col}{data_end_row})'
         total_otc_formula = f"=SUM({ext_col}{data_start_row}:{ext_col}{data_end_row})"
-        arc_formula = f'=SUMIF({term_col}{data_start_row}:{term_col}{data_end_row},"annual",{ext_col}{data_start_row}:{ext_col}{data_end_row})'
+        arc_formula       = f'=SUMIF({term_col}{data_start_row}:{term_col}{data_end_row},"annual",{ext_col}{data_start_row}:{ext_col}{data_end_row})'
     else:
         hw_formula = total_otc_formula = arc_formula = 0
 
@@ -1093,7 +1157,7 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
 
     row += 1
     # Maturity banner row
-    ws.merge_cells(f"A{row}:J{row}")
+    ws.merge_cells(f"A{row}:M{row}")
     mat_cell = ws[f"A{row}"]
     mat_cell.value = mat_label
     mat_cell.font = Font(name="Calibri", bold=True, color=WHITE, size=11)
@@ -1119,14 +1183,14 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
         lbl_font = Font(name="Calibri", bold=True, color=WHITE, size=11) if is_highlight else total_font
         val_font = Font(name="Calibri", bold=True, color=WHITE if is_highlight else DARK, size=11)
 
-        ws.merge_cells(f"A{row}:F{row}")
+        ws.merge_cells(f"A{row}:I{row}")   # label spans A–I (9 cols)
         c_lbl = ws[f"A{row}"]
         c_lbl.value = label
         c_lbl.font = lbl_font
         c_lbl.fill = lbl_fill
 
-        ws.merge_cells(f"G{row}:H{row}")
-        c_val = ws[f"G{row}"]
+        ws.merge_cells(f"J{row}:M{row}")   # value spans J–M (4 cols)
+        c_val = ws[f"J{row}"]
         c_val.value = val
         c_val.number_format = '"$"#,##0.00'
         c_val.font = val_font
@@ -1136,7 +1200,7 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
     # ── Validation status block ──
     validation_issues = _validate_bom_for_export(bom_data)
     row += 1
-    ws.merge_cells(f"A{row}:J{row}")
+    ws.merge_cells(f"A{row}:M{row}")
     vs_cell = ws[f"A{row}"]
     if validation_issues:
         vs_cell.value = f"VALIDATION: {len(validation_issues)} issue(s) detected — see below"
@@ -1148,7 +1212,7 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
     vs_cell.alignment = center
     row += 1
     for issue in validation_issues:
-        ws.merge_cells(f"A{row}:J{row}")
+        ws.merge_cells(f"A{row}:M{row}")
         ic = ws[f"A{row}"]
         ic.value = "⚑  " + issue
         ic.font = Font(name="Calibri", size=9, color="991B1B", italic=True)
@@ -1157,7 +1221,7 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
 
     # ── Calculation note ──
     row += 1
-    ws.merge_cells(f"A{row}:J{row}")
+    ws.merge_cells(f"A{row}:M{row}")
     note_cell = ws[f"A{row}"]
     note_cell.value = (
         "* All monetary totals are recalculated by the server at export time — LLM values overridden. "
@@ -1177,7 +1241,7 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
         ws[f"A{row}"].font = Font(name="Calibri", bold=True, color=WARN_TEXT, size=10)
         row += 1
         for w in warnings:
-            ws.merge_cells(f"A{row}:J{row}")
+            ws.merge_cells(f"A{row}:M{row}")
             c = ws[f"A{row}"]
             # Handle both new structured format {severity, type, message, ...}
             # and legacy flat strings gracefully
@@ -1197,7 +1261,7 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
 
     # ── Approval sign-off block ──
     row += 1
-    ws.merge_cells(f"A{row}:J{row}")
+    ws.merge_cells(f"A{row}:M{row}")
     ws[f"A{row}"].value = "APPROVAL SIGN-OFF  (all 3 required before BOM is final)"
     ws[f"A{row}"].font = Font(name="Calibri", bold=True, color=WHITE, size=10)
     ws[f"A{row}"].fill = orange_fill
@@ -1214,6 +1278,6 @@ def _build_excel_workbook(bom_data: dict) -> openpyxl.Workbook:
             ws.cell(row=row, column=col).border = thin_border
         row += 1
 
-    ws.freeze_panes = "A13"  # freeze above line items
+    ws.freeze_panes = "A13"  # freeze title + metadata above line items
     ws.title = "BOM"
     return wb

@@ -575,12 +575,13 @@ async def list_chat_history(user_id: str = "demo_user", limit: int = 30):
                 break
         project = ctx.get("requirements", {}).get("project") or ctx.get("project_name")
         category_label = ctx.get("category")
-        # Fallback title: first user message or project+category
+        # Fallback title: first user message, or real project+category (skip placeholder)
+        _real_project = project if (project and project != "New Project") else None
         if not title:
-            if project and category_label:
-                title = f"{project} — {category_label}"
-            elif project:
-                title = project
+            if _real_project and category_label:
+                title = f"{_real_project} \u2014 {category_label}"
+            elif _real_project:
+                title = _real_project
             elif category_label:
                 title = category_label
         result.append(SessionSummary(
