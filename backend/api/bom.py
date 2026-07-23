@@ -117,6 +117,9 @@ def _normalize_bom_doc(doc: dict) -> dict:
     normalized = []
     for item in raw_items:
         item = dict(item)
+        # Field name aliases from older/external Cosmos documents
+        if "line_number" not in item:
+            item["line_number"] = item.get("line", 0)
         if "quantity" not in item:
             item["quantity"] = item.get("qty", 0)
         if "extended_price" not in item:

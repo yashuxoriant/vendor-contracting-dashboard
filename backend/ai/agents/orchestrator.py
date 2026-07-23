@@ -76,11 +76,28 @@ _PHASE_ORDER = [
 ]
 
 
-def _retrieve_bom_context(query: str, bom_id: Optional[str] = None, top_k: int = 5) -> str:
-    """Search indexed BOMs for relevant chunks to inject into the system prompt."""
+def _retrieve_bom_context(
+    query: str,
+    bom_id: Optional[str] = None,
+    top_k: int = 5,
+    category: str = "",
+    vendor: Optional[str] = None,
+) -> str:
+    """Search indexed BOMs for relevant chunks to inject into the system prompt.
+
+    Routes to the category-specific index and narrows by vendor when known,
+    so Cisco queries never pull Juniper or Palo Alto chunks.
+    """
     try:
-        from services.search_service import search_bom_context
-        results = search_bom_context(query=query, top_k=top_k, bom_id=bom_id)
+        from services.search_service import search_bom_context, category_to_index_name
+        index_name = category_to_index_name(category)
+        results = search_bom_context(
+            query=query,
+            top_k=top_k,
+            bom_id=bom_id,
+            index_name=index_name,
+            vendor=vendor,
+        )
         if not results:
             return ""
         lines = [
@@ -392,7 +409,8 @@ class BOMOrchestrator:
         # ── Build system prompt ───────────────────────────────────────
         base_prompt = get_system_prompt(category)
         bom_id = context.get("bom_id")
-        bom_rag = _retrieve_bom_context(message, bom_id=bom_id)
+        vendor = agent_state.get("vendor_standard") or None
+        bom_rag = _retrieve_bom_context(message, bom_id=bom_id, category=category, vendor=vendor)
 
         requirements = context.get("requirements", {})
         project = requirements.get("project", "New Project")

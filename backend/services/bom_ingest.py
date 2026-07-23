@@ -24,7 +24,13 @@ from typing import Any, Dict, Optional
 
 from services.bom_extractor import extract_chunks
 from services.embedding_service import embed_batch
-from services.search_service import BOMChunkDocument, delete_bom_chunks, ensure_index, upsert_chunks
+from services.search_service import (
+    BOMChunkDocument,
+    category_to_index_name,
+    delete_bom_chunks,
+    ensure_index,
+    upsert_chunks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +161,9 @@ def ingest_bom(
     logger.info("BOMIngest: starting | bom_id=%s filename=%s size=%d bytes",
                 bom_id, filename, len(data))
 
+    # Derive the target search index from category (e.g. 'SD-WAN' → 'bom-network')
+    index_name = category_to_index_name(category)
+
     # ── Idempotency: compute content hash and skip if unchanged ────────────────────
     content_hash = hashlib.sha256(data).hexdigest()
 
@@ -190,12 +199,15 @@ def ingest_bom(
     # Step 1 — upload raw to ADLS
     adls_path = _upload_raw_to_adls(data, filename, bom_id)
 
-    # Step 2 — ensure Azure Search index exists (adds sp_file_id/content_hash fields if needed)
-    ensure_index()
+    # Step 2 — ensure the category-specific Azure Search index exists
+    ensure_index(index_name)
 
     # Step 3 — delete stale chunks if this is a re-ingest (content changed)
+    # Use the index_name stored in the previous status doc so we always clean
+    # the right index even if the category was renamed between ingests.
     if existing and existing.get("status") == "indexed":
-        old_count = delete_bom_chunks(bom_id)
+        prev_index = existing.get("index_name") or category_to_index_name(existing.get("category", category))
+        old_count = delete_bom_chunks(bom_id, prev_index)
         logger.info("BOMIngest: removed %d stale chunks for bom_id=%s", old_count, bom_id)
 
     # Step 4 — extract text chunks
@@ -235,9 +247,9 @@ def ingest_bom(
             metadata=chunk_meta,
         ))
 
-    # Step 7 — upsert into search index
+    # Step 7 — upsert into the category-specific search index
     try:
-        upserted = upsert_chunks(docs)
+        upserted = upsert_chunks(docs, index_name)
     except Exception as exc:
         _write_status(bom_id, "failed", detail=f"Search upsert failed: {exc}")
         raise
@@ -249,6 +261,7 @@ def ingest_bom(
         "filename":         filename,
         "vendor":           vendor,
         "category":         category,
+        "index_name":       index_name,   # stored so delete/re-ingest routes to the right index
         "chunks_total":     len(docs),
         "chunks_upserted":  upserted,
         "adls_path":        adls_path,

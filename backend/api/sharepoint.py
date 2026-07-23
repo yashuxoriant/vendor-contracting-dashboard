@@ -5,7 +5,7 @@ GET  /api/sharepoint/files   — list files in a folder
 """
 import logging
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse
@@ -127,6 +127,97 @@ async def upload_to_sharepoint(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"SharePoint upload failed: {exc}",
         )
+
+
+@router.post("/upload/batch")
+async def upload_batch_to_sharepoint(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    folder: str = Form(default="BOMs"),
+    vendor: str = Form(default=""),
+    category: str = Form(default=""),
+):
+    """
+    Upload multiple BOM files to SharePoint and trigger the embedding pipeline for each.
+
+    Returns a summary with per-file success/error and ingest_status_url for polling.
+    Files are processed independently — one failure does not block the others.
+    """
+    sp = get_sharepoint_client()
+    drive_root = sp.drive_path if sp else "PWC_Vendor_Contracting_Hub"
+    effective_folder = (
+        f"{drive_root}/{folder.strip('/')}"
+        if folder and folder not in ("BOMs", "")
+        else drive_root
+    )
+
+    results = []
+    for file in files:
+        effective_bom_id = str(uuid.uuid4())
+        entry: dict = {"filename": file.filename, "bom_id": effective_bom_id}
+        try:
+            ct = file.content_type or "application/octet-stream"
+            if ct not in _ALLOWED_TYPES:
+                entry["success"] = False
+                entry["error"] = f"File type '{ct}' is not allowed."
+                results.append(entry)
+                continue
+
+            content = await file.read()
+            if len(content) > _MAX_BYTES:
+                entry["success"] = False
+                entry["error"] = f"File exceeds 20 MB limit ({len(content) // (1024 * 1024)} MB)."
+                results.append(entry)
+                continue
+
+            if sp is None:
+                # Mock / demo mode
+                logger.info("SharePoint mock batch: would upload '%s'", file.filename)
+                _trigger_ingest(
+                    background_tasks, effective_bom_id, file.filename or "bom.xlsx",
+                    content, vendor, category,
+                    folder_path=effective_folder,
+                    sharepoint_path=f"{effective_folder}/{file.filename}",
+                )
+                entry.update({
+                    "success": True, "mock": True,
+                    "folder": effective_folder,
+                    "web_url": (
+                        f"https://xoriant.sharepoint.com/sites/PWC_Project_Planning_Hub"
+                        f"/Shared%20Documents/{effective_folder}/{file.filename}"
+                    ),
+                    "ingest_status_url": f"/api/ingest/status/{effective_bom_id}",
+                })
+            else:
+                sp_result = sp.upload_file(content, file.filename, folder_path=effective_folder)
+                sp_file_id = sp_result.get("id") or ""
+                _trigger_ingest(
+                    background_tasks, effective_bom_id, file.filename or "bom.xlsx",
+                    content, vendor, category,
+                    sp_file_id=sp_file_id,
+                    folder_path=effective_folder,
+                    sharepoint_path=f"{effective_folder}/{file.filename}",
+                )
+                entry.update({
+                    "success": True, "mock": False,
+                    "ingest_status_url": f"/api/ingest/status/{effective_bom_id}",
+                    **sp_result,
+                })
+        except Exception as exc:
+            logger.error("Batch upload failed for '%s': %s", file.filename, exc)
+            entry["success"] = False
+            entry["error"] = str(exc)
+
+        results.append(entry)
+
+    succeeded = sum(1 for r in results if r.get("success"))
+    return {
+        "total": len(results),
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded,
+        "folder": effective_folder,
+        "results": results,
+    }
 
 
 @router.get("/files")

@@ -114,24 +114,26 @@ async def reingest_bom(
     Re-trigger the ingest pipeline for an already-uploaded BOM.
     Fetches the raw file from ADLS and re-runs extraction + embedding.
     """
-    from services.search_service import delete_bom_chunks
+    from services.bom_ingest import get_ingest_status, ingest_bom_background, _write_status
+    from services.search_service import delete_bom_chunks, category_to_index_name
 
-    # 1. Remove existing indexed chunks
-    deleted = delete_bom_chunks(bom_id)
-    logger.info("reingest_bom: removed %d old chunks for bom_id=%s", deleted, bom_id)
+    # Read status doc first so we can route deletes to the correct index
+    doc = get_ingest_status(bom_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"No ingest record for bom_id={bom_id}")
+
+    # 1. Remove existing indexed chunks from the correct index
+    index_name = doc.get("index_name") or category_to_index_name(doc.get("category", ""))
+    deleted = delete_bom_chunks(bom_id, index_name)
+    logger.info("reingest_bom: removed %d old chunks from '%s' for bom_id=%s",
+                deleted, index_name, bom_id)
 
     # 2. Fetch raw bytes from ADLS
     try:
         from db import get_adls_client
         from config import get_settings
-        from services.bom_ingest import get_ingest_status, ingest_bom_background, _write_status
         adls = get_adls_client()
         settings = get_settings()
-
-        # Read ingest status to get original filename
-        doc = get_ingest_status(bom_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail=f"No ingest record for bom_id={bom_id}")
 
         filename = doc.get("filename", "bom.xlsx")
         vendor   = doc.get("vendor", "")
@@ -186,10 +188,17 @@ async def get_ingest_status_endpoint(bom_id: str):
 
 @router.delete("/bom/{bom_id}")
 async def delete_bom_index(bom_id: str):
-    """Remove all indexed chunks for a BOM from the search index."""
-    from services.search_service import delete_bom_chunks
-    deleted = delete_bom_chunks(bom_id)
-    return {"bom_id": bom_id, "chunks_deleted": deleted}
+    """Remove all indexed chunks for a BOM from its category-specific search index."""
+    from services.search_service import delete_bom_chunks, category_to_index_name
+    from services.bom_ingest import get_ingest_status
+    # Read the stored index_name so we delete from the right index
+    doc = get_ingest_status(bom_id)
+    if doc:
+        index_name = doc.get("index_name") or category_to_index_name(doc.get("category", ""))
+    else:
+        index_name = category_to_index_name("")  # falls back to legacy
+    deleted = delete_bom_chunks(bom_id, index_name)
+    return {"bom_id": bom_id, "chunks_deleted": deleted, "index": index_name}
 
 
 # ── POST /api/ingest/search  (semantic search for testing) ────────────────────
@@ -197,19 +206,40 @@ async def delete_bom_index(bom_id: str):
 @router.post("/search")
 async def search_bom_index(body: Dict[str, Any]):
     """
-    Semantic search over all indexed BOM chunks.
-    Body: { "query": "...", "top_k": 5, "bom_id": null }
+    Semantic search over indexed BOM chunks.
+    Body: {
+      "query": "...",
+      "top_k": 5,
+      "bom_id": null,
+      "category": "Network & Telecom",  // routes to category index
+      "vendor": "Cisco"                 // optional vendor filter for precision
+    }
     """
-    query  = body.get("query", "").strip()
-    top_k  = int(body.get("top_k", 5))
-    bom_id = body.get("bom_id")
+    query    = body.get("query", "").strip()
+    top_k    = int(body.get("top_k", 5))
+    bom_id   = body.get("bom_id")
+    category = body.get("category", "")
+    vendor   = body.get("vendor") or None
 
     if not query:
         raise HTTPException(status_code=400, detail="'query' is required")
 
-    from services.search_service import search_bom_context
-    results = search_bom_context(query=query, top_k=top_k, bom_id=bom_id)
-    return {"query": query, "results": results, "count": len(results)}
+    from services.search_service import search_bom_context, category_to_index_name
+    index_name = category_to_index_name(category)
+    results = search_bom_context(
+        query=query,
+        top_k=top_k,
+        bom_id=bom_id,
+        index_name=index_name,
+        vendor=vendor,
+    )
+    return {
+        "query":         query,
+        "index":         index_name,
+        "vendor_filter": vendor,
+        "results":       results,
+        "count":         len(results),
+    }
 
 
 # ── POST /api/ingest/delta  (manual SharePoint delta trigger) ─────────────────

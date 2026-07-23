@@ -402,54 +402,58 @@ export default function BOMLibraryPage() {
 
   // SharePoint upload state
   const [spUploadOpen, setSpUploadOpen] = useState(false)
-  const [spFile, setSpFile] = useState(null)
+  const [spFiles, setSpFiles] = useState([])            // multi-file array
   const [spVendor, setSpVendor] = useState('')
   const [spCategory, setSpCategory] = useState('')
   const [spUploading, setSpUploading] = useState(false)
-  const [spResult, setSpResult] = useState(null)
-  const [ingestStatus, setIngestStatus] = useState(null)
+  const [spResults, setSpResults] = useState([])        // per-file result array
+  const [ingestStatuses, setIngestStatuses] = useState({}) // { [bomId]: statusDoc }
   const spFileRef = useRef(null)
   const ingestPollRef = useRef(null)
 
-  const pollIngestStatus = (bomId) => {
-    setIngestStatus({ status: 'processing' })
+  const pollIngestStatuses = (bomIds) => {
+    setIngestStatuses(Object.fromEntries(bomIds.map(id => [id, { status: 'processing' }])))
     let attempts = 0
     ingestPollRef.current = setInterval(async () => {
       attempts++
-      try {
-        const r = await fetch('/api/ingest/status/' + bomId)
-        if (r.ok) {
-          const d = await r.json()
-          setIngestStatus(d)
-          if (d.status === 'indexed' || d.status === 'failed' || attempts >= 60) {
-            clearInterval(ingestPollRef.current)
-          }
-        }
-      } catch { /* ignore */ }
+      const updates = {}
+      await Promise.all(bomIds.map(async (bomId) => {
+        try {
+          const r = await fetch('/api/ingest/status/' + bomId)
+          if (r.ok) updates[bomId] = await r.json()
+        } catch { /* ignore */ }
+      }))
+      setIngestStatuses(prev => ({ ...prev, ...updates }))
+      const allDone = Object.values(updates).every(
+        s => s.status === 'indexed' || s.status === 'failed'
+      )
+      if (allDone || attempts >= 60) clearInterval(ingestPollRef.current)
     }, 3000)
   }
 
   useEffect(() => () => clearInterval(ingestPollRef.current), [])
 
   const handleSpUpload = async () => {
-    if (!spFile) return
+    if (!spFiles.length) return
     setSpUploading(true)
-    setSpResult(null)
-    setIngestStatus(null)
+    setSpResults([])
+    setIngestStatuses({})
     try {
       const fd = new FormData()
-      fd.append('file', spFile)
-      // Use the selected category as the SharePoint folder name (e.g. 'SD-WAN', 'Data Center / COLO')
+      // Append all files under the same field name 'files'
+      spFiles.forEach(f => fd.append('files', f))
+      // Use the selected category as the SharePoint folder (e.g. 'SD-WAN', 'Data Center / COLO')
       fd.append('folder', spCategory.trim() || 'BOMs')
       if (spVendor) fd.append('vendor', spVendor)
       if (spCategory) fd.append('category', spCategory)
-      const resp = await fetch('/api/sharepoint/upload', { method: 'POST', body: fd })
+      const resp = await fetch('/api/sharepoint/upload/batch', { method: 'POST', body: fd })
       const data = await resp.json()
       if (!resp.ok) throw new Error(data.detail || 'Upload failed')
-      setSpResult({ ok: true, url: data.web_url, bomId: data.bom_id, folder: data.folder || spCategory || 'BOMs' })
-      if (data.bom_id) pollIngestStatus(data.bom_id)
+      setSpResults(data.results || [])
+      const bomIds = (data.results || []).filter(r => r.success && r.bom_id).map(r => r.bom_id)
+      if (bomIds.length) pollIngestStatuses(bomIds)
     } catch (err) {
-      setSpResult({ ok: false, msg: err.message })
+      setSpResults([{ success: false, filename: 'Batch upload', error: err.message }])
     } finally {
       setSpUploading(false)
     }
@@ -493,7 +497,15 @@ export default function BOMLibraryPage() {
 
   const handleArchive = (id) => dispatch(archiveBOM(id))
 
-  const closeUpload = () => { setSpUploadOpen(false); setSpResult(null); setSpFile(null); setSpVendor(''); setSpCategory('') }
+  const closeUpload = () => {
+    setSpUploadOpen(false)
+    setSpFiles([])
+    setSpResults([])
+    setIngestStatuses({})
+    setSpVendor('')
+    setSpCategory('')
+    clearInterval(ingestPollRef.current)
+  }
 
   return (
     <Box sx={{ p: { xs: 2, md: 3 }, maxWidth: 1400, mx: 'auto' }}>
@@ -635,10 +647,24 @@ export default function BOMLibraryPage() {
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 1 }}>
             <Button variant="outlined" component="label" startIcon={<CloudUpload />}
               sx={{ borderRadius: 2, borderStyle: 'dashed', py: 2, fontSize: '0.8rem', textTransform: 'none' }}>
-              {spFile ? spFile.name : 'Select BOM file (Excel, PDF, CSV, Word)'}
-              <input ref={spFileRef} type="file" hidden accept=".xlsx,.xls,.csv,.pdf,.doc,.docx,.txt"
-                onChange={e => setSpFile(e.target.files[0])} />
+              {spFiles.length === 0
+                ? 'Select BOM files — Excel, PDF, CSV, Word (multi-select supported)'
+                : spFiles.length === 1
+                  ? spFiles[0].name
+                  : `${spFiles.length} files selected`}
+              <input ref={spFileRef} type="file" hidden multiple
+                accept=".xlsx,.xls,.csv,.pdf,.doc,.docx,.txt"
+                onChange={e => setSpFiles([...e.target.files])} />
             </Button>
+            {spFiles.length > 1 && (
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                {spFiles.map((f, i) => (
+                  <Box key={i} sx={{ fontSize: '0.72rem', bgcolor: '#F3F4F6', borderRadius: 1, px: 1, py: 0.25, color: '#374151' }}>
+                    {f.name}
+                  </Box>
+                ))}
+              </Box>
+            )}
             <Box sx={{ display: 'flex', gap: 1.5 }}>
               <TextField size="small" fullWidth label="Category" value={spCategory}
                 onChange={e => setSpCategory(e.target.value)}
@@ -649,25 +675,36 @@ export default function BOMLibraryPage() {
                 onChange={e => setSpVendor(e.target.value)} placeholder="Cisco, Fortinet..."
                 sx={{ '& .MuiOutlinedInput-root': { borderRadius: 2 } }} />
             </Box>
-            {spResult && (
-              <Alert severity={spResult.ok ? 'success' : 'error'} sx={{ fontSize: '0.78rem' }}>
-                {spResult.ok
-                  ? <>Uploaded to <strong>SharePoint/PWC_Vendor_Contracting_Hub/{spResult.folder}</strong>. RAG embedding pipeline started.{spResult.url && <> <a href={spResult.url} target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>View file ↗</a></>}</>
-                  : spResult.msg}
-              </Alert>
-            )}
-            {ingestStatus && (
-              <Alert severity={ingestStatus.status === 'indexed' ? 'success' : ingestStatus.status === 'failed' ? 'error' : 'info'}
-                sx={{ fontSize: '0.78rem' }}>
-                Embedding: {ingestStatus.status}
-                {ingestStatus.chunks_upserted != null ? ' -- ' + ingestStatus.chunks_upserted + ' chunks indexed' : ''}
-              </Alert>
+            {spResults.length > 0 && (
+              <Box sx={{ maxHeight: 180, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+                {spResults.map((r, i) => {
+                  const st = ingestStatuses[r.bom_id]
+                  const embeddingLabel = st
+                    ? st.status === 'indexed'
+                      ? ` · Indexed (${st.chunks_upserted ?? 0} chunks)`
+                      : st.status === 'failed'
+                        ? ' · Embedding failed'
+                        : ' · Embedding…'
+                    : ''
+                  const sev = !r.success ? 'error'
+                    : st?.status === 'failed' ? 'warning'
+                    : st?.status === 'indexed' ? 'success' : 'info'
+                  return (
+                    <Alert key={i} severity={sev} sx={{ fontSize: '0.74rem', py: 0.25 }}>
+                      <strong>{r.filename}</strong>:{' '}
+                      {r.success
+                        ? <>Uploaded{r.web_url && <> · <a href={r.web_url} target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>View ↗</a></>}{embeddingLabel}</>
+                        : r.error}
+                    </Alert>
+                  )
+                })}
+              </Box>
             )}
           </Box>
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
           <Button onClick={closeUpload} sx={{ color: '#6B7280', textTransform: 'none', fontSize: '0.78rem' }}>Cancel</Button>
-          <Button onClick={handleSpUpload} disabled={!spFile || spUploading} variant="contained"
+          <Button onClick={handleSpUpload} disabled={!spFiles.length || spUploading} variant="contained"
             sx={{ bgcolor: '#D04A02', fontWeight: 700, fontSize: '0.78rem', borderRadius: 2, textTransform: 'none',
               '&:hover': { bgcolor: '#B33D00' } }}>
             {spUploading ? <CircularProgress size={15} sx={{ color: '#fff' }} /> : 'Upload & Index'}
