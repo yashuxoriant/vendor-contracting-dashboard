@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 import io
 import json
+import logging
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -24,6 +25,8 @@ except ImportError:
     _EOL_AVAILABLE = False
 
 router = APIRouter(prefix="/api/bom", tags=["bom"])
+
+logger = logging.getLogger(__name__)
 
 
 # Request/Response Models
@@ -67,6 +70,9 @@ class BOMCreateRequest(BaseModel):
     version: Optional[int] = None
     warnings: Optional[List] = None
     approvalsRequired: Optional[List[str]] = None
+    # session link — camelCase (frontend) and snake_case (backend) both accepted
+    session_id: Optional[str] = None
+    creatingSessionId: Optional[str] = None
 
     model_config = {"extra": "ignore"}
 
@@ -141,6 +147,10 @@ def _normalize_bom_doc(doc: dict) -> dict:
         normalized.append(item)
     doc["line_items"] = normalized
 
+    # session_id: preserve so frontend can re-link BOM to its chat session after localStorage clear
+    if not doc.get("session_id"):
+        doc["session_id"] = doc.get("sessionId") or None
+
     return doc
 
 
@@ -180,12 +190,13 @@ async def list_boms(
     limit: int = 50
 ):
     """
-    List BOMs with optional filters
+    List BOMs with optional filters.
+    Returns an empty list (not 500) if Cosmos is unreachable or misconfigured,
+    so the frontend can still load using its local Redux/localStorage state.
     """
     try:
         cosmos_client = get_cosmos_client()
-        
-        # Build query
+
         filters = {}
         if user_id:
             filters["user_id"] = user_id
@@ -193,15 +204,23 @@ async def list_boms(
             filters["category"] = category
         if bom_status:
             filters["status"] = bom_status
-        
-        boms_data = cosmos_client.list_boms(filters, limit)
-        boms = [BOM.model_validate(_normalize_bom_doc(bom)) for bom in boms_data]
-        
-        return BOMListResponse(
-            boms=boms,
-            count=len(boms)
-        )
-        
+
+        # Isolate the Cosmos query so a DB failure returns [] instead of 500
+        try:
+            boms_data = cosmos_client.list_boms(filters, limit)
+        except Exception as db_err:
+            logger.warning("list_boms: Cosmos query failed, returning empty list: %s", db_err)
+            boms_data = []
+
+        boms = []
+        for raw in boms_data:
+            try:
+                boms.append(BOM.model_validate(_normalize_bom_doc(raw)))
+            except Exception as val_err:
+                logger.warning("list_boms: skipping invalid BOM doc (%s): %s", raw.get("bom_id"), val_err)
+
+        return BOMListResponse(boms=boms, count=len(boms))
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -263,6 +282,11 @@ async def create_bom(request: BOMCreateRequest):
             tco_3year=totals_data.get("tco_3year", 0),
         )
 
+        # Preserve the session that generated this BOM — critical for sidebar
+        # deduplication: without this, every page reload after localStorage clear
+        # shows a standalone BOM entry alongside the chat session entry.
+        session_id = request.session_id or request.creatingSessionId or None
+
         bom = BOM(
             bom_id=bom_id,
             project_name=proj,
@@ -274,6 +298,7 @@ async def create_bom(request: BOMCreateRequest):
             notes=request.notes,
             region=request.region,
             country=request.country,
+            session_id=session_id,
         )
         bom_dict = bom.model_dump(mode="json")
         bom_dict["_id"] = bom_id

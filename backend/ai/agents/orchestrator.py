@@ -1,4 +1,4 @@
-﻿"""
+"""
 BOM Orchestrator — Full State Machine (LangGraph-style, no external dependency)
 
 Architecture:
@@ -76,18 +76,353 @@ _PHASE_ORDER = [
 ]
 
 
-def _retrieve_bom_context(
-    query: str,
-    bom_id: Optional[str] = None,
-    top_k: int = 5,
-    category: str = "",
-    vendor: Optional[str] = None,
-) -> str:
-    """Search indexed BOMs for relevant chunks to inject into the system prompt.
+# ── Dependency Model & Validator ────────────────────────────────────────────
 
-    Routes to the category-specific index and narrows by vendor when known,
-    so Cisco queries never pull Juniper or Palo Alto chunks.
+_BOM_DEPENDENCY_RULES: Dict[str, Dict[str, Any]] = {
+    "WAN Router": {
+        "children": ["Software License", "SaaS/Subscription", "Support Contract", "Interface Module", "Transceiver", "Accessories", "Spares"],
+        "mandatory_support": True,
+        "spare_policy": 0.10,
+    },
+    "Firewall": {
+        "children": ["Security License", "Software License", "Support Contract", "Transceiver", "Accessories", "Spares"],
+        "mandatory_support": True,
+        "spare_policy": 0.10,
+    },
+    "LAN Switch": {
+        "children": ["Software License", "Support Contract", "Transceiver", "Accessories", "Spares"],
+        "mandatory_support": True,
+        "spare_policy": 0.10,
+    },
+    "Access Point": {
+        "children": ["Software License", "SaaS/Subscription", "Accessories", "Spares"],
+        "mandatory_support": False,
+        "spare_policy": 0.10,
+    },
+    "Compute": {
+        "children": ["Software License", "Support Contract", "Spares"],
+        "mandatory_support": True,
+        "spare_policy": 0.10,
+    },
+    "Storage": {
+        "children": ["Software License", "Support Contract", "Spares"],
+        "mandatory_support": True,
+        "spare_policy": 0.10,
+    },
+    "Network": {
+        "children": ["Support Contract", "Transceiver", "Accessories", "Spares"],
+        "mandatory_support": True,
+        "spare_policy": 0.10,
+    },
+}
+
+_HARDWARE_CATEGORIES = {
+    "WAN Router", "Firewall", "LAN Switch", "Access Point", "Compute", "Storage", "Network",
+    "Power & Physical", "Interface Module", "Transceiver", "Accessories", "Spares", "WAN Circuit",
+}
+_SOFTWARE_CATEGORIES = {"Software License", "Security License", "SaaS/Subscription"}
+_SERVICE_CATEGORIES = {"Support Contract", "Professional Services", "Managed Services", "Training", "Contingency"}
+
+# ── Scope vocabulary: maps user intent keywords → canonical hardware category names ─────
+# Vendor-agnostic — patterns match procurement concepts, not brand names.
+# Used by both _extract_scope_from_conversation() and _enforce_bom_scope().
+_SCOPE_PATTERNS: List[Tuple[str, str]] = [
+    (r"\bfirewall|ngfw|utm|next.gen.firewall\b",                      "Firewall"),
+    (r"\bwan.router|wan.cpe|branch.router\b",                         "WAN Router"),
+    (r"\bsd.?wan\b",                                                   "WAN Router"),
+    (r"\blan.switch|access.switch|campus.switch|switching\b",         "LAN Switch"),
+    (r"\baccess.point|wireless.ap|\bwlan\b|\bwifi\b",                  "Access Point"),
+    (r"\bserver|compute|blade|rack.server\b",                         "Compute"),
+    (r"\bstorage|san|nas|all.flash|flash.array\b",                    "Storage"),
+    (r"\bcircuit|broadband|mpls|wan.link|internet.link\b",           "WAN Circuit"),
+    (r"\bups|power.distribution|\bpdu\b",                             "Power & Physical"),
+    (r"\brack|cabinet\b",                                              "Power & Physical"),
+]
+
+# Dependency categories — always permitted when their parent hardware is in scope.
+# These are never treated as independent scope additions.
+_DEPENDENCY_CATEGORIES: set = {
+    "Software License", "Security License", "SaaS/Subscription",
+    "Support Contract", "Interface Module", "Transceiver", "Accessories", "Spares",
+}
+
+# Service categories — always kept regardless of hardware scope.
+_ALWAYS_IN_SCOPE_CATEGORIES: set = {
+    "Professional Services", "Managed Services", "Training", "Contingency",
+}
+
+
+def _extract_scope_from_conversation(
+    conversation: List[Dict],
+    agent_state: Dict,
+) -> Dict[str, Any]:
     """
+    Scan all user-role turns in the conversation to determine which hardware
+    categories the user explicitly named.
+
+    Returns:
+        {
+          "requested_categories": set[str],  e.g. {"Firewall"}
+          "scope_explicit":       bool        True when ≥1 layer keyword found
+        }
+
+    Only user turns count — AI response text never sets scope.
+    agent_state["requested_layers"] is used as a seed (accumulated per turn).
+    """
+    requested: set = set(agent_state.get("requested_layers") or [])
+    for turn in conversation:
+        if turn.get("role") != "user":
+            continue
+        text = (turn.get("content") or "").lower()
+        for pattern, category in _SCOPE_PATTERNS:
+            if re.search(pattern, text):
+                requested.add(category)
+    return {
+        "requested_categories": requested,
+        "scope_explicit": len(requested) > 0,
+    }
+
+
+def _enforce_bom_scope(
+    bom: Dict[str, Any],
+    scope: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Deterministic post-AI scope gate.
+
+    Moves hardware line items that fall outside the user's requested scope from
+    line_items[] into optional_recommendations[].  Dependency items (licenses,
+    SmartNet, accessories, spares) follow their parent hardware — they are only
+    moved when their parent was also moved.
+
+    Rules:
+    1. If scope_explicit is False (no layer keyword detected), skip enforcement
+       entirely — safe default when user intent is ambiguous.
+    2. Hardware in requested_categories → stays in line_items[].
+    3. Hardware NOT in requested_categories → moved to optional_recommendations[]
+       with recommendation_type="out_of_scope".
+    4. Dependency items are classified by tracing qty_driver, dependencies[],
+       and description keywords back to their parent hardware category.
+    5. Professional Services, Managed Services, Training, Contingency → always kept.
+
+    Mutates bom in-place.  Returns bom.
+    """
+    if not scope.get("scope_explicit"):
+        return bom
+    requested: set = scope.get("requested_categories", set())
+    if not requested:
+        return bom
+
+    items = bom.get("line_items") or []
+    optional = list(bom.get("optional_recommendations") or [])
+
+    # ── Pass 1: classify hardware items ──────────────────────────────
+    in_scope_hw: set = set()
+    out_of_scope_hw: set = set()
+    for item in items:
+        cat = (item.get("category") or "").strip()
+        ln = item.get("line_number")
+        if cat in _ALWAYS_IN_SCOPE_CATEGORIES or cat in _DEPENDENCY_CATEGORIES:
+            continue  # resolved in pass 2
+        if cat not in _HARDWARE_CATEGORIES:
+            in_scope_hw.add(ln)  # unknown category → keep
+            continue
+        if cat in requested:
+            in_scope_hw.add(ln)
+        else:
+            out_of_scope_hw.add(ln)
+
+    # Build lookup: line_number → category for out-of-scope hardware
+    oos_cats: Dict[int, str] = {
+        item.get("line_number"): (item.get("category") or "")
+        for item in items
+        if item.get("line_number") in out_of_scope_hw
+    }
+
+    # ── Pass 2: classify dependency items by tracing to parent hardware ────
+    in_scope_dep: set = set()
+    out_of_scope_dep: set = set()
+    for item in items:
+        cat = (item.get("category") or "").strip()
+        ln = item.get("line_number")
+        if cat not in _DEPENDENCY_CATEGORIES:
+            continue
+
+        driver = (item.get("qty_driver") or "").strip().lower()
+        dep_lines = item.get("dependencies") or []
+        desc = (item.get("description") or "").lower()
+
+        driver_in = (
+            any(driver in r.lower() or r.lower() in driver for r in requested)
+            if driver else False
+        )
+        deps_in  = any(d in in_scope_hw for d in dep_lines) if dep_lines else False
+        desc_in  = any(
+            re.search(p, desc) for p, c in _SCOPE_PATTERNS if c in requested
+        )
+        driver_out = (
+            any(driver in c.lower() or c.lower() in driver for c in oos_cats.values())
+            if driver else False
+        )
+        deps_out = any(d in out_of_scope_hw for d in dep_lines) if dep_lines else False
+
+        if driver_in or deps_in or desc_in:
+            in_scope_dep.add(ln)
+        elif (driver_out or deps_out) and not driver_in and not deps_in:
+            out_of_scope_dep.add(ln)
+        else:
+            in_scope_dep.add(ln)  # ambiguous → keep
+
+    # ── Pass 3: split line_items ───────────────────────────────────
+    out_all = out_of_scope_hw | out_of_scope_dep
+    kept: List[Dict] = []
+    moved_count = 0
+    for item in items:
+        ln = item.get("line_number")
+        if ln in out_all:
+            optional.append({
+                "description":           item.get("description", ""),
+                "category":              (item.get("category") or "").strip(),
+                "sku":                   item.get("sku", ""),
+                "qty":                   item.get("qty"),
+                "vendor":                item.get("vendor", ""),
+                "estimated_unit_price":  item.get("unit_price"),
+                "recommendation_reason": (
+                    f"Not in requested scope — user specified: "
+                    f"{', '.join(sorted(requested))}. Add explicitly if needed."
+                ),
+                "recommendation_type":   "out_of_scope",
+            })
+            moved_count += 1
+        else:
+            kept.append(item)
+
+    if moved_count:
+        bom.setdefault("warnings", [])
+        bom["warnings"].append(
+            f"ℹ️ Scope filter: {moved_count} line item(s) moved to Optional Recommendations "
+            f"— outside requested scope ({', '.join(sorted(requested))})."
+        )
+        logger.info(
+            "ScopeEnforcer: moved %d items to optional_recommendations (requested=%s)",
+            moved_count, sorted(requested),
+        )
+
+    bom["line_items"] = kept
+    bom["optional_recommendations"] = optional
+    return bom
+
+
+def _validate_bom_dependencies(bom: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Deterministic post-processing pass for LLM-generated BOM JSON.
+    Ensures quantity/price/totals consistency and emits warnings for orphan or missing dependencies.
+    """
+    items = bom.get("line_items") or []
+    warnings = list(bom.get("warnings") or [])
+    if not items:
+        bom["warnings"] = warnings
+        return bom, warnings
+
+    # 1) Recompute line extended prices and normalise qty
+    for item in items:
+        qty = item.get("qty") or item.get("quantity") or 1
+        try:
+            qty = float(qty)
+        except (TypeError, ValueError):
+            qty = 1.0
+        up = item.get("unit_price") or 0
+        try:
+            up = float(up)
+        except (TypeError, ValueError):
+            up = 0.0
+        item["qty"] = qty
+        item["quantity"] = qty
+        item["unit_price"] = up
+        item["extended_price"] = round(qty * up, 2)
+        item["ext_price"] = item["extended_price"]
+
+    # 2) Build parent indices and enrich dependencies[]
+    parent_lines: Dict[str, List[int]] = {}
+    for item in items:
+        cat = (item.get("category") or "").strip()
+        if cat in _BOM_DEPENDENCY_RULES:
+            parent_lines.setdefault(cat, []).append(int(item.get("line_number") or 0))
+
+    for item in items:
+        deps = item.get("dependencies")
+        if not isinstance(deps, list):
+            deps = []
+        cat = (item.get("category") or "").strip()
+        driver = (item.get("qty_driver") or "").strip().lower()
+        if cat not in _BOM_DEPENDENCY_RULES and not deps and driver:
+            for pcat, lines in parent_lines.items():
+                pcat_l = pcat.lower()
+                if driver in pcat_l or pcat_l in driver:
+                    deps = lines
+                    break
+        item["dependencies"] = deps
+
+    # 3) Orphan / mandatory dependency warnings
+    hardware_present = {((item.get("category") or "").strip()) for item in items if (item.get("category") or "").strip() in _BOM_DEPENDENCY_RULES}
+
+    for item in items:
+        cat = (item.get("category") or "").strip()
+        if cat in {"Software License", "Security License", "SaaS/Subscription", "Support Contract"}:
+            if not item.get("dependencies") and not item.get("qty_driver"):
+                warnings.append(
+                    f"⚠️ Dependency warning: '{item.get('description','')}' (line {item.get('line_number')}) has no traceable hardware parent."
+                )
+
+    for pcat in hardware_present:
+        rule = _BOM_DEPENDENCY_RULES.get(pcat, {})
+        if not rule.get("mandatory_support"):
+            continue
+        covered = False
+        for item in items:
+            if (item.get("category") or "") != "Support Contract":
+                continue
+            text = f"{item.get('description','')} {item.get('qty_driver','')}".lower()
+            if pcat.lower() in text or "router" in text and "router" in pcat.lower() or "firewall" in text and "firewall" in pcat.lower() or "switch" in text and "switch" in pcat.lower():
+                covered = True
+                break
+        if not covered:
+            warnings.append(
+                f"⚠️ Missing mandatory support: hardware category '{pcat}' has no matching support contract line."
+            )
+
+    # 4) Recompute totals deterministically
+    hw = sw = svc = 0.0
+    for item in items:
+        ep = float(item.get("extended_price") or 0)
+        cat = (item.get("category") or "").strip()
+        if cat in _SOFTWARE_CATEGORIES:
+            sw += ep
+        elif cat in _SERVICE_CATEGORIES:
+            svc += ep
+        else:
+            hw += ep
+
+    computed_total = round(hw + sw + svc, 2)
+    prior_total = float((bom.get("totals") or {}).get("total_otc") or 0)
+    if prior_total and abs(prior_total - computed_total) > 0.5:
+        warnings.append(
+            f"⚠️ Total corrected: previous total_otc ${prior_total:,.0f} did not match line-item sum ${computed_total:,.0f}."
+        )
+
+    totals = dict(bom.get("totals") or {})
+    totals["hardware"] = round(hw, 2)
+    totals["software"] = round(sw, 2)
+    totals["services"] = round(svc, 2)
+    totals["total_otc"] = computed_total
+    totals["tco_3year"] = totals.get("tco_3year") or round(computed_total * 1.4, 2)
+    bom["totals"] = totals
+    bom["warnings"] = warnings
+    return bom, warnings
+
+
+def _retrieve_bom_context(query: str, bom_id: Optional[str] = None, top_k: int = 5) -> str:
+    """Search indexed BOMs for relevant chunks to inject into the system prompt."""
     try:
         from services.search_service import search_bom_context, category_to_index_name
         index_name = category_to_index_name(category)
@@ -208,6 +543,50 @@ def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
         elif re.search(r"\bstandard\b|\bnon.critical\b|\boffice\b|\bbranch\b", m):
             agent_state["site_criticality"] = "standard"
 
+    # New WAN circuits required — distinct from hardware procurement
+    if not agent_state.get("new_circuits_needed"):
+        if re.search(
+            r"new circuit|order circuit|procure circuit|circuit.required|circuit.needed"
+            r"|new.*wan.*circuit|wan.*circuit.*new|broadband.*required|new.*broadband"
+            r"|need.*circuit|circuits.*procure",
+            m,
+        ):
+            agent_state["new_circuits_needed"] = True
+
+    # Hardware (CPE / SD-WAN / WAN layer) explicitly conveying
+    if not agent_state.get("hardware_conveying"):
+        if re.search(
+            r"(?:cpe|router|hardware|equipment|sd.wan|wan.cpe).*convey"
+            r"|convey.*(?:cpe|router|hardware|equipment|sd.wan|wan.cpe)"
+            r"|existing.*cisco.*convey|convey.*existing.*cisco",
+            m,
+        ):
+            agent_state["hardware_conveying"] = True
+        # Also set when conveyance_status is conveying_active and category contains SD-WAN/Network
+        elif agent_state.get("conveyance_status") == "conveying_active":
+            agent_state["hardware_conveying"] = True
+
+    # EOL replacement explicitly needed
+    if not agent_state.get("eol_replacement_needed"):
+        if re.search(
+            r"eol|end.of.life|eos|end.of.support|needs.replacement|replace.*hardware"
+            r"|hardware.*replace|outdated",
+            m,
+        ):
+            agent_state["eol_replacement_needed"] = True
+        elif agent_state.get("conveyance_status") == "conveying_eol":
+            agent_state["eol_replacement_needed"] = True
+
+    # No other network layers to procure (switches, APs, firewalls)
+    if not agent_state.get("no_other_layers"):
+        if re.search(
+            r"no other|no lan|no ap|no firewall|no switch|no access.point"
+            r"|circuits.only|only.circuits|just.circuits"
+            r"|nothing.else|no.additional.hardware|no.other.hardware",
+            m,
+        ):
+            agent_state["no_other_layers"] = True
+
     # Project / client name — "for Panasonic", "client: Honeywell", "project Falcon"
     if not agent_state.get("project_name"):
         pm = re.search(
@@ -222,7 +601,40 @@ def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
             if candidate.lower() not in _FALSE_POSITIVES:
                 agent_state["project_name"] = candidate
 
+    # Accumulate explicitly requested hardware layers across turns.
+    # Stored in agent_state so scope persists through the full conversation.
+    existing_layers: set = set(agent_state.get("requested_layers") or [])
+    for pattern, category in _SCOPE_PATTERNS:
+        if re.search(pattern, m):
+            existing_layers.add(category)
+    if existing_layers:
+        agent_state["requested_layers"] = sorted(existing_layers)
+
     return agent_state
+
+
+def _is_change_request(message: str) -> bool:
+    """Return True when the user asks to modify an already-generated BOM."""
+    m = message.lower()
+    return bool(re.search(
+        r"remove|don.t need|not needed|only need|update|change|replace"
+        r"|add |without|skip|exclude|drop|revise|rebuild|regenerate"
+        r"|redo|re-generate|re-build|also not needed|we don|we do not"
+        r"|scratch that|forget the|take out|leave out|modify",
+        m,
+    ))
+
+
+def _is_regen_confirmation(message: str) -> bool:
+    """Return True when the user confirms generating the revised BOM now."""
+    m = message.lower().strip()
+    return bool(re.search(
+        r"^(yes|yep|yeah|confirm|confirmed|proceed|go ahead|do it|generate|regenerate|"
+        r"create|build|apply|submit|ok|okay)\b"
+        r"|\b(generate|regenerate|create|build).*(now|bom)\b"
+        r"|\b(go ahead|proceed)\b",
+        m,
+    ))
 
 
 def _detect_phase_transition(
@@ -240,6 +652,9 @@ def _detect_phase_transition(
       4. Stay in current phase
     """
     if bom_found:
+        # If we were already post-generation, this is a revision pass.
+        if current_phase in (BOMPhase.VALIDATE, BOMPhase.COMPLETE):
+            return BOMPhase.COMPLETE
         return BOMPhase.VALIDATE
 
     # Check if all gates for NEXT phase are met
@@ -333,12 +748,119 @@ def _phase_addendum(phase: BOMPhase, agent_state: Dict) -> str:
         vendor = known.get("vendor_standard", "Cisco")
         sites = known.get("site_count", 1)
         criticality = known.get("site_criticality", "standard")
+        hardware_conveying = known.get("hardware_conveying", False)
+        eol_needed = known.get("eol_replacement_needed", False)
+        new_circuits = known.get("new_circuits_needed", False)
+        # Also honour conveyance_status if hardware_conveying wasn't set explicitly
+        if not hardware_conveying and known.get("conveyance_status") == "conveying_active":
+            hardware_conveying = True
+        if not eol_needed and known.get("conveyance_status") == "conveying_eol":
+            eol_needed = True
+
+        # ── CONVEYANCE GUARD ──────────────────────────────────────────────────
+        # When hardware is conveying AND not EOL, NO hardware should be procured.
+        # Only WAN circuits (if new_circuits_needed) or minimal integration services.
+        if hardware_conveying and not eol_needed:
+            if new_circuits:
+                return (
+                    f"\n\n[CURRENT PHASE: BOM GENERATION — WAN CIRCUITS ONLY — {sites} sites]\n"
+                    "⚠️  CONVEYANCE GUARD ACTIVE: Existing hardware (SD-WAN CPE, routers, licenses,"
+                    " controllers) is CONVEYING and NOT EOL. This is confirmed by the qualification answers.\n\n"
+                    "DO NOT generate any of the following — they already exist:\n"
+                    "  ✗ Router / WAN-CPE chassis\n"
+                    "  ✗ IOS XE / SD-WAN software licenses\n"
+                    "  ✗ DNA / vManage / Catalyst Center subscriptions\n"
+                    "  ✗ SmartNet / maintenance contracts for conveyed hardware\n"
+                    "  ✗ NIM modules, SFP transceivers, rack kits, cable kits\n"
+                    "  ✗ Spare routers or spare PSUs\n"
+                    "  ✗ Deployment professional services for conveyed equipment\n\n"
+                    f"GENERATE ONLY WAN circuit procurement for {sites} sites (carrier: open/competitive):\n"
+                    f"  1. Broadband Internet Circuit      qty_driver=Site  driver_count={sites}  qty_per_driver=1\n"
+                    f"  2. Circuit Installation Charge     qty_driver=Site  driver_count={sites}  qty_per_driver=1\n"
+                    f"  3. Carrier Activation Fee          qty_driver=Site  driver_count={sites}  qty_per_driver=1\n"
+                    f"  4. ISP Router/CPE (carrier-managed) qty_driver=Site driver_count={sites}  qty_per_driver=1  (if carrier-provided)\n"
+                    f"  5. Project Management              qty_driver=Project  driver_count=1\n"
+                    f"  6. Implementation Support          qty_driver=Project  driver_count=1\n"
+                    f"  7. Contingency (10%)               qty_driver=Project  driver_count=1\n\n"
+                    "Output ONLY valid JSON inside ```json...``` fences.\n"
+                    "Each line item MUST include qty_driver, driver_count, qty_per_driver, qty_basis, qty_status.\n"
+                    f"KNOWN SO FAR: {json.dumps(known, default=str)}"
+                )
+            else:
+                return (
+                    f"\n\n[CURRENT PHASE: BOM GENERATION — INTEGRATION SERVICES ONLY — {sites} sites]\n"
+                    "⚠️  CONVEYANCE GUARD ACTIVE: All equipment is conveying and NOT EOL."
+                    " No circuits and no new hardware are required.\n\n"
+                    "DO NOT generate hardware, licenses, SmartNet, or circuit line items.\n"
+                    "Generate ONLY minimal integration/transition services (if applicable):\n"
+                    "  - Cutover coordination / change management\n"
+                    "  - Contract transfer management (carrier, maintenance reassignment)\n"
+                    "  - Project management (optional)\n"
+                    "If there is genuinely nothing to procure, output a BOM with a single\n"
+                    "'No procurement required — all equipment conveying' informational line.\n\n"
+                    "Output ONLY valid JSON inside ```json...``` fences.\n"
+                    f"KNOWN SO FAR: {json.dumps(known, default=str)}"
+                )
+        # ── STANDARD HARDWARE GENERATION ────────────────────────────────────
+        # When triggered by a confirmed change request, inject full dependency-analysis header.
+        pending_change = known.get("pending_change_request", "")
+        if pending_change:
+            snapshot = known.get("current_bom_snapshot") or {}
+            snapshot_text = json.dumps(snapshot, default=str)
+            return (
+                f"\n\n[CURRENT PHASE: BOM REVISION — DEPENDENCY-AWARE REGENERATION — {vendor}, {sites} sites, {criticality}]\n"
+                f"CONFIRMED CHANGE REQUEST: \"{pending_change}\"\n\n"
+                "CURRENT BOM SNAPSHOT (source of truth for revision):\n"
+                f"{snapshot_text}\n\n"
+                "MANDATORY — perform these steps IN ORDER before emitting JSON:\n\n"
+                "STEP 1 — IMPACT ANALYSIS\n"
+                "  For every directly modified item, identify ALL dependent items:\n"
+                "  • Hardware chassis → licenses, subscriptions, SmartNet, accessories, HA peer, spares\n"
+                "  • Quantity change → cascade qty = new_count × qty_per_driver to ALL dependent lines\n"
+                "  • Removal → remove chassis AND every line whose qty_driver is that hardware\n"
+                "  • Addition → add chassis AND generate full bundle (license + SmartNet + accessories)\n"
+                "  • Spares kit → recalculate as 10% of the NEW hardware fleet count\n\n"
+                "STEP 2 — RECALCULATE QUANTITIES & PRICES\n"
+                "  • extended_price = qty × unit_price — recalculate for every changed line\n"
+                "  • Recompute totals: hardware, software, services, total_otc, tco_3year\n"
+                "  • Update qty_basis with the new derivation sentence\n\n"
+                "STEP 3 — CONSISTENCY VALIDATION\n"
+                "  • Every hardware unit must have a support/maintenance line\n"
+                "  • No orphaned licenses or contracts for removed hardware\n"
+                "  • No stale quantities from the pre-revision BOM\n"
+                "  • Increment revision number by 1\n\n"
+                "STEP 4 — EMIT REVISED BOM JSON + CHANGE SUMMARY\n"
+                "  Output valid JSON inside ```json...``` fences FIRST.\n"
+                "  After JSON, summarise: lines removed | lines added | lines recalculated\n"
+                "  Flag any new warnings (HA incomplete, spares below 10%, lead-time risk).\n"
+                "  SCOPE DISCIPLINE: only add new items the user explicitly requested —\n"
+                "  surface any unrequested additions in optional_recommendations[] instead.\n\n"
+                "Each line item MUST include: qty_driver, driver_count, qty_per_driver,\n"
+                "qty_basis, qty_status, quantity_basis, ha_role (if HA pair), price_basis, order_sequence.\n"
+                f"KNOWN SO FAR: {json.dumps(known, default=str)}"
+            )
         return (
             f"\n\n[CURRENT PHASE: BOM GENERATION — {vendor}, {sites} sites, {criticality}]\n"
-            "EXPAND EVERY COMPONENT TO ITS FULL SKU BUNDLE NOW.\n"
-            "Rule: A single hardware line is ALWAYS wrong. Every component expands to:\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "SCOPE DISCIPLINE — READ BEFORE GENERATING\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Include in line_items[] ONLY the hardware/software layers the user\n"
+            "explicitly requested in the conversation. Do NOT add extra layers.\n"
+            "  ✗ If user asked for firewalls only → no routers, no switches, no APs\n"
+            "  ✗ If user asked for SD-WAN CPE only → no firewalls, no LAN switches\n"
+            "  ✗ If user asked for EDR only → no SIEM, no PAM, no email security\n"
+            "  ✗ Do NOT add FortiManager, FortiAnalyzer, vManage, Catalyst Center,\n"
+            "    or any management/orchestration platform unless the user named it\n"
+            "Mandatory dependencies of REQUESTED hardware ARE allowed in line_items[]:\n"
+            "  ✓ Support contract (SmartNet/FortiCare) per requested hardware unit\n"
+            "  ✓ Software license required to operate the requested hardware\n"
+            "  ✓ Physical accessories (rack kit, cables, SFPs) per requested unit\n"
+            "  ✓ Spares kit (10% of requested fleet)\n"
+            "Any additional items you think are useful → put in optional_recommendations[]\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "EXPAND EVERY REQUESTED COMPONENT TO ITS FULL SKU BUNDLE:\n"
             "  Router  → 8 lines  (chassis + IOS + DNA subscription + SmartNet + WAN NIM + SFP + cables + rack kit)\n"
-            "  Firewall → 10 lines (appliance + IPS + URL + SSL + AMP + HA peer + support + rack + SFPs + PS)\n"
+            "  Firewall → 10 lines (appliance + IPS + URL + SSL + AMP + HA peer + support + rack + SFPs)\n"
             "  Switch  → 5 lines  (chassis + license + stacking + SmartNet + SFP uplinks)\n"
             "  AP      → 4 lines  (unit + PoE injector + cloud license + mounting)\n"
             "Output ONLY valid JSON inside ```json...``` fences.\n"
@@ -357,6 +879,39 @@ def _phase_addendum(phase: BOMPhase, agent_state: Dict) -> str:
             "4. Lead-time warnings: flag MPLS (12-20wk), switching (16-26wk), firewalls (8-16wk)\n"
             "5. Dual-quote flag: any line item >$50K needs two vendor quotes\n"
             "After validation, output the FINAL BOM JSON with all warnings populated.\n"
+        )
+
+    if phase == BOMPhase.COMPLETE:
+        known_json = json.dumps(known, default=str)
+        pending = known.get("pending_bom_regen", False)
+        pending_msg = known.get("pending_change_request", "")
+        if pending:
+            return (
+                "\n\n[CURRENT PHASE: POST-BOM EDIT CONFIRMATION]\n"
+                "A change request has been captured and must be confirmed before regenerating BOM JSON.\n\n"
+                "For this turn, do NOT emit JSON.\n"
+                "1. Acknowledge the requested changes in 1-2 lines.\n"
+                "2. Briefly state which dependent items will also be affected (e.g. removing a router\n"
+                "   will also remove its license, SmartNet, accessories, and spare entry).\n"
+                "3. Ask exactly one confirmation question:\n"
+                "   'I've applied the dependency impact analysis. Would you like me to generate the\n"
+                "    updated BOM now, or would you like to make any additional changes first?'\n"
+                "4. Do NOT emit BOM JSON on this turn — wait for user confirmation.\n\n"
+                f"PENDING CHANGE REQUEST: {pending_msg}\n"
+                f"KNOWN SO FAR: {known_json}"
+            )
+        return (
+            "\n\n[CURRENT PHASE: POST-BOM Q&A / EDIT MODE]\n"
+            "A BOM has already been generated for this session.\n\n"
+            "RULES:\n"
+            "1. If the user asks a QUESTION (why a line item exists, pricing basis, etc.), answer directly.\n"
+            "   Do NOT regenerate the BOM for question-only turns.\n\n"
+            "2. If the user requests a CHANGE (remove/add/update/replace/not needed/only need),\n"
+            "   acknowledge the requested changes and ask for confirmation before BOM regeneration.\n"
+            "   Do NOT output revised BOM JSON until the user confirms generate/regenerate.\n\n"
+            "3. Do NOT restart qualification or ask initial intake questions again.\n"
+            "   Use the existing session context and current BOM as source of truth.\n\n"
+            f"KNOWN SO FAR: {known_json}"
         )
 
     return ""
@@ -405,6 +960,25 @@ class BOMOrchestrator:
         # Use category from session context as ground truth
         if category and not agent_state.get("workstream_category"):
             agent_state["workstream_category"] = category
+
+        # Post-BOM edit flow (2-step):
+        # 1) capture change request and ask for confirmation (no regenerate yet)
+        # 2) regenerate only after explicit confirmation
+        if current_phase in (BOMPhase.VALIDATE, BOMPhase.COMPLETE):
+            if _is_change_request(message) and not _is_regen_confirmation(message):
+                agent_state["pending_bom_regen"] = True
+                agent_state["pending_change_request"] = message.strip()
+                current_phase = BOMPhase.COMPLETE
+                logger.info(
+                    "Orchestrator: change request captured in phase=%s, awaiting confirmation",
+                    phase_str,
+                )
+            elif agent_state.get("pending_bom_regen") and _is_regen_confirmation(message):
+                current_phase = BOMPhase.GENERATE
+                logger.info(
+                    "Orchestrator: regeneration confirmed in phase=%s, resetting to GENERATE",
+                    phase_str,
+                )
 
         # ── Build system prompt ───────────────────────────────────────
         base_prompt = get_system_prompt(category)
@@ -463,8 +1037,17 @@ class BOMOrchestrator:
         # ── Post-process ───────────────────────────────────────────────────
         partial_bom, bom_found = self._extract_bom(response_text)
 
+        # -- Scope enforcement - deterministic post-AI filter -----------------------
+        # Runs on every generated BOM before display or persistence.
+        # Out-of-scope hardware is moved to optional_recommendations[], not deleted.
+        if partial_bom and bom_found:
+            _scope = _extract_scope_from_conversation(
+                session.get("conversation", []), agent_state
+            )
+            partial_bom = _enforce_bom_scope(partial_bom, _scope)
         # Strip JSON block from display text
         display_text = response_text
+
         if partial_bom:
             display_text = re.sub(r"```json[\s\S]*?```", "", response_text).strip()
             if not display_text:
@@ -483,10 +1066,25 @@ class BOMOrchestrator:
         context["current_phase_name"] = new_phase.value
         context["current_phase"] = _PHASE_ORDER.index(new_phase) + 1  # keep numeric compat
 
-        complete = (new_phase == BOMPhase.COMPLETE) or (bom_found and new_phase == BOMPhase.VALIDATE)
+        complete = (new_phase == BOMPhase.COMPLETE) or (
+            bom_found and new_phase in (BOMPhase.VALIDATE, BOMPhase.COMPLETE)
+        )
         progress = _PHASE_PROGRESS.get(new_phase, 10)
 
         if complete and partial_bom:
+            previous_snapshot = agent_state.get("current_bom_snapshot") or {}
+            previous_revision = int(previous_snapshot.get("revision") or 0)
+            has_pending_change = bool(agent_state.get("pending_change_request"))
+
+            # Ensure revision increments on confirmed modification cycles.
+            if has_pending_change:
+                current_rev = int(partial_bom.get("revision") or 0)
+                if current_rev <= previous_revision:
+                    partial_bom["revision"] = previous_revision + 1
+                    partial_bom.setdefault("warnings", []).append(
+                        f"⚠️ Revision auto-corrected to Rev {previous_revision + 1} for confirmed change request."
+                    )
+
             # Inject final enrichments
             partial_bom["project"] = project
             partial_bom["category"] = category
@@ -494,6 +1092,18 @@ class BOMOrchestrator:
             partial_bom["vendor_standard"] = agent_state.get("vendor_standard", "")
             partial_bom["site_count"] = agent_state.get("site_count")
             partial_bom["conveyance_status"] = agent_state.get("conveyance_status", "")
+
+            # Persist current BOM snapshot so future revisions are context-accurate.
+            agent_state["current_bom_snapshot"] = {
+                "name": partial_bom.get("name", ""),
+                "revision": partial_bom.get("revision", 1),
+                "line_items": partial_bom.get("line_items", []),
+                "totals": partial_bom.get("totals", {}),
+            }
+
+            # Clear pending regen state after successful revised BOM generation.
+            agent_state.pop("pending_bom_regen", None)
+            agent_state.pop("pending_change_request", None)
 
         logger.info(
             "Orchestrator: project=%s category=%s phase=%s→%s complete=%s bom_items=%d",
@@ -560,6 +1170,7 @@ class BOMOrchestrator:
                 "price_basis":    item.get("price_basis", "budgetary_assumption"),
                 "quantity_basis": item.get("quantity_basis", ""),
                 "recommendation_status": item.get("recommendation_status", ""),
+                "dependencies":   item.get("dependencies", []),
             })
 
         # Recompute totals
@@ -572,6 +1183,12 @@ class BOMOrchestrator:
         data["totals"]["total_otc"] = data["totals"].get("total_otc") or total_otc
 
         data["line_items"] = normalised
+        # Preserve optional_recommendations if the AI emitted them — do not merge into line_items
+        if "optional_recommendations" in data and isinstance(data["optional_recommendations"], list):
+            data["optional_recommendations"] = data["optional_recommendations"]
+        else:
+            data.setdefault("optional_recommendations", [])
+        data, _ = _validate_bom_dependencies(data)
         return data, True
 
     # ── Rule-based fallback ───────────────────────────────────────────────
@@ -737,6 +1354,85 @@ class BOMOrchestrator:
                 {"description": "Firewall Ruleset Migration PS", "category": "Professional Services", "qty": 1, "unit_price": 15000, "vendor": "NTT Data", "term": "one-time"},
             ],
         }
+
+        # ── Conveyance guard — use circuits-only template when hardware is conveying ──
+        hardware_conveying = (
+            agent_state.get("hardware_conveying", False)
+            or agent_state.get("conveyance_status") == "conveying_active"
+        )
+        eol_needed = (
+            agent_state.get("eol_replacement_needed", False)
+            or agent_state.get("conveyance_status") == "conveying_eol"
+        )
+        new_circuits = agent_state.get("new_circuits_needed", False)
+
+        if hardware_conveying and not eol_needed and new_circuits:
+            # Circuits-only scenario: procure WAN broadband only
+            circuit_price = 350   # broadband /month indicative
+            install_price = 500   # one-time install per site
+            activation_price = 250
+            items_raw = [
+                {"description": f"Broadband Internet Circuit (per site/month — competitive ISP)", "category": "WAN Circuit", "qty": sites, "unit_price": circuit_price, "vendor": "TBD — Competitive", "term": "/month", "order_sequence": 1},
+                {"description": "Circuit Installation Charge (per site, one-time)", "category": "WAN Circuit", "qty": sites, "unit_price": install_price, "vendor": "TBD — Competitive", "term": "one-time", "order_sequence": 1},
+                {"description": "Carrier Activation Fee (per site, one-time)", "category": "WAN Circuit", "qty": sites, "unit_price": activation_price, "vendor": "TBD — Competitive", "term": "one-time", "order_sequence": 1},
+                {"description": "ISP-Managed CPE / Modem (carrier-provided, per site)", "category": "WAN Circuit", "qty": sites, "unit_price": 0, "vendor": "TBD — Competitive", "term": "one-time", "order_sequence": 1, "notes": "Carrier-managed — confirm whether included in circuit cost"},
+                {"description": "Project Management — Circuit Procurement", "category": "Professional Services", "qty": 1, "unit_price": 4500, "vendor": "Internal / NTT Data", "term": "one-time", "order_sequence": 2},
+                {"description": "Implementation Support — Circuit Cutover Coordination", "category": "Professional Services", "qty": 1, "unit_price": 3500, "vendor": "Internal / NTT Data", "term": "one-time", "order_sequence": 2},
+                {"description": "Contingency (10% of circuit costs)", "category": "Contingency", "qty": 1, "unit_price": int((circuit_price + install_price + activation_price) * sites * 0.1), "vendor": "—", "term": "one-time", "order_sequence": 3},
+            ]
+            # Build items directly and return — skip the normal template lookup
+            items = []
+            for i, t in enumerate(items_raw):
+                qty = t.get("qty", 1)
+                price = t.get("unit_price", 0)
+                items.append({
+                    "line_number": i + 1,
+                    "description": t["description"],
+                    "category": t.get("category", "General"),
+                    "sku": "",
+                    "qty": qty,
+                    "quantity": qty,
+                    "unit": t.get("unit", "/unit"),
+                    "unit_price": price,
+                    "extended_price": price * qty,
+                    "ext_price": price * qty,
+                    "vendor": t.get("vendor", "TBD"),
+                    "term": t.get("term", "one-time"),
+                    "order_sequence": t.get("order_sequence", ""),
+                    "ha_role": "",
+                    "quantity_basis": f"{sites} Sites × 1 per Site" if qty == sites else "Project-level",
+                    "qty_driver": "Site" if qty == sites else "Project",
+                    "driver_count": sites if qty == sites else 1,
+                    "qty_per_driver": 1,
+                    "qty_status": "confirmed",
+                    "notes": t.get("notes", ""),
+                    "price_basis": "budgetary_assumption",
+                    "eol_flag": False,
+                })
+            total = sum(i["unit_price"] * i["qty"] for i in items)
+            return {
+                "name": f"{project} — WAN Circuits BOM (Conveying CPE)",
+                "project": project,
+                "category": category,
+                "revision": 1,
+                "bom_maturity": "budgetary",
+                "conveyance_note": "SD-WAN CPE is conveying and not EOL. This BOM covers WAN circuit procurement only.",
+                "line_items": items,
+                "totals": {
+                    "hardware": 0,
+                    "software": 0,
+                    "services": 8000,
+                    "total_otc": total,
+                    "tco_3year": total + (circuit_price * sites * 36),
+                },
+                "warnings": [
+                    "TEMPLATE BOM: Prices are budgetary estimates only. Validate with carrier quotes.",
+                    "SD-WAN CPE is conveying — no router/license/SmartNet procurement required.",
+                    "Confirm SmartNet contract transfer for conveyed Cisco hardware with deal team.",
+                    "Broadband circuit lead time: 4–8 weeks. Order before Day-1 minus 10 weeks.",
+                ],
+                "approvals_required": ["Buyer IT", "Seller IT", "SI Technical Team"],
+            }
 
         # Use the first matching category template
         items_raw = templates.get(category)

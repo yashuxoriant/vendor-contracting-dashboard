@@ -88,6 +88,8 @@ class StartSessionRequest(BaseModel):
     user_id: Optional[str] = "demo_user"
     bom_id: Optional[str] = None  # Optional: scope chat to a specific indexed BOM
     domain_preselected: bool = False  # True when user chose the category from the UI picker
+    existing_bom: Optional[Dict[str, Any]] = None  # Full BOM object when loading an existing BOM for editing
+    existing_bom: Optional[Dict[str, Any]] = None  # Full BOM object when loading an existing BOM
 
 class StartSessionResponse(BaseModel):
     session_id: str
@@ -143,6 +145,24 @@ async def start_session(request: StartSessionRequest):
             "current_step": "08_category_resolved",
         }
 
+    # When an existing BOM is loaded, skip intake (Steps 1-9 already done) and
+    # seed the agent with the BOM context so it can answer questions about it.
+    if request.existing_bom:
+        bom = request.existing_bom
+        line_items = bom.get("lineItems") or bom.get("line_items") or []
+        bom_name   = bom.get("name") or bom.get("project_name") or request.project
+        initial_agent_state.update({
+            "ma_phase": initial_agent_state.get("ma_phase", "Day-1 Readiness"),
+            "workstream_category": request.category,
+            "vendor_engagement_required": True,
+            "current_step": "10_skill_output_received",
+            "existing_bom_loaded": True,
+            "bom_name": bom_name,
+            "bom_line_count": len(line_items),
+            "bom_total_value": bom.get("totalValue") or bom.get("total_value", 0),
+            "bom_status": bom.get("status", "draft"),
+        })
+
     context = SessionContext(
         category=request.category,
         requirements={"project": request.project},
@@ -152,13 +172,28 @@ async def start_session(request: StartSessionRequest):
         agent_state=initial_agent_state,
     )
 
-    welcome_content = (
-        f"Hello! I'm your AI Procurement Assistant for **{request.category}**.\n\n"
-        f"I'll help determine what equipment or services need to be procured "
-        f"for **{request.project}** and prepare a draft procurement BOM for vendor review.\n\n"
-        f"To get started, tell me a bit about the environment you're working with, "
-        f"or simply reply and I'll guide you through the qualification."
-    )
+    if request.existing_bom:
+        bom      = request.existing_bom
+        line_items = bom.get("lineItems") or bom.get("line_items") or []
+        bom_name = bom.get("name") or bom.get("project_name") or request.project
+        total    = bom.get("totalValue") or bom.get("total_value", 0)
+        welcome_content = (
+            f"I've loaded **\"{bom_name}\"** \u2014 {len(line_items)} line items"
+            + (f", total **${total:,.0f}**" if total else "") + ".\n\n"
+            "What would you like to do?\n"
+            "- Add, remove, or update line items\n"
+            "- Explain any line item, SKU, or pricing\n"
+            "- Rebuild or revise the BOM for a different scope\n"
+            "- Export to Excel or prepare an RFQ"
+        )
+    else:
+        welcome_content = (
+            f"Hello! I'm your AI Procurement Assistant for **{request.category}**.\n\n"
+            f"I'll help determine what equipment or services need to be procured "
+            f"for **{request.project}** and prepare a draft procurement BOM for vendor review.\n\n"
+            f"To get started, tell me a bit about the environment you're working with, "
+            f"or simply reply and I'll guide you through the qualification."
+        )
     welcome = ChatMessage(role="assistant", content=welcome_content)
     session = ChatSession(
         session_id=session_id,
