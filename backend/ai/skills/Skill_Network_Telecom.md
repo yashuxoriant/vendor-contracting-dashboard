@@ -135,8 +135,17 @@ Before generating any line items, identify the closest historical reference BOM.
 4. Inspect the selected reference BOM’s line items. Ask the user **only** for the
    multiplier values those specific line items require (e.g., site count, AP
    count per floor, firewall HA pair vs. single). Do not ask for anything the
-   intake package already answers.
-
+   intake package already answers.5. **SCOPE FILTER (mandatory):** Before carrying any reference BOM line item into
+   the draft, verify it belongs to a layer the user confirmed needs procurement
+   (from Steps 2a/2b/2c qualification answers). Discard line items for:
+   - Layers the user confirmed are **conveying and not EOL**
+   - Layers the user explicitly said are **not in scope** or **not needed**
+   - Management/orchestration platforms (FortiManager, vManage, Catalyst Center,
+     FortiAnalyzer, etc.) unless the user named them
+   - Any hardware family not mentioned in the conversation
+   Place any filtered-out items that you believe are still useful into
+   `optional_recommendations[]` with a `recommendation_reason`. Never silently
+   include them in `line_items[]`.
 ---
 
 ## Step 5 — Delivery / Logistics Inputs

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useDispatch, useSelector } from 'react-redux'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useLocation } from 'react-router-dom'
 import {
   Box, Typography, TextField, IconButton, Paper, Chip, Button,
   Avatar, Tooltip, LinearProgress, Snackbar, Alert,
@@ -534,6 +534,7 @@ const INTAKE_STEPS = [
 export default function ChatPage() {
   const dispatch = useDispatch()
   const navigate = useNavigate()
+  const location = useLocation()
   const bomList = useSelector(s => s.bom.bomList)
   const savedCurrentBOM = useSelector(s => s.bom.currentBOM)
 
@@ -548,7 +549,10 @@ export default function ChatPage() {
   const backendFailCount = useRef(0)   // consecutive backend failures; mode only disabled after 2+
 
   // Backend AI state
-  const [sessionId, setSessionId]       = useState(null)
+  // Seed sessionId from navigation state immediately so the sidebar dedup
+  // logic already has the correct session on the very first render —
+  // prevents the brief 📄 standalone-BOM flash when resuming from BOM Library.
+  const [sessionId, setSessionId]       = useState(location.state?.resumeSessionId || null)
   const [backendMode, setBackendMode]   = useState(false)
   const [phaseProgress, setPhaseProgress] = useState(0)
   const [backendChecked, setBackendChecked] = useState(false)
@@ -615,7 +619,7 @@ export default function ChatPage() {
               createdBy:   b.created_by || 'AI Agent',
               totalValue:  b.totals?.total_otc || 0,
               // Restore the session link from localStorage so the sidebar can reverse-look up BOM name
-              creatingSessionId: storedSessionMap[feId] || null,
+              creatingSessionId: storedSessionMap[feId] || b.session_id || null,
               lineItems:   (b.line_items || []).map((item, i) => ({
                 id:          `li_${feId}_${i}`,
                 lineNo:      item.line_number || i + 1,
@@ -655,8 +659,12 @@ export default function ChatPage() {
             dispatch(setBOMList(merged))
           })
           .catch(() => {})
-        // Restore session from localStorage so context persists across page refresh AND tab close
-        const savedSid = localStorage.getItem('chat_session_id') || sessionStorage.getItem('chat_session_id')
+        // Restore session from localStorage so context persists across page refresh AND tab close.
+        // Skip when navigating from BOM Library with resumeSessionId — the resume
+        // useEffect below handles that case and must not race with this path.
+        const savedSid = location.state?.resumeSessionId
+          ? null
+          : (localStorage.getItem('chat_session_id') || sessionStorage.getItem('chat_session_id'))
         if (savedSid) {
           setSessionId(savedSid)
           localStorage.setItem('chat_session_id', savedSid)
@@ -879,12 +887,31 @@ export default function ChatPage() {
   }
 
   useEffect(() => {
+    // When navigating from the BOM Library with a resumeSessionId, skip the
+    // welcome/loaded message — the resume useEffect below will load the transcript.
+    if (location.state?.resumeSessionId) {
+      setMessages([{ id: 1, role: 'ai', type: 'text', text: '_Loading conversation…_' }])
+      return
+    }
     const welcome = savedCurrentBOM
       ? { id: 1, role: 'ai', type: 'loaded', text: 'Loaded **"' + savedCurrentBOM.name + '"** (v' + savedCurrentBOM.version + ') - **' + savedCurrentBOM.lineItems.length + ' items**, ' + fmt(savedCurrentBOM.totalValue) + '. What would you like to do?', bom: savedCurrentBOM }
       : { id: 1, role: 'ai', type: 'help', text: 'Hello! I am your **AI BOM Assistant**.\n\nI can create, update, analyze and manage your Bills of Materials in real-time. Just describe what you need in plain English.', suggestions: ['Create a Data Center BOM for Panasonic', 'Create SD-WAN BOM for 30 sites', 'Create Cybersecurity BOM for Idemia', 'Show my BOMs'] }
     setMessages([welcome])
     if (savedCurrentBOM) setLocalBOM(savedCurrentBOM)
   }, [])
+
+  // Resume a specific session when navigating from the BOM Library via "Open in AI Chat"
+  // on a BOM that has a known creatingSessionId. Replaces the navigation state so a
+  // page refresh does not re-trigger the resume.
+  useEffect(() => {
+    const resumeId = location.state?.resumeSessionId
+    if (!resumeId) return
+    // Prefer the BOM passed directly in navigation state (freshest source) over
+    // whatever Redux holds — avoids showing a stale "Loaded BOM" welcome message.
+    const resumeBom = location.state?.resumeBom || savedCurrentBOM || null
+    switchToSession({ session_id: resumeId }, resumeBom)
+    navigate(location.pathname, { replace: true, state: {} })
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, isTyping])
 
@@ -912,6 +939,10 @@ export default function ChatPage() {
       }
       if (resp.type === 'saved' && resp.bom) {
         dispatch(saveBOM(resp.bom))
+        // Push the current revision to the backend so BOM Library always shows the
+        // latest version. Try PUT first (BOM already exists), fall back to POST.
+        bomApi?.update?.(resp.bom.id, resp.bom)
+          ?.catch(() => bomApi?.create?.(resp.bom)?.catch(() => {}))
         dispatch(pushNotification({ type: 'bom_saved', title: 'BOM Saved', message: `${resp.bom.name} saved to BOM Library. Ready to send for approval.`, link: '/bom-library' }))
       }
       if (resp.type === 'bom_created' && resp.bom) {
@@ -1055,6 +1086,10 @@ export default function ChatPage() {
               // Tag the BOM with the session that generated it so clicking it
               // in the sidebar can restore the full conversation.
               if (aiBOM && sid) {
+                // Reuse the existing BOM id if one was already generated in this session.
+                // Without this, every regeneration creates a new id → orphaned entries pile up.
+                const existingBOMId = bomList.find(b => b.creatingSessionId === sid)?.id
+                if (existingBOMId) aiBOM.id = existingBOMId
                 aiBOM.creatingSessionId = sid
                 saveBOMSession(aiBOM.id, sid)  // persist to localStorage (survives page refresh)
                 // Upgrade the session label to the full BOM name — this is the
@@ -1066,18 +1101,29 @@ export default function ChatPage() {
             if ((finalEvt.complete || (aiBOM && aiBOM.lineItems?.length > 0)) && aiBOM) {
               // Always save to Redux immediately (works offline too)
               dispatch(saveBOM(aiBOM))
-              // Persist to Cosmos via backend (best-effort)
-              bomApi?.create?.(aiBOM)
-                .then(() => setToast({ open: true, msg: 'BOM saved to library', severity: 'success' }))
-                .catch(() => setToast({ open: true, msg: 'BOM created (saved locally — sync to backend failed)', severity: 'warning' }))
-              const cats = [...new Set(aiBOM.lineItems.map(li => li.category))]
-              const displayText = (
-                `✅ Created **${aiBOM.name}**\n\n` +
-                `**${aiBOM.lineItems.length} line items** | Total: **${fmt(aiBOM.totalValue)}**\n` +
-                `Categories: ${cats.join(' · ')}\n\n` +
+              // Persist to Cosmos — use PUT (update) when the ID was reused from a prior
+              // generation in this session so Rev 2 overwrites Rev 1 in the database.
+              // Fall back to POST (create) for brand-new BOMs.
+              const isRegen = bomList.some(b => b.id === aiBOM.id)
+              ;(isRegen ? bomApi?.update?.(aiBOM.id, aiBOM) : bomApi?.create?.(aiBOM))
+                ?.then(() => setToast({ open: true, msg: 'BOM saved to library', severity: 'success' }))
+                ?.catch(() => setToast({ open: true, msg: 'BOM saved locally — backend sync failed', severity: 'warning' }))
+
+              // Preserve the AI's streamed summary text and append the action menu below it.
+              // Strip any residual ```json``` fences from the streamed text before displaying.
+              const aiSummary = streamedText
+                .replace(/```json[\s\S]*?```/g, '')
+                .trim()
+
+              const actionMenu = (
+                `\n\n---\n✅ **${aiBOM.name}** — ` +
+                `**${aiBOM.lineItems.length} line items** | Total: **${fmt(aiBOM.totalValue)}**\n\n` +
                 `The BOM is live in the panel on the right. You can:\n` +
                 `- Change item 2 qty to 8\n- Remove item 5\n- Analyze cost savings\n- Export as CSV\n- Save to BOM Library`
               )
+
+              const displayText = aiSummary ? aiSummary + actionMenu : actionMenu.trim()
+
               setMessages(prev => {
                 const next = prev.map(m =>
                   m.id === streamingMsgId ? { ...m, text: displayText, type: 'bom_created', bom: aiBOM, actions: ['library', 'rfq'], streaming: false } : m
@@ -1143,6 +1189,10 @@ export default function ChatPage() {
       if (resp.bom) { setLocalBOM(resp.bom); dispatch(setCurrentBOM(resp.bom)) }
       if (resp.type === 'saved' && resp.bom) {
         dispatch(saveBOM(resp.bom))
+        // Push the current revision to the backend so BOM Library always shows the
+        // latest version. Try PUT first (BOM already exists), fall back to POST.
+        bomApi?.update?.(resp.bom.id, resp.bom)
+          ?.catch(() => bomApi?.create?.(resp.bom)?.catch(() => {}))
         dispatch(pushNotification({ type: 'bom_saved', title: 'BOM Saved', message: `${resp.bom.name} saved to BOM Library. Ready to send for approval.`, link: '/bom-library' }))
       }
       if (resp.type === 'bom_created' && resp.bom) {
@@ -1228,6 +1278,9 @@ export default function ChatPage() {
           const proj = ctx.project || detectProject(text || '') || 'New Project'
           const aiBOM = backendBOMtoFrontend(bomSource, proj)
           if (aiBOM) {
+            // Reuse existing BOM id if one was already created in this session
+            const existingBOMId = bomList.find(b => b.creatingSessionId === sid)?.id
+            if (existingBOMId) aiBOM.id = existingBOMId
             aiBOM.creatingSessionId = sid
             saveBOMSession(aiBOM.id, sid)
             saveSessionLabel(sid, aiBOM.name)  // upgrade label to BOM name
@@ -1415,15 +1468,48 @@ export default function ChatPage() {
                 raw: s,
               }
             })
-            const bomItems = bomList.map(b => ({
-              key: 'bom_' + b.id,
-              type: 'bom',
-              label: b.name,
-              sub: b.status,
-              date: b.updatedAt || b.createdAt || '',
-              active: currentBOM?.id === b.id,
-              raw: b,
-            }))
+            // Collect all session IDs that are already represented by a chat row.
+            // IMPORTANT: also include the current live sessionId — it won't be in
+            // chatHistory (loaded at mount) if this session was started after page load.
+            const chatSessionIds = new Set(chatHistory.map(s => s.session_id))
+            if (sessionId) chatSessionIds.add(sessionId)
+
+            // If the current session is not yet in chatHistory, add a synthetic row
+            // so there is always exactly one chat row for the active session.
+            if (sessionId && !chatHistory.some(s => s.session_id === sessionId)) {
+              const liveLabel = currentBOM?.name || getSessionLabel(sessionId) || 'New BOM Chat'
+              chatItems.unshift({
+                key: 'chat_' + sessionId,
+                type: 'chat',
+                label: liveLabel,
+                sub: messages.length + ' msgs',
+                date: new Date().toISOString(),
+                active: true,
+                raw: { session_id: sessionId },
+              })
+            }
+
+            // Build the set of BOM IDs that are linked to a visible chat session
+            // (via either in-memory creatingSessionId or localStorage bom_session_map)
+            const linkedBomIds = new Set()
+            bomList.forEach(b => { if (b.creatingSessionId && chatSessionIds.has(b.creatingSessionId)) linkedBomIds.add(b.id) })
+            try {
+              const lsMap = JSON.parse(localStorage.getItem('bom_session_map') || '{}')
+              Object.entries(lsMap).forEach(([bomId, sid]) => { if (chatSessionIds.has(sid)) linkedBomIds.add(bomId) })
+            } catch (_) {}
+
+            // Only show standalone BOM rows for BOMs that have NO linked chat session
+            const bomItems = bomList
+              .filter(b => !linkedBomIds.has(b.id))
+              .map(b => ({
+                key: 'bom_' + b.id,
+                type: 'bom',
+                label: b.name,
+                sub: b.status,
+                date: b.updatedAt || b.createdAt || '',
+                active: currentBOM?.id === b.id,
+                raw: b,
+              }))
             const all = [...chatItems, ...bomItems].sort((a, b) => (b.date > a.date ? 1 : -1))
             if (all.length === 0) return (
               <Typography sx={{ fontSize: '0.65rem', color: '#9CA3AF', textAlign: 'center', mt: 2 }}>

@@ -157,6 +157,7 @@ class BOM(BaseModel):
     metadata: Dict[str, Any] = {}
     revision: int = 1                       # increments each time BOM is rebuilt after changes
     approval_cycle: int = 1                 # how many full restart cycles have occurred
+    session_id: Optional[str] = None        # chat session that created this BOM — used to re-link sidebar row
 
     class Config:
         use_enum_values = True

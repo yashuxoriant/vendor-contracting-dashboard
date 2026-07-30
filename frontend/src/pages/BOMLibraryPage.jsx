@@ -278,7 +278,17 @@ function BOMRow({ bom, dispatch, navigate, onArchive }) {
           <Box sx={{ display: 'flex', gap: 0.5 }}>
             <Tooltip title="Open in AI Chat">
               <IconButton size="small" sx={{ color: '#D04A02' }}
-                onClick={() => { dispatch(setCurrentBOM(bom)); navigate('/chat') }}>
+                onClick={() => {
+                  if (bom.creatingSessionId) {
+                    // Resume original session — do NOT dispatch setCurrentBOM here;
+                    // that triggers a stale 'Loaded BOM' message before the transcript loads.
+                    navigate('/chat', { state: { resumeSessionId: bom.creatingSessionId, resumeBom: bom } })
+                  } else {
+                    // Orphaned BOM (no linked session) — open as before
+                    dispatch(setCurrentBOM(bom))
+                    navigate('/chat')
+                  }
+                }}>
                 <AutoAwesome sx={{ fontSize: 15 }} />
               </IconButton>
             </Tooltip>
