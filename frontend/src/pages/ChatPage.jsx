@@ -579,7 +579,9 @@ export default function ChatPage() {
   const clearHidden = () => localStorage.removeItem(HIDDEN_KEY)
   const filterSessions = (sessions) => {
     const hidden = loadHidden()
-    return sessions.filter(s => !hidden.has(s.session_id) && (s.message_count || 0) > 0)
+    // Require at least 2 messages (welcome + ≥1 user turn) so orphan sessions
+    // created by opening the domain picker without sending are never shown.
+    return sessions.filter(s => !hidden.has(s.session_id) && (s.message_count || 0) >= 2)
   }
 
   // On mount: check backend + load chat history + restore previous session
@@ -843,9 +845,13 @@ export default function ChatPage() {
   }
 
   // Handle domain selection from the picker modal.
-  // Pre-starts a backend session with domain_preselected=true so the skill
-  // file is loaded from turn 1, and sets up the welcome message.
-  const handleDomainSelect = async (category) => {
+  // Session creation is intentionally LAZY — we do NOT call startSession here.
+  // Creating a backend session on every domain click produced orphan sessions
+  // (message_count=1, only the welcome) that cluttered the history sidebar.
+  // Instead, the session is created on the first message send in handleSend,
+  // where domainPreselected=true and ctx.category are already set so the agent
+  // still receives the seeded state from turn 1.
+  const handleDomainSelect = (category) => {
     setDomainPickerOpen(false)
     setLocalBOM(null)
     dispatch(setCurrentBOM(null))
@@ -853,29 +859,18 @@ export default function ChatPage() {
     setSessionId(null)
     setPhaseProgress(0)
     setIntakeFields({})
+    // Clear both storage keys so a page refresh doesn't accidentally restore
+    // the previous session instead of starting fresh.
+    localStorage.removeItem('chat_session_id')
     sessionStorage.removeItem('chat_session_id')
 
     const domainObj = BOM_DOMAINS.find(d => d.key === category) || { icon: '📋' }
-
-    // Always call the backend directly — do not gate on the backendMode state
-    // snapshot, which may still be false if the user clicks before the initial
-    // ping has resolved (race condition on page load).
-    try {
-      const resp = await chatApi.startSession(category, 'New Project', 'demo_user', null, true)
-      setSessionId(resp.session_id)
-      localStorage.setItem('chat_session_id', resp.session_id)
-      sessionStorage.setItem('chat_session_id', resp.session_id)
-      saveSessionLabel(resp.session_id, category)  // initial label = category
-      setBackendMode(true)
-      // Use the backend welcome message — it owns the greeting and first question
-      setMessages([{ id: Date.now(), role: 'ai', type: 'text', text: resp.message }])
-    } catch (_) {
-      // Backend genuinely unavailable — neutral placeholder, no workflow assumptions
-      setMessages([{
-        id: Date.now(), role: 'ai', type: 'text',
-        text: `${domainObj.icon} **${category}** selected. Tell me about the environment you're working with and I'll guide you through procurement qualification.`,
-      }])
-    }
+    // Show local welcome immediately; backend session is created on first message
+    setMessages([{
+      id: Date.now(), role: 'ai', type: 'text',
+      text: `${domainObj.icon} Hello! I'm your AI Procurement Assistant for **${category}**.\n\nI'll help determine what equipment or services need to be procured and prepare a draft procurement BOM for vendor review.\n\nTell me about the environment you're working with, or simply reply and I'll guide you through the qualification.`,
+    }])
+    setBackendMode(true)
   }
 
   useEffect(() => {
