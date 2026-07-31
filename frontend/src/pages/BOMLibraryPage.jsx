@@ -20,7 +20,7 @@ const fmtDate = (s) => {
   return new Date(s).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
 }
 
-// Category definitions (Chetan: "big baseball cards across multiple categories")
+// Category definitions — must match the 6 domains in ChatPage BOM_DOMAINS
 const CATEGORIES = [
   {
     key: 'Data Center / COLO',
@@ -28,23 +28,7 @@ const CATEGORIES = [
     icon: '\uD83C\uDFE2',
     accent: '#1F2937',
     light: '#F9FAFB',
-    desc: 'Top-of-rack, leaf/spine, power, cooling, colo cage',
-  },
-  {
-    key: 'Network & Telecom',
-    label: 'Network & Telecom',
-    icon: '\uD83C\uDF10',
-    accent: '#1D4ED8',
-    light: '#EFF6FF',
-    desc: 'LAN/WAN, switches, firewalls, access points, voice/UCaaS',
-  },
-  {
-    key: 'SD-WAN',
-    label: 'SD-WAN / WAN',
-    icon: '\uD83D\uDD17',
-    accent: '#3B82F6',
-    light: '#EFF6FF',
-    desc: 'SD-WAN routers, carrier circuits, MPLS, broadband',
+    desc: 'DC builds, colocation, server infra, colo cage',
   },
   {
     key: 'Cybersecurity',
@@ -55,12 +39,28 @@ const CATEGORIES = [
     desc: 'NGFW, EDR, SIEM, PAM, Zero Trust, compliance tooling',
   },
   {
-    key: 'M365 & Power Platform',
-    label: 'M365 & Licensing',
-    icon: '\uD83D\uDCBC',
+    key: 'End User Computing',
+    label: 'End User Computing',
+    icon: '\uD83D\uDCBB',
     accent: '#7C3AED',
     light: '#F5F3FF',
-    desc: 'E3/E5 licensing, Power Apps, Teams Phone, FastTrack',
+    desc: 'Laptops, VDI, peripherals, EUC fleet',
+  },
+  {
+    key: 'M365 & Power Platform',
+    label: 'M365 & Power Platform',
+    icon: '\uD83D\uDCBC',
+    accent: '#0078D4',
+    light: '#EFF6FF',
+    desc: 'Microsoft 365, Teams, SharePoint, Power Apps',
+  },
+  {
+    key: 'Network Equipment',
+    label: 'Network Equipment',
+    icon: '\uD83D\uDD0C',
+    accent: '#059669',
+    light: '#ECFDF5',
+    desc: 'Switches, routers, firewalls, access points',
   },
   {
     key: 'Cloud Infrastructure',
@@ -68,23 +68,7 @@ const CATEGORIES = [
     icon: '\u2601\uFE0F',
     accent: '#D97706',
     light: '#FFFBEB',
-    desc: 'Azure, AWS, GCP -- IaaS, PaaS, landing zones, ExpressRoute',
-  },
-  {
-    key: 'EOL Replacement',
-    label: 'EOL Replacement',
-    icon: '\u26A0\uFE0F',
-    accent: '#DC2626',
-    light: '#FEF2F2',
-    desc: 'End-of-life / end-of-support hardware replacement BOMs',
-  },
-  {
-    key: 'Network Equipment',
-    label: 'Network Equipment',
-    icon: '\uD83D\uDDA5',
-    accent: '#059669',
-    light: '#ECFDF5',
-    desc: 'Switches, routers, access points, wireless controllers',
+    desc: 'Azure, AWS, GCP — IaaS, PaaS, landing zones',
   },
 ]
 
@@ -99,9 +83,30 @@ const STATUS_STYLE = {
   archived: { bg: '#F3F4F6', color: '#6B7280', label: 'Archived' },
 }
 
+// Read the bomId→sessionId map from localStorage (written by ChatPage when a BOM is generated).
+// This is the fallback for BOMs whose session_id isn't stored in Cosmos yet.
+function _lsSessionForBOM(bomId) {
+  try { return JSON.parse(localStorage.getItem('bom_session_map') || '{}')[bomId] || null }
+  catch (_) { return null }
+}
+// Persist a bomId→sessionId link into localStorage so ChatPage can pick it up later.
+function _persistSessionLink(bomId, sessionId) {
+  if (!bomId || !sessionId) return
+  try {
+    const map = JSON.parse(localStorage.getItem('bom_session_map') || '{}')
+    if (!map[bomId]) { map[bomId] = sessionId; localStorage.setItem('bom_session_map', JSON.stringify(map)) }
+  } catch (_) {}
+}
+
 function backendToFrontend(b) {
+  const bomId = b.bom_id || b.id || b._id
+  // session_id is stored in Cosmos by the chat endpoint when a BOM is generated.
+  // Also check localStorage bom_session_map as a fallback (older BOMs or cleared storage).
+  const sessionLink = b.session_id || _lsSessionForBOM(bomId) || null
+  // Persist to localStorage so the link survives across pages without relying on ChatPage.
+  _persistSessionLink(bomId, sessionLink)
   return {
-    id: b.bom_id || b.id || b._id,
+    id: bomId,
     name: b.name || ((b.project_name || b.project || 'Unknown') + ' -- ' + (b.category || '') + ' BOM'),
     project: b.project_name || b.project || 'Unknown Project',
     category: b.category || 'Data Center / COLO',
@@ -111,6 +116,7 @@ function backendToFrontend(b) {
     createdAt: b.created_at,
     updatedAt: b.updated_at || b.created_at,
     notes: b.notes || '',
+    creatingSessionId: sessionLink,
     lineItems: (b.line_items || []).map((item, idx) => ({
       id: 'item_' + idx,
       lineNo: item.line_number || idx + 1,
@@ -157,10 +163,9 @@ async function exportBOMExcel(bom) {
 
 // Category Baseball Card
 function CategoryCard({ cat, boms, onSelect }) {
-  const catBOMs = boms.filter(b => {
-    const c = (b.category || '').toLowerCase()
-    return c === cat.key.toLowerCase() || c.includes(cat.key.toLowerCase().split('/')[0].trim())
-  })
+  const catBOMs = boms.filter(b =>
+    (b.category || '').toLowerCase() === cat.key.toLowerCase()
+  )
   const vendors = [...new Set(catBOMs.flatMap(b => b.lineItems.map(i => i.vendor)).filter(Boolean))].slice(0, 5)
   const latest = catBOMs.reduce((acc, b) => (!acc || new Date(b.updatedAt) > new Date(acc.updatedAt) ? b : acc), null)
 
@@ -279,12 +284,15 @@ function BOMRow({ bom, dispatch, navigate, onArchive }) {
             <Tooltip title="Open in AI Chat">
               <IconButton size="small" sx={{ color: '#D04A02' }}
                 onClick={() => {
-                  if (bom.creatingSessionId) {
+                  // Prefer creatingSessionId (already resolved by backendToFrontend);
+                  // also check localStorage directly as a last-resort fallback.
+                  const sid = bom.creatingSessionId || _lsSessionForBOM(bom.id)
+                  if (sid) {
                     // Resume original session — do NOT dispatch setCurrentBOM here;
                     // that triggers a stale 'Loaded BOM' message before the transcript loads.
-                    navigate('/chat', { state: { resumeSessionId: bom.creatingSessionId, resumeBom: bom } })
+                    navigate('/chat', { state: { resumeSessionId: sid, resumeBom: bom } })
                   } else {
-                    // Orphaned BOM (no linked session) — open as before
+                    // Orphaned BOM (no linked session) — load BOM into chat and start fresh.
                     dispatch(setCurrentBOM(bom))
                     navigate('/chat')
                   }
@@ -382,6 +390,9 @@ export default function BOMLibraryPage() {
   const dispatch = useDispatch()
   const navigate = useNavigate()
   const bomList = useSelector(s => s.bom.bomList)
+  // Keep a ref to the latest bomList so loadFromBackend can read it after the async fetch
+  const bomListRef = useRef(bomList)
+  useEffect(() => { bomListRef.current = bomList }, [bomList])
 
   const [search, setSearch] = useState('')
   const [vendorFilter, setVendorFilter] = useState('All')
@@ -474,8 +485,41 @@ export default function BOMLibraryPage() {
     setBackendError(null)
     try {
       const data = await bomService.list()
+      const cosmosIds = new Set((data.boms || []).map(b => b.bom_id || b.id || b._id).filter(Boolean))
       const boms = (data.boms || []).map(backendToFrontend)
       boms.forEach(b => dispatch(saveBOM(b)))
+
+      // Auto-sync any BOMs that are in Redux but not in Cosmos.
+      // On page refresh Redux resets to [], so also scan localStorage for
+      // session_bom_* entries (written by ChatPage when a BOM is generated).
+      const localSessionBOMs = []
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i)
+          if (k && k.startsWith('session_bom_')) {
+            const b = JSON.parse(localStorage.getItem(k) || 'null')
+            if (b && b.id && b.name && b.lineItems?.length > 0) localSessionBOMs.push(b)
+          }
+        }
+      } catch (_) {}
+
+      // Merge Redux + localStorage sources, then filter out any already in Cosmos
+      const allLocal = [...bomListRef.current, ...localSessionBOMs]
+      const seen = new Set()
+      const unsaved = allLocal.filter(b => {
+        if (!b.id || !b.name || seen.has(b.id)) return false
+        seen.add(b.id)
+        return !cosmosIds.has(b.id)
+      })
+      if (unsaved.length > 0) {
+        console.info('[BOMLibrary] Syncing', unsaved.length, 'unsynced BOM(s):', unsaved.map(b => b.name))
+        unsaved.forEach(b => {
+          dispatch(saveBOM(b))  // show immediately in the list
+          bomService.create(b).catch(err =>
+            console.warn('[BOMLibrary] Sync failed for', b.name, err?.response?.data || err?.message)
+          )
+        })
+      }
     } catch {
       setBackendError('Could not reach backend -- showing local data')
     } finally {
@@ -488,7 +532,7 @@ export default function BOMLibraryPage() {
   const filteredBOMs = bomList.filter(b => {
     if (b.status === 'archived') return false
     const q = search.toLowerCase()
-    if (q && !b.name.toLowerCase().includes(q) && !(b.project || '').toLowerCase().includes(q) &&
+    if (q && !(b.name || '').toLowerCase().includes(q) && !(b.project || '').toLowerCase().includes(q) &&
         !(b.category || '').toLowerCase().includes(q)) return false
     if (vendorFilter !== 'All') {
       const hasVendor = b.lineItems.some(i => (i.vendor || '').toLowerCase().includes(vendorFilter.toLowerCase()))
@@ -498,11 +542,9 @@ export default function BOMLibraryPage() {
   })
 
   const categoryBOMs = selectedCategory
-    ? filteredBOMs.filter(b => {
-        const c = (b.category || '').toLowerCase()
-        return c === selectedCategory.key.toLowerCase() ||
-               c.includes(selectedCategory.key.toLowerCase().split('/')[0].trim())
-      })
+    ? filteredBOMs.filter(b =>
+        (b.category || '').toLowerCase() === selectedCategory.key.toLowerCase()
+      )
     : []
 
   const handleArchive = (id) => dispatch(archiveBOM(id))

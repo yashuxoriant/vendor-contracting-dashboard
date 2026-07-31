@@ -230,8 +230,10 @@ class CosmosDBClient:
     # ========================================================================
 
     def create_bom(self, bom_data: dict) -> dict:
-        """Create BOM — accepts and returns plain dict."""
-        return self.create_item(settings.cosmos_container_boms, bom_data)
+        """Create or upsert BOM — uses upsert so re-saving a regenerated BOM
+        (same ID) updates the existing record rather than raising a conflict."""
+        bom_id = bom_data.get('id') or bom_data.get('bom_id') or bom_data.get('_id', '')
+        return self.update_item(settings.cosmos_container_boms, bom_id, bom_data)
 
     def get_bom(self, bom_id: str) -> Optional[dict]:
         """Get BOM by ID.  Uses cross-partition query so no project_name needed."""

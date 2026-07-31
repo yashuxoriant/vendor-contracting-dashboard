@@ -421,7 +421,7 @@ def _validate_bom_dependencies(bom: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
     return bom, warnings
 
 
-def _retrieve_bom_context(query: str, bom_id: Optional[str] = None, top_k: int = 5) -> str:
+def _retrieve_bom_context(query: str, bom_id: Optional[str] = None, top_k: int = 5, category: Optional[str] = None, vendor: Optional[str] = None) -> str:
     """Search indexed BOMs for relevant chunks to inject into the system prompt."""
     try:
         from services.search_service import search_bom_context, category_to_index_name

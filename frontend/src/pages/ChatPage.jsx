@@ -671,6 +671,19 @@ export default function ChatPage() {
           setSessionId(savedSid)
           localStorage.setItem('chat_session_id', savedSid)
 
+          // Restore BOM preview panel immediately from localStorage cache.
+          // Also push into Redux bomList so the sidebar sessionToBOM mapping works.
+          const cachedBOM = loadSessionBOM(savedSid)
+          if (cachedBOM) {
+            setLocalBOM(cachedBOM)
+            dispatch(setCurrentBOM(cachedBOM))
+            dispatch(saveBOM({ ...cachedBOM, creatingSessionId: cachedBOM.creatingSessionId || savedSid }))
+          }
+
+          // Restore ctx (category/project) so the AI keeps its domain on reload.
+          const cachedCtx = loadSessionCtx(savedSid)
+          if (cachedCtx) setCtx(cachedCtx)
+
           // 1. Immediately restore from localStorage cache (fast, survives backend restart)
           const cached = (() => {
             try {
@@ -732,6 +745,30 @@ export default function ChatPage() {
   const CONV_CACHE_PREFIX = 'chat_conv_'
   const BOM_SESSION_MAP_KEY = 'bom_session_map'
   const SESSION_LABEL_KEY = 'session_label_map'
+  const SESSION_BOM_KEY = 'session_bom_'
+  const SESSION_CTX_KEY = 'session_ctx_'
+
+  // Persist and restore the last BOM for a session so the preview panel
+  // is not blank on hard refresh or after navigating away and back.
+  const saveSessionBOM = (sid, bom) => {
+    if (!sid || !bom) return
+    try { localStorage.setItem(SESSION_BOM_KEY + sid, JSON.stringify(bom)) } catch (_) {}
+  }
+  const loadSessionBOM = (sid) => {
+    if (!sid) return null
+    try { return JSON.parse(localStorage.getItem(SESSION_BOM_KEY + sid) || 'null') } catch { return null }
+  }
+
+  // Persist and restore the ctx (category/project) for a session so the AI
+  // still knows its domain after a hard reload.
+  const saveSessionCtx = (sid, ctxVal) => {
+    if (!sid || !ctxVal) return
+    try { localStorage.setItem(SESSION_CTX_KEY + sid, JSON.stringify(ctxVal)) } catch (_) {}
+  }
+  const loadSessionCtx = (sid) => {
+    if (!sid) return null
+    try { return JSON.parse(localStorage.getItem(SESSION_CTX_KEY + sid) || 'null') } catch { return null }
+  }
 
   const saveSessionLabel = (sid, label) => {
     if (!sid || !label || label === 'New Project') return
@@ -797,14 +834,17 @@ export default function ChatPage() {
     const restoredBom = linkedBom || null
     setLocalBOM(restoredBom)
     dispatch(setCurrentBOM(restoredBom))
-    setCtx({ project: restoredBom?.project || null, category: restoredBom?.category || null })
+    const sid = sessionItem.session_id
+    // Restore ctx from cache first; fall back to BOM fields
+    const cachedCtx = loadSessionCtx(sid)
+    const restoredCtx = cachedCtx || { project: restoredBom?.project || null, category: restoredBom?.category || null }
+    setCtx(restoredCtx)
     setPhaseProgress(sessionItem.progress || (restoredBom ? 100 : 0))
     setIntakeFields({})
     setIsTyping(false)
     sendingRef.current = false
     setInput('')
 
-    const sid = sessionItem.session_id
     setSessionId(sid)
     localStorage.setItem('chat_session_id', sid)
     sessionStorage.setItem('chat_session_id', sid)
@@ -838,6 +878,11 @@ export default function ChatPage() {
       if (data.bom) {
         setLocalBOM(data.bom)
         dispatch(setCurrentBOM(data.bom))
+      } else {
+        // Transcript endpoint doesn't return BOM — restore from localStorage cache.
+        // This keeps the preview panel populated on hard refresh.
+        const cachedBOM = loadSessionBOM(sid)
+        if (cachedBOM) { setLocalBOM(cachedBOM); dispatch(setCurrentBOM(cachedBOM)) }
       }
     }).catch(() => {
       // Backend unreachable or session evicted — restore from localStorage cache
@@ -912,7 +957,7 @@ export default function ChatPage() {
 
   const addMsg = (msg) => setMessages(prev => [...prev, { id: Date.now() + Math.random(), ...msg }])
 
-  const handleSend = useCallback(async (text) => {
+  const handleSend = useCallback(async (text, forceBackend = false) => {
     const userText = (text || input).trim()
     if (!userText) return
     if (sendingRef.current) return   // already processing — ignore duplicate trigger
@@ -924,7 +969,9 @@ export default function ChatPage() {
     // ── Always handle BOM modification commands locally ────────────────────
     // The backend has no knowledge of the in-memory BOM; these commands are
     // handled by getAIResponse which operates on the currentBOM state directly.
-    if (isLocalBOMCmd(userText, !!currentBOM)) {
+    // forceBackend=true (set when clicking AI response suggestions) bypasses this
+    // so follow-up questions like "Add more items" go to the AI, not local mode.
+    if (!forceBackend && isLocalBOMCmd(userText, !!currentBOM)) {
       await new Promise(r => setTimeout(r, 350))
       setIsTyping(false)
       const resp = getAIResponse(userText, currentBOM, bomList, ctx)
@@ -964,8 +1011,12 @@ export default function ChatPage() {
           sessionStorage.setItem('chat_session_id', sid)  // persist for page-refresh resume
           // Write an initial label so the sidebar shows something better than
           // "New Project" immediately — will be upgraded to BOM name once generated
-          const initialLabel = (proj !== 'New Project' ? proj + ' — ' : '') + cat
+          const initialLabel = proj !== 'New Project' ? `${proj} — ${cat}` : `New BOM — ${cat}`
           saveSessionLabel(sid, initialLabel)
+          // Persist ctx so domain/project survive a page reload
+          const newCtx = { project: proj !== 'New Project' ? proj : null, category: cat, domainPreselected: Boolean(ctx.domainPreselected && ctx.category === cat) }
+          setCtx(newCtx)
+          saveSessionCtx(sid, newCtx)
           // Link this new session to the currently loaded BOM (if any) so clicking
           // the BOM in the sidebar later will restore this conversation.
           if (currentBOM?.id) saveBOMSession(currentBOM.id, sid)
@@ -998,6 +1049,12 @@ export default function ChatPage() {
               const stateCat  = finalEvt.agent_state.workstream_category || finalEvt.agent_state.category || ''
               if (stateProj && stateProj !== 'New Project' && sid) {
                 saveSessionLabel(sid, stateCat ? `${stateProj} \u2014 ${stateCat}` : stateProj)
+              }
+              // Keep ctx in sync so reloads inherit correct domain
+              if ((stateProj || stateCat) && sid) {
+                const updatedCtx = { project: stateProj || null, category: stateCat || ctx.category || null }
+                setCtx(updatedCtx)
+                saveSessionCtx(sid, updatedCtx)
               }
             } else if (finalEvt.intake_fields) {
               setIntakeFields(prev => ({ ...prev, ...finalEvt.intake_fields }))
@@ -1081,28 +1138,32 @@ export default function ChatPage() {
               // Tag the BOM with the session that generated it so clicking it
               // in the sidebar can restore the full conversation.
               if (aiBOM && sid) {
-                // Reuse the existing BOM id if one was already generated in this session.
-                // Without this, every regeneration creates a new id → orphaned entries pile up.
+                // If the backend already saved the BOM to Cosmos and returned its ID,
+                // use that stable ID so Redux and Cosmos are always in sync.
+                // Otherwise reuse an existing session BOM ID (prevents orphaned entries on regen).
+                const backendBomId = finalEvt.bom_id
                 const existingBOMId = bomList.find(b => b.creatingSessionId === sid)?.id
-                if (existingBOMId) aiBOM.id = existingBOMId
+                aiBOM.id = backendBomId || existingBOMId || aiBOM.id
                 aiBOM.creatingSessionId = sid
                 saveBOMSession(aiBOM.id, sid)  // persist to localStorage (survives page refresh)
-                // Upgrade the session label to the full BOM name — this is the
-                // most reliable label source and survives hard refresh + backend restart
                 saveSessionLabel(sid, aiBOM.name)
               }
-              if (aiBOM) { setLocalBOM(aiBOM); dispatch(setCurrentBOM(aiBOM)) }
+              if (aiBOM) { setLocalBOM(aiBOM); dispatch(setCurrentBOM(aiBOM)); saveSessionBOM(sid, aiBOM) }
             }
             if ((finalEvt.complete || (aiBOM && aiBOM.lineItems?.length > 0)) && aiBOM) {
-              // Always save to Redux immediately (works offline too)
+              // Save to Redux immediately so BOM panel and library both reflect it.
               dispatch(saveBOM(aiBOM))
-              // Persist to Cosmos — use PUT (update) when the ID was reused from a prior
-              // generation in this session so Rev 2 overwrites Rev 1 in the database.
-              // Fall back to POST (create) for brand-new BOMs.
-              const isRegen = bomList.some(b => b.id === aiBOM.id)
-              ;(isRegen ? bomApi?.update?.(aiBOM.id, aiBOM) : bomApi?.create?.(aiBOM))
-                ?.then(() => setToast({ open: true, msg: 'BOM saved to library', severity: 'success' }))
-                ?.catch(() => setToast({ open: true, msg: 'BOM saved locally — backend sync failed', severity: 'warning' }))
+              refreshHistory()
+              // Backend already saved to Cosmos during streaming (bom_id present).
+              // Only call bomApi.create as a safety net when bom_id is absent
+              // (e.g. older backend version or network race).
+              if (!finalEvt.bom_id) {
+                bomApi?.create?.(aiBOM)
+                  ?.then(() => setToast({ open: true, msg: 'BOM saved to library', severity: 'success' }))
+                  ?.catch((err) => { console.error('[Chat] BOM Cosmos save failed:', err?.response?.data || err?.message, aiBOM?.id); setToast({ open: true, msg: 'BOM saved locally — backend sync failed', severity: 'warning' }) })
+              } else {
+                setToast({ open: true, msg: 'BOM saved to library', severity: 'success' })
+              }
 
               // Preserve the AI's streamed summary text and append the action menu below it.
               // Strip any residual ```json``` fences from the streamed text before displaying.
@@ -1228,7 +1289,7 @@ export default function ChatPage() {
         setSessionId(sid)
         localStorage.setItem('chat_session_id', sid)
         sessionStorage.setItem('chat_session_id', sid)
-        saveSessionLabel(sid, (proj !== 'New Project' ? proj + ' — ' : '') + cat)
+        saveSessionLabel(sid, proj !== 'New Project' ? `${proj} — ${cat}` : `New BOM — ${cat}`)
       }
 
       // Use the category the user selected when starting this session
@@ -1282,6 +1343,7 @@ export default function ChatPage() {
             setLocalBOM(aiBOM)
             dispatch(setCurrentBOM(aiBOM))
             dispatch(saveBOM(aiBOM))
+            saveSessionBOM(sid, aiBOM)
             bomApi?.create?.(aiBOM).catch(() => {})
             const cats = [...new Set(aiBOM.lineItems.map(li => li.category))]
             addMsg({
@@ -1411,7 +1473,7 @@ export default function ChatPage() {
             History &amp; Saved BOMs
           </Typography>
           <Box sx={{ display: 'flex', gap: 0.25, alignItems: 'center' }}>
-            {backendMode && <Tooltip title="Synced with Azure ADLS + Cosmos DB"><CloudDone sx={{ fontSize: 11, color: '#10B981' }} /></Tooltip>}
+
             {(chatHistory.length > 0) && (
               <Tooltip title="Clear all chat history">
                 <IconButton size="small" onClick={() => { clearHidden(); chatHistory.forEach(s => addHidden(s.session_id)); setChatHistory([]) }}
@@ -1451,7 +1513,7 @@ export default function ChatPage() {
                 || getSessionLabel(s.session_id)
                 || (s.title && !s.title.startsWith('New Project') ? s.title : null)
                 || (s.project && s.project !== 'New Project' ? s.project : null)
-                || s.category
+                || (s.category ? `New BOM \u2014 ${s.category}` : null)
                 || 'Chat Session'
               return {
                 key: 'chat_' + s.session_id,
@@ -1671,7 +1733,7 @@ export default function ChatPage() {
                       <Typography sx={{ fontSize: '0.62rem', color: '#9CA3AF', mb: 0.5 }}>Try asking:</Typography>
                       <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.4 }}>
                         {msg.suggestions.map(s => (
-                          <Box key={s} onClick={() => !isTyping && !sendingRef.current && handleSend(s)}
+                          <Box key={s} onClick={() => !isTyping && !sendingRef.current && handleSend(s, !!sessionId)}
                             sx={{ fontSize: '0.7rem', color: '#3B82F6', cursor: isTyping ? 'default' : 'pointer', p: '4px 8px', borderRadius: '4px', bgcolor: '#EFF6FF', opacity: isTyping ? 0.5 : 1, '&:hover': { bgcolor: isTyping ? '#EFF6FF' : '#DBEAFE' } }}>
                             {s}
                           </Box>

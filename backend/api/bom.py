@@ -147,9 +147,10 @@ def _normalize_bom_doc(doc: dict) -> dict:
         normalized.append(item)
     doc["line_items"] = normalized
 
-    # session_id: preserve so frontend can re-link BOM to its chat session after localStorage clear
+    # session_id: preserve so frontend can re-link BOM to its chat session after localStorage clear.
+    # Accept both snake_case (canonical) and camelCase (sent by older frontend versions).
     if not doc.get("session_id"):
-        doc["session_id"] = doc.get("sessionId") or None
+        doc["session_id"] = doc.get("sessionId") or doc.get("creatingSessionId") or None
 
     return doc
 
