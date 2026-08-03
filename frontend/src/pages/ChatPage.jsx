@@ -244,6 +244,24 @@ function exportBOMasCSV(bom) {
   URL.revokeObjectURL(url)
 }
 
+// Calculate BOM total using the same category-based rollup logic as the backend.
+// This ensures frontend-modified BOMs match the backend's validation logic.
+function calculateBOMTotal(lineItems) {
+  let hw = 0, sw = 0, svc = 0
+  const softwareCats = new Set(['Software License', 'Security License', 'SaaS/Subscription'])
+  const serviceCats = new Set(['Support Contract', 'Professional Services', 'Managed Services', 'Training', 'Contingency'])
+  
+  lineItems.forEach(item => {
+    const ep = parseFloat(item.extPrice || 0)
+    const cat = (item.category || '').trim()
+    if (softwareCats.has(cat)) sw += ep
+    else if (serviceCats.has(cat)) svc += ep
+    else hw += ep
+  })
+  
+  return Math.round((hw + sw + svc) * 100) / 100  // round to 2 decimals like backend
+}
+
 function getAIResponse(userMsg, currentBOM, bomList, ctx) {
   const msg = userMsg.toLowerCase().trim()
   const cat = detectCategory(msg)
@@ -293,7 +311,7 @@ function getAIResponse(userMsg, currentBOM, bomList, ctx) {
     const newItems = [...currentBOM.lineItems, newItem]
     const newBOM = {
       ...currentBOM, lineItems: newItems,
-      totalValue: newItems.reduce((s, i) => s + i.extPrice, 0),
+      totalValue: calculateBOMTotal(newItems),
       updatedAt: new Date().toISOString(),
     }
     const priceNote = price
@@ -315,7 +333,7 @@ function getAIResponse(userMsg, currentBOM, bomList, ctx) {
     if (item) {
       const updated = { ...item, unitPrice: newPrice, extPrice: newPrice * item.qty }
       const newItems = currentBOM.lineItems.map(i => i.lineNo === lineNo ? updated : i)
-      const newBOM = { ...currentBOM, lineItems: newItems, totalValue: newItems.reduce((s, i) => s + i.extPrice, 0), updatedAt: new Date().toISOString() }
+      const newBOM = { ...currentBOM, lineItems: newItems, totalValue: calculateBOMTotal(newItems), updatedAt: new Date().toISOString() }
       return { type: 'updated', text: 'Updated **Item ' + lineNo + '** (' + item.description + '): unit price set to **' + fmt(newPrice) + '**. Line total: **' + fmt(updated.extPrice) + '**\n\nRevised BOM total: **' + fmt(newBOM.totalValue) + '**', bom: newBOM }
     }
   }
@@ -354,7 +372,7 @@ function getAIResponse(userMsg, currentBOM, bomList, ctx) {
     if (item) {
       const updated = { ...item, qty: newQty, extPrice: item.unitPrice * newQty }
       const newItems = currentBOM.lineItems.map(i => i.lineNo === lineNo ? updated : i)
-      const newBOM = { ...currentBOM, lineItems: newItems, totalValue: newItems.reduce((s, i) => s + i.extPrice, 0), updatedAt: new Date().toISOString() }
+      const newBOM = { ...currentBOM, lineItems: newItems, totalValue: calculateBOMTotal(newItems), updatedAt: new Date().toISOString() }
       return { type: 'updated', text: 'Updated **Item ' + lineNo + '** (' + item.description + '): qty ' + item.qty + ' -> ' + newQty + '. Line total: **' + fmt(updated.extPrice) + '**\n\nRevised BOM total: **' + fmt(newBOM.totalValue) + '**', bom: newBOM }
     }
   }
@@ -377,7 +395,7 @@ function getAIResponse(userMsg, currentBOM, bomList, ctx) {
     const item = currentBOM.lineItems.find(i => i.lineNo === lineNo)
     if (item) {
       const newItems = currentBOM.lineItems.filter(i => i.lineNo !== lineNo).map((i, idx) => ({ ...i, lineNo: idx + 1 }))
-      const newBOM = { ...currentBOM, lineItems: newItems, totalValue: newItems.reduce((s, i) => s + i.extPrice, 0), updatedAt: new Date().toISOString() }
+      const newBOM = { ...currentBOM, lineItems: newItems, totalValue: calculateBOMTotal(newItems), updatedAt: new Date().toISOString() }
       return { type: 'updated', text: 'Removed **Item ' + lineNo + '**: ' + item.description + '. BOM now has **' + newItems.length + ' items** totalling **' + fmt(newBOM.totalValue) + '**.', bom: newBOM }
     }
   }
@@ -456,7 +474,9 @@ function backendBOMtoFrontend(backendBOM, projectName) {
     qtyBasis:     item.qty_basis     ?? '',
     qtyStatus:    item.qty_status    ?? 'confirmed',
   }))
-  const totalValue = lineItems.reduce((s, i) => s + i.extPrice, 0)
+  // Trust the backend's authoritative total_otc (already validated and rounded).
+  // Only recalculate if the backend didn't provide totals (e.g., old BOM format).
+  const totalValue = backendBOM.totals?.total_otc ?? calculateBOMTotal(lineItems)
   const cat = backendBOM.category || 'Data Center / COLO'
   const proj = backendBOM.project || projectName || 'New Project'
   return {
