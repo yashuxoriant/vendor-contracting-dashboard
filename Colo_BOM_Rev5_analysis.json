@@ -1,0 +1,457 @@
+{
+  "file": "Colo_BOM_Rev5.xlsx",
+  "sheets": [
+    {
+      "name": "Rev2 Change Log",
+      "rows": 17,
+      "columns": [
+        "BOM REVISION 2 \u2014 CHANGE LOG vs. REVISION 1",
+        "Unnamed: 1",
+        "Unnamed: 2",
+        "Unnamed: 3"
+      ],
+      "sample_data": [
+        {
+          "BOM REVISION 2 \u2014 CHANGE LOG vs. REVISION 1": "Changes driven by: seller infrastructure detail email + SAP\u2192RISE decision + PLM migration + Commvault like-for-like",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "nan",
+          "Unnamed: 3": "nan"
+        },
+        {
+          "BOM REVISION 2 \u2014 CHANGE LOG vs. REVISION 1": "IBM Spectrum Protect (TSM)",
+          "Unnamed: 1": "Retained \u2014 covers IBM Power Stack 3 (Storage Protect workload) and remaining Power stacks",
+          "Unnamed: 2": "RETAINED",
+          "Unnamed: 3": "Storage Protect is a dedicated IBM Power workload (Stack 3). Required for AIX backup across remaining Power stacks (Stack 3 & 4)."
+        },
+        {
+          "BOM REVISION 2 \u2014 CHANGE LOG vs. REVISION 1": "Tape Library (TS4500)",
+          "Unnamed: 1": "Activated \u2014 qty set to 1 with LTO-9 drives and media",
+          "Unnamed: 2": "ACTIVATED",
+          "Unnamed: 3": "Required for Commvault (x86 Stack 4) and long-term retention. Seller runs TS4500 in production."
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "Unnamed: 1",
+          "Unnamed: 2",
+          "Unnamed: 3"
+        ]
+      }
+    },
+    {
+      "name": "BOM Rev2",
+      "rows": 79,
+      "columns": [
+        "COLOCATION BOM \u2014 REVISION 2 | DIVESTITURE TARGET STATE",
+        "Unnamed: 1",
+        "Unnamed: 2",
+        "Unnamed: 3",
+        "Unnamed: 4",
+        "Unnamed: 5",
+        "Unnamed: 6"
+      ],
+      "sample_data": [
+        {
+          "COLOCATION BOM \u2014 REVISION 2 | DIVESTITURE TARGET STATE": "SAP \u2192 RISE Azure (removed) | PLM \u2192 TBD (parked) | Commvault like-for-like | IBM Power Stacks 3 & 4 retained",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "nan",
+          "Unnamed: 3": "nan",
+          "Unnamed: 4": "nan",
+          "Unnamed: 5": "nan",
+          "Unnamed: 6": "nan"
+        },
+        {
+          "COLOCATION BOM \u2014 REVISION 2 | DIVESTITURE TARGET STATE": "  NETWORK INFRASTRUCTURE",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "nan",
+          "Unnamed: 3": "nan",
+          "Unnamed: 4": "nan",
+          "Unnamed: 5": "nan",
+          "Unnamed: 6": "nan"
+        },
+        {
+          "COLOCATION BOM \u2014 REVISION 2 | DIVESTITURE TARGET STATE": "LEGEND:",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "NEW \u2014 not in Rev 1",
+          "Unnamed: 3": "MODIFIED from Rev 1",
+          "Unnamed: 4": "UNCHANGED",
+          "Unnamed: 5": "PARKED / TBD \u2014 not costed",
+          "Unnamed: 6": "nan"
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "Unnamed: 1",
+          "Unnamed: 2",
+          "Unnamed: 3",
+          "Unnamed: 4",
+          "Unnamed: 5",
+          "Unnamed: 6"
+        ]
+      }
+    },
+    {
+      "name": "Assumptions & Open Items",
+      "rows": 15,
+      "columns": [
+        "KEY ASSUMPTIONS & OPEN ITEMS \u2014 BOM REVISION 2",
+        "Unnamed: 1"
+      ],
+      "sample_data": [
+        {
+          "KEY ASSUMPTIONS & OPEN ITEMS \u2014 BOM REVISION 2": "Item",
+          "Unnamed: 1": "Detail"
+        },
+        {
+          "KEY ASSUMPTIONS & OPEN ITEMS \u2014 BOM REVISION 2": "Oracle Licensing",
+          "Unnamed: 1": "OPEN: Oracle DB EE on IBM Power (HFM/Stack 4) is subject to IBM Power core factor multiplier. Exact cost depends on LPAR core allocation. License cost placeholder \u2014 validate with Oracle LMS before finalising. Consider this a material cost risk item."
+        },
+        {
+          "KEY ASSUMPTIONS & OPEN ITEMS \u2014 BOM REVISION 2": "Prices",
+          "Unnamed: 1": "All prices are list price estimates. Assume 25-40% discount via Cisco/IBM/Lenovo partners on hardware. Commvault and VMware discounts vary \u2014 get competitive quotes. IBM Power hardware discounts are typically lower (10-20%)."
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "KEY ASSUMPTIONS & OPEN ITEMS \u2014 BOM REVISION 2",
+          "Unnamed: 1"
+        ]
+      }
+    },
+    {
+      "name": "BOM Rev3",
+      "rows": 76,
+      "columns": [
+        "COLOCATION BOM \u2014 REVISION 3 | RIGHT-SIZED FOR 100 APPLICATIONS",
+        "Unnamed: 1",
+        "Unnamed: 2",
+        "Unnamed: 3",
+        "Unnamed: 4",
+        "Unnamed: 5",
+        "Unnamed: 6"
+      ],
+      "sample_data": [
+        {
+          "COLOCATION BOM \u2014 REVISION 3 | RIGHT-SIZED FOR 100 APPLICATIONS": "Right-sizing applied to x86 compute, network core/agg, VMware NSX, load balancing, and WAN routing | Blue = right-sized vs Rev2",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "nan",
+          "Unnamed: 3": "nan",
+          "Unnamed: 4": "nan",
+          "Unnamed: 5": "nan",
+          "Unnamed: 6": "nan"
+        },
+        {
+          "COLOCATION BOM \u2014 REVISION 3 | RIGHT-SIZED FOR 100 APPLICATIONS": "Storage (Object)",
+          "Unnamed: 1": "IBM COS / Spectrum Scale Cluster",
+          "Unnamed: 2": "Accesser (2-node) + Slicetor (4-node) + JBOD",
+          "Unnamed: 3": "1",
+          "Unnamed: 4": "95000",
+          "Unnamed: 5": "95000",
+          "Unnamed: 6": "Object storage tier \u2014 backup offload for Storage Protect (Stack 3)."
+        },
+        {
+          "COLOCATION BOM \u2014 REVISION 3 | RIGHT-SIZED FOR 100 APPLICATIONS": "LEGEND:",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "RIGHT-SIZED vs Rev2 (blue)",
+          "Unnamed: 3": "NEW vs Rev1",
+          "Unnamed: 4": "MODIFIED",
+          "Unnamed: 5": "PARKED / TBD \u2014 $0",
+          "Unnamed: 6": "UNCHANGED"
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "Unnamed: 1",
+          "Unnamed: 2",
+          "Unnamed: 3",
+          "Unnamed: 4",
+          "Unnamed: 5",
+          "Unnamed: 6"
+        ]
+      }
+    },
+    {
+      "name": "Right-Sizing Summary",
+      "rows": 14,
+      "columns": [
+        "RIGHT-SIZING SUMMARY \u2014 REV2 vs REV3",
+        "Unnamed: 1",
+        "Unnamed: 2",
+        "Unnamed: 3",
+        "Unnamed: 4"
+      ],
+      "sample_data": [
+        {
+          "RIGHT-SIZING SUMMARY \u2014 REV2 vs REV3": "Changes applied to x86 compute, network, VMware NSX, load balancing, and WAN routing",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "nan",
+          "Unnamed: 3": "nan",
+          "Unnamed: 4": "nan"
+        },
+        {
+          "RIGHT-SIZING SUMMARY \u2014 REV2 vs REV3": "Network Aggregation Layer",
+          "Unnamed: 1": "6x 93180YC-FX @ $168K",
+          "Unnamed: 2": "Removed \u2014 collapsed spine-leaf",
+          "Unnamed: 3": "168000",
+          "Unnamed: 4": "Dedicated aggregation layer unnecessary at 8-rack scale. ToR switches connect directly to spine. Cleaner and cheaper architecture."
+        },
+        {
+          "RIGHT-SIZING SUMMARY \u2014 REV2 vs REV3": "TOTAL RIGHT-SIZING SAVING (Rev2 \u2192 Rev3)",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "nan",
+          "Unnamed: 3": "899650",
+          "Unnamed: 4": "Rev2 total: $5,761,420 \u2192 Rev3 est: ~$4,861,770"
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "Unnamed: 1",
+          "Unnamed: 2",
+          "Unnamed: 3",
+          "Unnamed: 4"
+        ]
+      }
+    },
+    {
+      "name": "BOM Rev4",
+      "rows": 69,
+      "columns": [
+        "COLOCATION BOM \u2014 REVISION 4 | DIVESTITURE TARGET STATE",
+        "Unnamed: 1",
+        "Unnamed: 2",
+        "Unnamed: 3",
+        "Unnamed: 4",
+        "Unnamed: 5",
+        "Unnamed: 6"
+      ],
+      "sample_data": [
+        {
+          "COLOCATION BOM \u2014 REVISION 4 | DIVESTITURE TARGET STATE": "Rev4 changes: UCS removed (SAP\u2192RISE) | IBM Power right-sized | Storage consolidated | SAN Directors\u2192switches | VMware resized",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "nan",
+          "Unnamed: 3": "nan",
+          "Unnamed: 4": "nan",
+          "Unnamed: 5": "nan",
+          "Unnamed: 6": "nan"
+        },
+        {
+          "COLOCATION BOM \u2014 REVISION 4 | DIVESTITURE TARGET STATE": "Network Spine",
+          "Unnamed: 1": "Cisco Nexus 9336C-FX2 Spine Switch",
+          "Unnamed: 2": "N9K-C9336C-FX2 (36x 100GbE QSFP28) \u2014 HA pair",
+          "Unnamed: 3": "2",
+          "Unnamed: 4": "38000",
+          "Unnamed: 5": "76000",
+          "Unnamed: 6": "Fixed-form spine switches. Right-sized for 8-rack private colo."
+        },
+        {
+          "COLOCATION BOM \u2014 REVISION 4 | DIVESTITURE TARGET STATE": "LEGEND:",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "MODIFIED from Rev3",
+          "Unnamed: 3": "NEW vs Rev1",
+          "Unnamed: 4": "RIGHT-SIZED",
+          "Unnamed: 5": "PARKED / TBD \u2014 $0",
+          "Unnamed: 6": "UNCHANGED"
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "Unnamed: 1",
+          "Unnamed: 2",
+          "Unnamed: 3",
+          "Unnamed: 4",
+          "Unnamed: 5",
+          "Unnamed: 6"
+        ]
+      }
+    },
+    {
+      "name": "Rev4 Change Log",
+      "rows": 18,
+      "columns": [
+        "BOM REVISION 4 \u2014 CHANGE LOG vs. REVISION 3",
+        "Unnamed: 1",
+        "Unnamed: 2",
+        "Unnamed: 3"
+      ],
+      "sample_data": [
+        {
+          "BOM REVISION 4 \u2014 CHANGE LOG vs. REVISION 3": "Item",
+          "Unnamed: 1": "Change",
+          "Unnamed: 2": "Action",
+          "Unnamed: 3": "Notes / Rationale"
+        },
+        {
+          "BOM REVISION 4 \u2014 CHANGE LOG vs. REVISION 3": "IBM SAN Director (SAN768B-2)",
+          "Unnamed: 1": "Replaced with IBM SAN48B-6 standard switches",
+          "Unnamed: 2": "MODIFIED",
+          "Unnamed: 3": "Director-class overkill at this scale. IBM SAN48B-6 (32Gb FC, 48-port) HA pair. Saving ~$130K."
+        },
+        {
+          "BOM REVISION 4 \u2014 CHANGE LOG vs. REVISION 3": "Fiber Optic AOC + Optics",
+          "Unnamed: 1": "Quantities reduced",
+          "Unnamed: 2": "MODIFIED",
+          "Unnamed: 3": "Reduced to match right-sized host count of 20 hosts."
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "Unnamed: 1",
+          "Unnamed: 2",
+          "Unnamed: 3"
+        ]
+      }
+    },
+    {
+      "name": "BOM Rev5",
+      "rows": 69,
+      "columns": [
+        "COLOCATION BOM \u2014 REVISION 5 | DIVESTITURE TARGET STATE",
+        "Unnamed: 1",
+        "Unnamed: 2",
+        "Unnamed: 3",
+        "Unnamed: 4",
+        "Unnamed: 5",
+        "Unnamed: 6"
+      ],
+      "sample_data": [
+        {
+          "COLOCATION BOM \u2014 REVISION 5 | DIVESTITURE TARGET STATE": "Rev5: Cisco MDS removed (no UCS) | IBM SAN switches qty 2\u21924 | FC optics right-sized for IBM switches only",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "nan",
+          "Unnamed: 3": "nan",
+          "Unnamed: 4": "nan",
+          "Unnamed: 5": "nan",
+          "Unnamed: 6": "nan"
+        },
+        {
+          "COLOCATION BOM \u2014 REVISION 5 | DIVESTITURE TARGET STATE": "Network Spine",
+          "Unnamed: 1": "Cisco Nexus 9336C-FX2 Spine Switch",
+          "Unnamed: 2": "N9K-C9336C-FX2 (36x 100GbE QSFP28) \u2014 HA pair",
+          "Unnamed: 3": "2",
+          "Unnamed: 4": "38000",
+          "Unnamed: 5": "76000",
+          "Unnamed: 6": "Fixed-form spine switches \u2014 right-sized for 8-rack private colo."
+        },
+        {
+          "COLOCATION BOM \u2014 REVISION 5 | DIVESTITURE TARGET STATE": "LEGEND:",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "MODIFIED from Rev4",
+          "Unnamed: 3": "NEW vs Rev1",
+          "Unnamed: 4": "RIGHT-SIZED",
+          "Unnamed: 5": "PARKED / TBD \u2014 $0",
+          "Unnamed: 6": "UNCHANGED"
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "Unnamed: 1",
+          "Unnamed: 2",
+          "Unnamed: 3",
+          "Unnamed: 4",
+          "Unnamed: 5",
+          "Unnamed: 6"
+        ]
+      }
+    },
+    {
+      "name": "Rev5 Change Log",
+      "rows": 4,
+      "columns": [
+        "BOM REVISION 5 \u2014 CHANGE LOG vs. REVISION 4",
+        "Unnamed: 1",
+        "Unnamed: 2",
+        "Unnamed: 3"
+      ],
+      "sample_data": [
+        {
+          "BOM REVISION 5 \u2014 CHANGE LOG vs. REVISION 4": "Item",
+          "Unnamed: 1": "Change",
+          "Unnamed: 2": "Action",
+          "Unnamed: 3": "Rationale"
+        },
+        {
+          "BOM REVISION 5 \u2014 CHANGE LOG vs. REVISION 4": "IBM SAN48B-6 Switch",
+          "Unnamed: 1": "Qty 2 \u2192 4 (2 per room)",
+          "Unnamed: 2": "MODIFIED",
+          "Unnamed: 3": "Increased to cover all SAN connectivity \u2014 IBM Power and x86 block storage \u2014 across both rooms. Previously sized for IBM Power only."
+        },
+        {
+          "BOM REVISION 5 \u2014 CHANGE LOG vs. REVISION 4": "FC SFP+ Optics",
+          "Unnamed: 1": "Qty 80\u219264 | Renamed from Cisco DS-SFP-FC32G-SW to IBM SAN Switch FC SFP+",
+          "Unnamed: 2": "MODIFIED",
+          "Unnamed: 3": "Cisco MDS removed \u2014 optics no longer need to be Cisco-compatible. Resized for 4x IBM SAN48B-6 switches only. Qty reduced accordingly."
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "Unnamed: 1",
+          "Unnamed: 2",
+          "Unnamed: 3"
+        ]
+      }
+    },
+    {
+      "name": "HW vs SW Split",
+      "rows": 56,
+      "columns": [
+        "BOM REV5 \u2014 HARDWARE vs. SOFTWARE / LICENSING SPLIT",
+        "Unnamed: 1",
+        "Unnamed: 2",
+        "Unnamed: 3",
+        "Unnamed: 4",
+        "Unnamed: 5",
+        "Unnamed: 6",
+        "Unnamed: 7",
+        "Unnamed: 8"
+      ],
+      "sample_data": [
+        {
+          "BOM REV5 \u2014 HARDWARE vs. SOFTWARE / LICENSING SPLIT": "Updated for Rev5 | Cisco MDS removed | IBM SAN48B-6 x4 | FC optics right-sized | 43 live BOM lines classified",
+          "Unnamed: 1": "nan",
+          "Unnamed: 2": "nan",
+          "Unnamed: 3": "nan",
+          "Unnamed: 4": "nan",
+          "Unnamed: 5": "nan",
+          "Unnamed: 6": "nan",
+          "Unnamed: 7": "nan",
+          "Unnamed: 8": "nan"
+        },
+        {
+          "BOM REV5 \u2014 HARDWARE vs. SOFTWARE / LICENSING SPLIT": "Backup (x86)",
+          "Unnamed: 1": "Commvault 3yr Support & Maintenance",
+          "Unnamed: 2": "22% annual maintenance",
+          "Unnamed: 3": "1",
+          "Unnamed: 4": "79200",
+          "Unnamed: 5": "79200",
+          "Unnamed: 6": "SOFTWARE",
+          "Unnamed: 7": "CDW SW / Commvault",
+          "Unnamed: 8": "3yr maintenance \u2014 same route as license."
+        },
+        {
+          "BOM REV5 \u2014 HARDWARE vs. SOFTWARE / LICENSING SPLIT": "Oracle Direct / LAR Only",
+          "Unnamed: 1": "Oracle DB SE2 (HFM placeholder). MUST go Oracle direct or Licensed Oracle Reseller. Do NOT use CDW. Validate SE2 compatibility with HFM version. Confirm core count with Oracle LMS before PO \u2014 material cost risk.",
+          "Unnamed: 2": "nan",
+          "Unnamed: 3": "nan",
+          "Unnamed: 4": "nan",
+          "Unnamed: 5": "nan",
+          "Unnamed: 6": "nan",
+          "Unnamed: 7": "nan",
+          "Unnamed: 8": "nan"
+        }
+      ],
+      "detected_fields": {
+        "description": [
+          "Unnamed: 1",
+          "Unnamed: 2",
+          "Unnamed: 3",
+          "Unnamed: 4",
+          "Unnamed: 5",
+          "Unnamed: 6",
+          "Unnamed: 7",
+          "Unnamed: 8"
+        ]
+      }
+    }
+  ],
+  "patterns": {}
+}

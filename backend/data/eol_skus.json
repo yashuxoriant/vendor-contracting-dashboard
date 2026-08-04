@@ -1,0 +1,195 @@
+{
+  "_comment": "EOL/EOS reference data for common enterprise IT SKUs. Dates are YYYY-MM-DD. Replace/augment from vendor portals.",
+  "skus": {
+    "C9300-48P-A": {
+      "description": "Cisco Catalyst 9300 48-Port PoE+ Switch",
+      "vendor": "Cisco",
+      "eol_announced": "2023-02-15",
+      "end_of_sale": "2024-02-15",
+      "end_of_support": "2029-02-15",
+      "replacement_sku": "C9300-48P-E",
+      "replacement_desc": "Cisco Catalyst 9300-48P-E (updated platform with enhanced security)",
+      "severity": "warning"
+    },
+    "C9300-48P-E": {
+      "description": "Cisco Catalyst 9300 48-Port PoE+ Switch (E model)",
+      "vendor": "Cisco",
+      "eol_announced": null,
+      "end_of_sale": null,
+      "end_of_support": null,
+      "replacement_sku": null,
+      "replacement_desc": null,
+      "severity": "none"
+    },
+    "C3750X-48P-L": {
+      "description": "Cisco Catalyst 3750-X 48-Port PoE Switch",
+      "vendor": "Cisco",
+      "eol_announced": "2016-10-30",
+      "end_of_sale": "2017-10-29",
+      "end_of_support": "2022-10-31",
+      "replacement_sku": "C9300-48P-E",
+      "replacement_desc": "Cisco Catalyst 9300-48P-E",
+      "severity": "critical"
+    },
+    "ASR1001-X": {
+      "description": "Cisco ASR 1001-X Router",
+      "vendor": "Cisco",
+      "eol_announced": "2022-12-19",
+      "end_of_sale": "2023-12-18",
+      "end_of_support": "2028-12-18",
+      "replacement_sku": "ASR1001-HX",
+      "replacement_desc": "Cisco ASR 1001-HX — higher throughput and redundant PSU",
+      "severity": "warning"
+    },
+    "ASR1001-HX": {
+      "description": "Cisco ASR 1001-HX Router",
+      "vendor": "Cisco",
+      "eol_announced": null,
+      "end_of_sale": null,
+      "end_of_support": null,
+      "replacement_sku": null,
+      "replacement_desc": null,
+      "severity": "none"
+    },
+    "PA-220": {
+      "description": "Palo Alto PA-220 Next-Gen Firewall",
+      "vendor": "Palo Alto Networks",
+      "eol_announced": "2023-03-31",
+      "end_of_sale": "2023-09-30",
+      "end_of_support": "2026-03-31",
+      "replacement_sku": "PA-445",
+      "replacement_desc": "Palo Alto PA-445 — ML-Powered NGFW with higher throughput",
+      "severity": "warning"
+    },
+    "PA-445": {
+      "description": "Palo Alto PA-445 NGFW",
+      "vendor": "Palo Alto Networks",
+      "eol_announced": null,
+      "end_of_sale": null,
+      "end_of_support": null,
+      "replacement_sku": null,
+      "replacement_desc": null,
+      "severity": "none"
+    },
+    "WS-C2960S-48TS-L": {
+      "description": "Cisco Catalyst 2960S 48-Port Switch",
+      "vendor": "Cisco",
+      "eol_announced": "2016-10-30",
+      "end_of_sale": "2017-10-29",
+      "end_of_support": "2022-10-31",
+      "replacement_sku": "C9200-48T",
+      "replacement_desc": "Cisco Catalyst 9200 48-Port Switch",
+      "severity": "critical"
+    },
+    "N9K-C9396PX": {
+      "description": "Cisco Nexus 9396PX Modular Chassis",
+      "vendor": "Cisco",
+      "eol_announced": "2020-01-10",
+      "end_of_sale": "2021-01-09",
+      "end_of_support": "2026-01-31",
+      "replacement_sku": "N9K-C9372TX-E",
+      "replacement_desc": "Cisco Nexus 93XX EX — fixed 1/10/25G with line-rate encryption",
+      "severity": "warning"
+    },
+    "UCS-C240-M4SX": {
+      "description": "Cisco UCS C240 M4 Rack Server",
+      "vendor": "Cisco",
+      "eol_announced": "2018-06-30",
+      "end_of_sale": "2019-06-30",
+      "end_of_support": "2024-06-30",
+      "replacement_sku": "UCSC-C240-M6SX",
+      "replacement_desc": "Cisco UCS C240 M6 — 3rd Gen Intel Xeon Scalable",
+      "severity": "critical"
+    },
+    "UCSC-C240-M6SX": {
+      "description": "Cisco UCS C240 M6 Rack Server",
+      "vendor": "Cisco",
+      "eol_announced": null,
+      "end_of_sale": null,
+      "end_of_support": null,
+      "replacement_sku": null,
+      "replacement_desc": null,
+      "severity": "none"
+    },
+    "MX85": {
+      "description": "Cisco Meraki MX85 Security Appliance",
+      "vendor": "Cisco Meraki",
+      "eol_announced": null,
+      "end_of_sale": null,
+      "end_of_support": null,
+      "replacement_sku": null,
+      "replacement_desc": null,
+      "severity": "none"
+    },
+    "FALCON-PREVENT": {
+      "description": "CrowdStrike Falcon Prevent (Legacy SKU)",
+      "vendor": "CrowdStrike",
+      "eol_announced": null,
+      "end_of_sale": null,
+      "end_of_support": null,
+      "replacement_sku": null,
+      "replacement_desc": null,
+      "severity": "none"
+    },
+    "ISR4331/K9": {
+      "description": "Cisco ISR 4331 Integrated Services Router",
+      "vendor": "Cisco",
+      "eol_announced": "2023-09-30",
+      "end_of_sale": "2024-09-29",
+      "end_of_support": "2029-09-30",
+      "replacement_sku": "ISR1100-6G",
+      "replacement_desc": "Cisco ISR 1100 Series — cloud-managed, lower TCO",
+      "severity": "warning"
+    },
+    "HP-DL380-G9": {
+      "description": "HPE ProLiant DL380 Gen9 Server",
+      "vendor": "HPE",
+      "eol_announced": "2021-06-01",
+      "end_of_sale": "2022-01-31",
+      "end_of_support": "2026-01-31",
+      "replacement_sku": "HP-DL380-G11",
+      "replacement_desc": "HPE ProLiant DL380 Gen11 — 4th Gen Xeon, PCIe5, CXL support",
+      "severity": "critical"
+    },
+    "HP-DL380-G10": {
+      "description": "HPE ProLiant DL380 Gen10 Server",
+      "vendor": "HPE",
+      "eol_announced": "2023-01-15",
+      "end_of_sale": "2024-01-31",
+      "end_of_support": "2028-01-31",
+      "replacement_sku": "HP-DL380-G11",
+      "replacement_desc": "HPE ProLiant DL380 Gen11",
+      "severity": "warning"
+    },
+    "HP-DL380-G11": {
+      "description": "HPE ProLiant DL380 Gen11 Server",
+      "vendor": "HPE",
+      "eol_announced": null,
+      "end_of_sale": null,
+      "end_of_support": null,
+      "replacement_sku": null,
+      "replacement_desc": null,
+      "severity": "none"
+    },
+    "DELL-R740XD": {
+      "description": "Dell PowerEdge R740xd Server",
+      "vendor": "Dell",
+      "eol_announced": "2022-10-01",
+      "end_of_sale": "2023-04-01",
+      "end_of_support": "2027-04-01",
+      "replacement_sku": "DELL-R760XD",
+      "replacement_desc": "Dell PowerEdge R760xd — PCIe5, DDR5 memory",
+      "severity": "warning"
+    },
+    "DELL-R760XD": {
+      "description": "Dell PowerEdge R760xd Server",
+      "vendor": "Dell",
+      "eol_announced": null,
+      "end_of_sale": null,
+      "end_of_support": null,
+      "replacement_sku": null,
+      "replacement_desc": null,
+      "severity": "none"
+    }
+  }
+}

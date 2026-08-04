@@ -1,0 +1,72 @@
+name: Deploy Dashboard to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'index.html'
+      - 'catalog_data.json'
+      - 'assets/**'
+      - '*.css'
+      - '*.js'
+      - '.github/workflows/deploy-pages.yml'
+  workflow_dispatch:
+
+# Permissions needed for GitHub Pages deployment
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment, skip queued ones
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      
+      - name: Prepare deployment artifact
+        run: |
+          # Create a clean deployment folder
+          mkdir -p _site
+          
+          # Copy dashboard files
+          cp index.html _site/ 2>/dev/null || echo "⚠️ index.html not found"
+          cp catalog_data.json _site/ 2>/dev/null || echo "⚠️ catalog_data.json not found"
+          
+          # Copy any optional asset folders/files
+          [ -d "assets" ] && cp -r assets _site/ || true
+          [ -f "favicon.ico" ] && cp favicon.ico _site/ || true
+          [ -f "style.css" ] && cp style.css _site/ || true
+          [ -f "app.js" ] && cp app.js _site/ || true
+          [ -f "README.md" ] && cp README.md _site/ || true
+          
+          echo "📦 Deployment artifact contents:"
+          ls -la _site/
+      
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '_site'
+      
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+      
+      - name: Report deployment URL
+        run: |
+          echo "✅ Dashboard deployed successfully!"
+          echo "🌐 URL: ${{ steps.deployment.outputs.page_url }}"
