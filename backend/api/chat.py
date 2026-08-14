@@ -332,6 +332,22 @@ async def stream_message(request: ChatMessageRequest, background_tasks: Backgrou
             latest_session.context.progress_percentage = float(progress)
             if saved_bom_id:
                 latest_session.context.bom_id = saved_bom_id
+
+            # ── Persist orchestrator state machine fields back to Cosmos ──────────
+            # orch.process() mutates session_doc["context"] in-place (agent_state,
+            # current_phase_name, current_phase).  Without this block those mutations
+            # are discarded and every turn re-starts from phase=intake, agent_state={}.
+            # That is the root cause of: pre-gate never firing, assumption questions
+            # never being asked, phase addendums always injecting INTAKE instructions,
+            # and the AI generating BOMs without user confirmation on every turn.
+            updated_ctx = session_doc.get("context", {})
+            if updated_ctx.get("agent_state"):
+                latest_session.context.agent_state = updated_ctx["agent_state"]
+            if updated_ctx.get("current_phase_name"):
+                latest_session.context.current_phase_name = updated_ctx["current_phase_name"]
+            if updated_ctx.get("current_phase"):
+                latest_session.context.current_phase = updated_ctx["current_phase"]
+
             latest_session.updated_at = datetime.utcnow()
 
             if complete:
@@ -669,10 +685,22 @@ async def get_session_transcript(session_id: str, user_id: str = "demo_user"):
         raise HTTPException(status_code=404, detail="Session not found")
     conv = session_data.get("conversation", [])
     ctx  = session_data.get("context", {})
+
+    # Fetch linked BOM so the frontend preview panel is populated on session restore
+    bom_data = None
+    bom_id = ctx.get("bom_id")
+    if bom_id:
+        try:
+            bom_data = cosmos_client.get_bom(bom_id)
+        except Exception:
+            bom_data = None
+
     return {
         "session_id": session_id,
         "category": ctx.get("category"),
         "project": ctx.get("project_name"),
+        "agent_state": ctx.get("agent_state", {}),
+        "bom": bom_data,
         "messages": [{"role": m.get("role"), "content": m.get("content"), "timestamp": m.get("timestamp")} for m in conv],
         "source": "cosmos",
     }

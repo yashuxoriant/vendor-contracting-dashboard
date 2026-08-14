@@ -23,7 +23,7 @@ import logging
 import json
 import re
 import hashlib
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Callable, Dict, Any, Optional, Tuple, List
 from enum import Enum
 
 from ai.client import call_ai
@@ -53,7 +53,7 @@ _PHASE_GATES: Dict[BOMPhase, List[str]] = {
     BOMPhase.QUALIFY:  ["workstream_category"],                                     # Need category (ma_phase assumed Day-1)
     BOMPhase.SCOPE:    ["conveyance_status"],                                       # Need conveying decision
     BOMPhase.SIZING:   ["site_count"],                                              # Need site count
-    BOMPhase.GENERATE: ["site_count"],                                              # Need count (date optional)
+    BOMPhase.GENERATE: ["site_count", "conveyance_status"],                          # Need count + conveyance decision
     BOMPhase.VALIDATE: [],                                                          # Auto after generate
     BOMPhase.COMPLETE: [],                                                          # Auto after validate
 }
@@ -313,6 +313,22 @@ def _enforce_bom_scope(
     return bom
 
 
+def _parse_numeric(value: Any, default: float = 0.0) -> float:
+    """
+    Safely coerce a value to float, handling AI-formatted strings like '$350,720' or '1,200.50'.
+    Strips currency symbols, commas, and spaces before parsing. Returns default on failure.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        cleaned = str(value).replace("$", "").replace(",", "").replace(" ", "").strip()
+        return float(cleaned) if cleaned else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _validate_bom_dependencies(bom: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """
     Deterministic post-processing pass for LLM-generated BOM JSON.
@@ -326,16 +342,8 @@ def _validate_bom_dependencies(bom: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
 
     # 1) Recompute line extended prices and normalise qty
     for item in items:
-        qty = item.get("qty") or item.get("quantity") or 1
-        try:
-            qty = float(qty)
-        except (TypeError, ValueError):
-            qty = 1.0
-        up = item.get("unit_price") or 0
-        try:
-            up = float(up)
-        except (TypeError, ValueError):
-            up = 0.0
+        qty = _parse_numeric(item.get("qty") or item.get("quantity"), default=1.0) or 1.0
+        up = _parse_numeric(item.get("unit_price"), default=0.0)
         item["qty"] = qty
         item["quantity"] = qty
         item["unit_price"] = up
@@ -404,7 +412,7 @@ def _validate_bom_dependencies(bom: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
             hw += ep
 
     computed_total = round(hw + sw + svc, 2)
-    prior_total = float((bom.get("totals") or {}).get("total_otc") or 0)
+    prior_total = _parse_numeric((bom.get("totals") or {}).get("total_otc"), default=0.0)
     if prior_total and abs(prior_total - computed_total) > 0.5:
         warnings.append(
             f"⚠️ Total corrected: previous total_otc ${prior_total:,.0f} did not match line-item sum ${computed_total:,.0f}."
@@ -415,7 +423,7 @@ def _validate_bom_dependencies(bom: Dict[str, Any]) -> Tuple[Dict[str, Any], Lis
     totals["software"] = round(sw, 2)
     totals["services"] = round(svc, 2)
     totals["total_otc"] = computed_total
-    totals["tco_3year"] = totals.get("tco_3year") or round(computed_total * 1.4, 2)
+    totals["tco_3year"] = _parse_numeric(totals.get("tco_3year"), default=0.0) or round(computed_total * 1.4, 2)
     bom["totals"] = totals
     bom["warnings"] = warnings
     return bom, warnings
@@ -450,11 +458,13 @@ def _retrieve_bom_context(query: str, bom_id: Optional[str] = None, top_k: int =
         return ""
 
 
-def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
+def _extract_fields_from_message(message: str, agent_state: Dict, from_ai: bool = False) -> Dict:
     """
     Deterministically extract intake fields from a user message.
     Updates agent_state in-place; returns updated dict.
     Real-life example: user says "TSA exit for 10 sites, Cisco standard, Day 1 March 15"
+    Set from_ai=True when processing AI response text — skips assumption extractors
+    to prevent AI phrasing from poisoning user-confirmed state.
     """
     m = message.lower()
 
@@ -488,6 +498,13 @@ def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
     if not agent_state.get("conveyance_status"):
         if re.search(r"not.convey|not.transfer|stay\s+with|msp.own|leased|shared", m):
             agent_state["conveyance_status"] = "not_conveying"
+        elif re.search(
+            r"greenfield|fresh.install|new.deploy|net.new|brand.new"
+            r"|no.existing|from.scratch|new.build|brand.new.deploy",
+            m,
+        ):
+            # Greenfield / new build — nothing to convey, buy everything new
+            agent_state["conveyance_status"] = "not_conveying"
         elif re.search(r"convey|transfer|coming.with|brings.with|inheriting", m):
             if re.search(r"eol|end.of.life|eos|end.of.support|outdated|old", m):
                 agent_state["conveyance_status"] = "conveying_eol"
@@ -495,6 +512,9 @@ def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
                 agent_state["conveyance_status"] = "conveying_active"
         elif re.search(r"shared|multi.tenant|common.infra", m):
             agent_state["conveyance_status"] = "shared"
+        elif re.search(r"\bdedicated\b|\bstand.?alone\b|\bour.own\b|\bnew.build\b", m):
+            # Dedicated sites → buyer gets own infrastructure, nothing conveying
+            agent_state["conveyance_status"] = "not_conveying"
 
     # Site count
     if not agent_state.get("site_count"):
@@ -507,6 +527,17 @@ def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
         um = re.search(r"(\d+)\s*(?:user|employee|seat|staff|person)", m)
         if um:
             agent_state["user_count"] = int(um.group(1))
+
+    # Site size / scale classification — qualitative (small / medium / large / FF)
+    # Captures phrases like "small sites", "full floor", "FF", "same size" so the
+    # Users / Scale intake checkbox ticks even without a numeric user count.
+    if not agent_state.get("site_size"):
+        if re.search(r"\bfull.?floor\b|\bff\b|\bmedium\s+(?:branch|site|office)\b", m):
+            agent_state["site_size"] = "medium"
+        elif re.search(r"\bsmall\s+(?:branch|site|office|format)\b|\bss\b|\bsame\s+size\b", m):
+            agent_state["site_size"] = "small"
+        elif re.search(r"\blarge\s+(?:branch|site|office)\b|\bheadquarters\b|\bhq\b", m):
+            agent_state["site_size"] = "large"
 
     # Day 1 / Required-by date
     if not agent_state.get("required_by_date"):
@@ -522,6 +553,16 @@ def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
             dm2 = re.search(r"\b(20\d{2})[-/](0?\d|1[0-2])[-/](0?\d|[12]\d|3[01])\b", message)
             if dm2:
                 agent_state["required_by_date"] = dm2.group(0)
+            else:
+                # Quarter notation: "Q3 2025", "Q4-2026", "end of Q2", "year end 2025"
+                dm3 = re.search(
+                    r"\bq[1-4][\s\-/]*20\d{2}\b"
+                    r"|end\s+of\s+(?:q[1-4]|year|20\d{2})"
+                    r"|year[\s\-]?end\s*20\d{2}",
+                    m, re.I,
+                )
+                if dm3:
+                    agent_state["required_by_date"] = dm3.group(0)
 
     # Vendor preference
     if not agent_state.get("vendor_standard"):
@@ -553,7 +594,10 @@ def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
         ):
             agent_state["new_circuits_needed"] = True
 
-    # Hardware (CPE / SD-WAN / WAN layer) explicitly conveying
+    # Hardware (CPE / SD-WAN / WAN layer) explicitly conveying.
+    # NOTE: Only set this when the user EXPLICITLY says a hardware layer (CPE/router/SD-WAN)
+    # is conveying. Do NOT auto-derive from conveyance_status — conveyance_status may refer
+    # to circuits, LAN, or other layers while the CPE layer is net-new.
     if not agent_state.get("hardware_conveying"):
         if re.search(
             r"(?:cpe|router|hardware|equipment|sd.wan|wan.cpe).*convey"
@@ -561,9 +605,6 @@ def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
             r"|existing.*cisco.*convey|convey.*existing.*cisco",
             m,
         ):
-            agent_state["hardware_conveying"] = True
-        # Also set when conveyance_status is conveying_active and category contains SD-WAN/Network
-        elif agent_state.get("conveyance_status") == "conveying_active":
             agent_state["hardware_conveying"] = True
 
     # EOL replacement explicitly needed
@@ -601,6 +642,60 @@ def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
             if candidate.lower() not in _FALSE_POSITIVES:
                 agent_state["project_name"] = candidate
 
+    # ── Assumption confirmation extractors ─────────────────────────────────────
+    # These only run on USER messages. When from_ai=True (AI response processing),
+    # skip entirely to prevent AI phrasing (e.g. "DNA Essentials") from being
+    # treated as user confirmation and silently answering unasked questions.
+    if not from_ai:
+        # SFP transceiver type
+        if agent_state.get("sfp_type_confirmed") is None:
+            if re.search(r"\bfiber\b|\blc\b|\bsingle.mode\b|\bsmf\b|\bmmf\b|\bom\d\b", m):
+                agent_state["sfp_type_confirmed"] = "fiber"
+            elif re.search(r"\bcopper\b|\brj.?45\b|\bcat\s*\d\b", m):
+                agent_state["sfp_type_confirmed"] = "copper"
+
+        # Spares kit
+        if agent_state.get("spares_kit_confirmed") is None:
+            if re.search(r"(yes|include|add|need).{0,20}spare|(spare).{0,20}(yes|include|add|need)", m):
+                agent_state["spares_kit_confirmed"] = True
+            elif re.search(r"(no|exclude|skip|don.t.need).{0,20}spare|(spare).{0,20}(no|exclude|skip)", m):
+                agent_state["spares_kit_confirmed"] = False
+
+        # DNA license tier (Cisco only)
+        if agent_state.get("dna_tier_confirmed") is None:
+            if re.search(r"\badvantage\b", m):
+                agent_state["dna_tier_confirmed"] = "advantage"
+            elif re.search(r"\bessentials\b", m):
+                agent_state["dna_tier_confirmed"] = "essentials"
+
+        # Rack mount kits
+        if agent_state.get("rack_kit_confirmed") is None:
+            if re.search(r"(yes|include|procure|add).{0,20}rack|(rack).{0,20}(yes|include|procure)", m):
+                agent_state["rack_kit_confirmed"] = True
+            elif re.search(r"(no|site.provides|exclude|skip).{0,20}rack|(rack).{0,20}(no|site.provides|exclude)|site\s+provides|racks?\s+exist", m):
+                agent_state["rack_kit_confirmed"] = False
+
+        # OOB console servers
+        if agent_state.get("oob_console_confirmed") is None:
+            if re.search(r"(yes|include|need|add).{0,20}(oob|console.server|out.of.band)", m):
+                agent_state["oob_console_confirmed"] = True
+            elif re.search(r"(no|exclude|skip|separate|handled).{0,20}(oob|console.server|out.of.band)|(oob|console.server).{0,20}(no|exclude|handled)", m):
+                agent_state["oob_console_confirmed"] = False
+
+        # Smart Hands
+        if agent_state.get("smart_hands_confirmed") is None:
+            if re.search(r"(yes|include|need|add).{0,20}(smart.hands|on.site|install|racking)", m):
+                agent_state["smart_hands_confirmed"] = True
+            elif re.search(r"(no|internal|exclude|skip|handle|separate).{0,20}(smart.hands|on.site.install|racking)|(smart.hands).{0,20}(no|internal|handle)|internal\s+team|we\s+handle|handled\s+internally", m):
+                agent_state["smart_hands_confirmed"] = False
+
+        # SD-WAN controller plane — cloud-hosted vs on-prem
+        if agent_state.get("controller_plane_confirmed") is None:
+            if re.search(r"\bon.?prem\b|\bon.?premises\b|\bucs\b|\bhypervisor\b|\bvmware\b|\besxi\b|\bself.host", m):
+                agent_state["controller_plane_confirmed"] = "on-prem"
+            elif re.search(r"\bcloud.hosted\b|\bsaas\b|\bcloud\s+vmanage\b|\bcisco\s+cloud\b|\bhosted\s+by\s+cisco\b", m):
+                agent_state["controller_plane_confirmed"] = "cloud"
+
     # Accumulate explicitly requested hardware layers across turns.
     # Stored in agent_state so scope persists through the full conversation.
     existing_layers: set = set(agent_state.get("requested_layers") or [])
@@ -610,6 +705,170 @@ def _extract_fields_from_message(message: str, agent_state: Dict) -> Dict:
     if existing_layers:
         agent_state["requested_layers"] = sorted(existing_layers)
 
+    return agent_state
+
+
+def _get_missing_fields(agent_state: Dict) -> List[str]:
+    """
+    Returns a list of human-readable labels for required intake fields
+    that have not yet been populated in agent_state.
+    Used by dynamic phase addendums to ask only what is truly missing.
+    """
+    _REQUIRED_LABELS = [
+        ("workstream_category", "IT subcategory (Data Center / Network / Cybersecurity / etc.)"),
+        ("conveyance_status",   "Is existing equipment conveying, or is this a new/greenfield build?"),
+        ("site_count",         "How many sites / locations are in scope?"),
+    ]
+    return [
+        label for field, label in _REQUIRED_LABELS
+        if not agent_state.get(field)
+    ]
+
+
+# ── Assumption checklist — items AI commonly adds without explicit user confirmation ──
+# Each entry: (agent_state_key, question_text, condition_fn)
+# condition_fn(agent_state) -> bool: return True when this question is relevant
+# for this specific deployment context.  Questions that evaluate to False are
+# silently skipped — neither asked nor generated in the BOM.
+# State values: None = not yet asked, True/str = confirmed include, False = confirmed exclude.
+_ASSUMPTION_CHECKLIST: List[Tuple[str, str, Callable]] = [
+    (
+        "sfp_type_confirmed",
+        "SFP transceivers — fiber (LC single-mode) or copper (RJ-45) handoff at each site?",
+        # Only relevant when WAN routers or LAN switches are in scope
+        lambda s: bool({"WAN Router", "LAN Switch"} & set(s.get("requested_layers") or [])),
+    ),
+    (
+        "spares_kit_confirmed",
+        "Spares kit (10% of device fleet) — include in BOM or exclude?",
+        # Always relevant for any hardware procurement
+        lambda s: True,
+    ),
+    (
+        "dna_tier_confirmed",
+        "Cisco DNA license tier — Advantage (full analytics/AIOps) or Essentials (~35% cheaper)?",
+        # Only relevant for Cisco deployments
+        lambda s: "cisco" in (s.get("vendor_standard") or "").lower(),
+    ),
+    (
+        "rack_kit_confirmed",
+        "Rack mount kits & cable management — procure as part of this BOM or site provides?",
+        # Skip for DC/COLO — racks are always procured there, not a question
+        lambda s: (s.get("workstream_category") or "").lower() not in ("data center / colo",),
+    ),
+    (
+        "oob_console_confirmed",
+        "OOB (out-of-band) console servers for remote site management — include or handled separately?",
+        # Only relevant when WAN routers are in scope (branch/remote site deployments)
+        lambda s: "WAN Router" in (s.get("requested_layers") or []),
+    ),
+    (
+        "smart_hands_confirmed",
+        "Smart Hands / on-site racking & installation labour — include in BOM or internal teams handle?",
+        # Skip when all hardware is conveying — nothing to install
+        lambda s: s.get("conveyance_status") != "conveying_active",
+    ),
+    (
+        "controller_plane_confirmed",
+        "SD-WAN controller plane — cloud-hosted (Cisco vManage SaaS) or on-prem (UCS/ESXi VM)?",
+        # Only relevant for SD-WAN deployments that need a new controller
+        lambda s: (
+            "WAN Router" in (s.get("requested_layers") or [])
+            and not s.get("hardware_conveying")
+        ),
+    ),
+]
+
+
+def _get_unconfirmed_assumptions(agent_state: Dict) -> List[Tuple[str, str]]:
+    """
+    Returns (field_key, question_text) pairs for assumption items not yet
+    answered by the user.  Each entry's condition_fn is evaluated against the
+    current agent_state — questions irrelevant to this specific deployment
+    context (wrong vendor, wrong category, hardware conveying, etc.) are
+    silently skipped.
+    Treats True, False, and any string as 'answered' — only None means unasked.
+    """
+    unconfirmed: List[Tuple[str, str]] = []
+    for field, question, condition_fn in _ASSUMPTION_CHECKLIST:
+        if not condition_fn(agent_state):
+            continue
+        if agent_state.get(field) is not None:
+            continue
+        unconfirmed.append((field, question))
+    return unconfirmed
+
+
+def _extract_assumptions_from_conversation(
+    conversation: List[Dict],
+    agent_state: Dict,
+) -> Dict:
+    """
+    Re-scan all user turns in the conversation for assumption answers that may
+    have been given before the GENERATE phase was reached (e.g. user said
+    'fiber connections' in turn 2 long before the questions were formally asked).
+    Runs _extract_fields_from_message with from_ai=False on each user turn so
+    only genuine user text updates assumption state — AI turns are skipped.
+    Safe to call multiple times: extractors are idempotent once a field is set.
+
+    Context-aware: checks the preceding AI turn to resolve bare "yes"/"no" bullet
+    answers where the topic keyword only appears in the AI question, not the user reply.
+    """
+    for idx, turn in enumerate(conversation):
+        if turn.get("role") != "user":
+            continue
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+
+        # Find the nearest preceding AI turn for context
+        prev_ai = ""
+        for j in range(idx - 1, -1, -1):
+            if conversation[j].get("role") in ("assistant", "ai", "AI"):
+                prev_ai = (conversation[j].get("content") or "").lower()
+                break
+
+        # Detect bare "no" / "yes" lines (e.g. "- No" as a bullet point answer)
+        _bare_no  = bool(re.search(r"(?m)^\s*[-•*]?\s*no\s*$",  content, re.IGNORECASE))
+        _bare_yes = bool(re.search(r"(?m)^\s*[-•*]?\s*yes\s*$", content, re.IGNORECASE))
+
+        if prev_ai:
+            if agent_state.get("smart_hands_confirmed") is None:
+                if re.search(r"smart.hands|installation.serv|racking.*instal|on.site.*instal|labour", prev_ai):
+                    if _bare_no:
+                        agent_state["smart_hands_confirmed"] = False
+                    elif _bare_yes:
+                        agent_state["smart_hands_confirmed"] = True
+
+            if agent_state.get("oob_console_confirmed") is None:
+                if re.search(r"oob|console.server|out.of.band", prev_ai):
+                    if _bare_no:
+                        agent_state["oob_console_confirmed"] = False
+                    elif _bare_yes:
+                        agent_state["oob_console_confirmed"] = True
+
+            if agent_state.get("spares_kit_confirmed") is None:
+                if re.search(r"spare|spares.kit", prev_ai):
+                    if _bare_no:
+                        agent_state["spares_kit_confirmed"] = False
+                    elif _bare_yes:
+                        agent_state["spares_kit_confirmed"] = True
+
+            if agent_state.get("rack_kit_confirmed") is None:
+                if re.search(r"rack.mount|cable.management|rack.kit", prev_ai):
+                    if _bare_no:
+                        agent_state["rack_kit_confirmed"] = False
+                    elif _bare_yes:
+                        agent_state["rack_kit_confirmed"] = True
+
+            if agent_state.get("controller_plane_confirmed") is None:
+                if re.search(r"vmanage|vbond|vsmart|controller.plane|sd.wan.controller", prev_ai):
+                    if re.search(r"\bon.?prem\b|\bon.?premises\b|\bucs\b|\bhypervisor\b|\bvmware\b|\besxi\b", content.lower()):
+                        agent_state["controller_plane_confirmed"] = "on-prem"
+                    elif re.search(r"\bcloud.hosted\b|\bsaas\b|\bcloud\s+vmanage\b|\bcisco\s+cloud\b", content.lower()):
+                        agent_state["controller_plane_confirmed"] = "cloud"
+
+        agent_state = _extract_fields_from_message(content, agent_state, from_ai=False)
     return agent_state
 
 
@@ -676,9 +935,28 @@ def _detect_phase_transition(
     text_lower = response_text.lower()
     for phase, kws in phase_keywords.items():
         if any(kw in text_lower for kw in kws):
-            # Only advance if not going backwards
+            # Only advance if not going backwards AND gate fields are satisfied
             if _PHASE_ORDER.index(phase) > _PHASE_ORDER.index(current_phase):
-                return phase
+                gates = _PHASE_GATES.get(phase, [])
+                if all(agent_state.get(g) for g in gates):
+                    return phase
+
+    # ── Implicit SIZING→GENERATE transition ─────────────────────────────────
+    # When the AI is in SIZING and its response indicates scope is complete
+    # (scope table, "ready to generate", "I now have everything") but no JSON
+    # was emitted, advance to GENERATE so the NEXT turn injects the assumption
+    # pre-check instructions and JSON schema prompt.
+    if current_phase == BOMPhase.SIZING and not bom_found:
+        _advance_triggers = [
+            "ready to generate", "i now have everything", "all inputs confirmed",
+            "scope summary", "let me compile", "generate the bom", "generating the bom",
+            "let me generate", "proceed to generate", "scope is confirmed",
+            "compile the draft", "compile the bom",
+        ]
+        if any(t in text_lower for t in _advance_triggers):
+            gates = _PHASE_GATES.get(BOMPhase.GENERATE, [])
+            if all(agent_state.get(g) for g in gates):
+                return BOMPhase.GENERATE
 
     return current_phase  # stay put
 
@@ -688,22 +966,82 @@ def _phase_addendum(phase: BOMPhase, agent_state: Dict) -> str:
     known = {k: v for k, v in agent_state.items() if v}
 
     if phase == BOMPhase.INTAKE:
+        known = {k: v for k, v in agent_state.items() if v}
+        missing = _get_missing_fields(agent_state)
+        known_lines = ""
+        if known.get("workstream_category"):
+            known_lines += f"\n  ✓ Category: {known['workstream_category']}"
+        if known.get("project_name"):
+            known_lines += f"\n  ✓ Project/client: {known['project_name']}"
+        if known.get("site_count"):
+            known_lines += f"\n  ✓ Sites: {known['site_count']}"
+        if known.get("conveyance_status"):
+            known_lines += f"\n  ✓ Conveyance: {known['conveyance_status']}"
+        known_block = (f"\nALREADY KNOWN — do NOT re-ask:{known_lines}") if known_lines else ""
+        if not missing:
+            return (
+                "\n\n[CURRENT PHASE: INTAKE — ALL KEY FIELDS KNOWN]\n"
+                "ASSUME Day-1 Readiness — do NOT ask M&A phase.\n"
+                f"{known_block}\n"
+                "All required intake fields are captured. Acknowledge briefly and advance "
+                "to ask conveyance/qualification details.\n"
+                "Do NOT re-ask any of the already-known fields above."
+            )
+        # Build a question list only for fields that are actually missing
+        ask_items = []
+        if not known.get("workstream_category"):
+            ask_items.append("1. Subcategory: Office/Branch/Manufacturing Site | Colo/Datacenter Hub | Cloud Network Hub?")
+        if not known.get("conveyance_status") and known.get("workstream_category"):
+            ask_items.append(f"{len(ask_items)+1}. Is infrastructure dedicated or shared (multi-tenant/MSP-owned)?")
+        if not known.get("project_name"):
+            ask_items.append(f"{len(ask_items)+1}. Project/client name?")
+        ask_block = "\n".join(ask_items) if ask_items else "Proceed to qualification."
         return (
-            "\n\n[CURRENT PHASE: INTAKE]\n"
+            f"\n\n[CURRENT PHASE: INTAKE]\n"
             "ASSUME Day-1 Readiness — do NOT ask M&A phase.\n"
-            "Ask ONLY (in one message):\n"
-            "1. Subcategory: Office/Branch/Manufacturing Site | Colo/Datacenter Hub | Cloud Network Hub?\n"
-            "2. Is infrastructure dedicated or shared (multi-tenant/MSP-owned)?\n"
-            "3. Project/client name (if not already known).\n"
-            "Do NOT ask about vendors, sites, or conveyance yet."
+            f"{known_block}\n"
+            f"Ask ONLY the following (omit any already answered above):\n{ask_block}\n"
+            "Do NOT ask about vendors, sites, or conveyance details yet."
         )
 
     if phase == BOMPhase.QUALIFY:
         cat = known.get("workstream_category", "Network & Telecom")
         subcategory = known.get("subcategory", "")
+        missing = _get_missing_fields(agent_state)
+
+        # Build known-fields block so AI never re-asks them
+        known_lines = ""
+        if known.get("workstream_category"):
+            known_lines += f"\n  ✓ Category: {known['workstream_category']}"
+        if known.get("conveyance_status"):
+            known_lines += f"\n  ✓ Conveyance: {known['conveyance_status']}"
+        if known.get("site_count"):
+            known_lines += f"\n  ✓ Sites: {known['site_count']}"
+        if known.get("vendor_standard"):
+            known_lines += f"\n  ✓ Vendor standard: {known['vendor_standard']}"
+        if known.get("site_criticality"):
+            known_lines += f"\n  ✓ Criticality: {known['site_criticality']}"
+        known_block = (f"ALREADY KNOWN — do NOT re-ask:{known_lines}") if known_lines else ""
+
+        # Build the missing-fields ask list dynamically
+        still_missing = [
+            label for field, label in [
+                ("conveyance_status", "Is existing network equipment conveying, or is this a new/greenfield build?"),
+                ("site_count",        "How many sites are in scope? (used as the quantity multiplier)"),
+            ]
+            if not agent_state.get(field)
+        ]
+        if still_missing:
+            ask_lines = "\n".join(f"{i+1}. {q}" for i, q in enumerate(still_missing))
+            ask_block = f"Ask ONLY the following unanswered questions:\n{ask_lines}"
+        else:
+            ask_block = "All key qualification fields are known. Acknowledge and advance to SCOPE."
+
         return (
             f"\n\n[CURRENT PHASE: QUALIFICATION — {cat} / {subcategory}]\n"
-            "Follow the skill's conveying decision tree:\n"
+            f"{known_block}\n\n"
+            f"{ask_block}\n\n"
+            "Conveying decision tree (for context):\n"
             "SHARED sites → buy NET NEW for all layers (router, switch, firewall, WAN-CPE, WLAN). Skip to SCOPE.\n"
             "DEDICATED sites:\n"
             "  → Is network equipment conveying? (LAN, WLAN, Firewall, WAN-CPE, on-prem WLC, NAC)\n"
@@ -713,7 +1051,7 @@ def _phase_addendum(phase: BOMPhase, agent_state: Dict) -> str:
             "    Circuit conveying → contract + cutover-day changes via telco.\n"
             "  → Any EOL/EOS replacements needed?\n"
             "Typical dedicated-site BOMs: SD-WAN CPE, firewalls, EOL routers/switches/APs.\n"
-            f"KNOWN SO FAR: {json.dumps(known, default=str)}"
+            f"FULL STATE: {json.dumps(known, default=str)}"
         )
 
     if phase == BOMPhase.SCOPE:
@@ -741,6 +1079,13 @@ def _phase_addendum(phase: BOMPhase, agent_state: Dict) -> str:
             "- WAN routers: 2 per HA site, 1 per standard site\n"
             "- Firewalls: 2 per site (HA pair always for >250 users or compliance)\n"
             "- quantity_basis: annotate every line as '[qty] per site × [N] sites = [total]'\n"
+            "\n"
+            "⚠️  CRITICAL CONSTRAINT — DO NOT GENERATE BOM JSON IN THIS PHASE:\n"
+            "After computing quantities, summarise the scope in a PLAIN TEXT table only.\n"
+            "Do NOT emit a ```json block — the BOM assumption check must happen first.\n"
+            "End your response by saying you are ready to generate the BOM and\n"
+            "confirming the scope summary.  The orchestrator will then advance the\n"
+            "phase and ask the user to confirm assumption items before generating JSON.\n"
             f"KNOWN SO FAR: {json.dumps(known, default=str)}"
         )
 
@@ -751,9 +1096,9 @@ def _phase_addendum(phase: BOMPhase, agent_state: Dict) -> str:
         hardware_conveying = known.get("hardware_conveying", False)
         eol_needed = known.get("eol_replacement_needed", False)
         new_circuits = known.get("new_circuits_needed", False)
-        # Also honour conveyance_status if hardware_conveying wasn't set explicitly
-        if not hardware_conveying and known.get("conveyance_status") == "conveying_active":
-            hardware_conveying = True
+        # NOTE: Do NOT auto-set hardware_conveying from conveyance_status here.
+        # conveyance_status may refer to circuits/LAN layers while CPE is net-new.
+        # hardware_conveying is only True when the extractor matched explicit CPE/router language.
         if not eol_needed and known.get("conveyance_status") == "conveying_eol":
             eol_needed = True
 
@@ -839,33 +1184,85 @@ def _phase_addendum(phase: BOMPhase, agent_state: Dict) -> str:
                 "qty_basis, qty_status, quantity_basis, ha_role (if HA pair), price_basis, order_sequence.\n"
                 f"KNOWN SO FAR: {json.dumps(known, default=str)}"
             )
+        # ── PATH A: user has answered assumption questions — generate JSON now ──
+        if known.get("pending_assumption_confirmation"):
+            return (
+                f"\n\n[CURRENT PHASE: BOM GENERATION — ASSUMPTION CONFIRMATION COMPLETE — {vendor}, {sites} sites, {criticality}]\n"
+                "The user has just answered your assumption confirmation questions.\n"
+                "Parse their responses carefully:\n"
+                "  - Items the user said YES to (or gave a specific answer, e.g. 'fiber SFPs') →\n"
+                "    include in line_items[] with qty_status='confirmed', using the detail they gave\n"
+                "  - Items the user said NO to → exclude entirely from the BOM\n"
+                "  - Any item still unresolved → optional_recommendations[] only,\n"
+                "    recommendation_type='unconfirmed_assumption'\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "SCOPE DISCIPLINE — still applies\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Include in line_items[] ONLY: layers the user explicitly requested + items they just confirmed YES.\n"
+                "  ✓ Support contract (SmartNet/FortiCare) per confirmed hardware unit\n"
+                "  ✓ Software license required to operate confirmed hardware\n"
+                "  ✗ Items user said NO to → excluded entirely, do not put anywhere\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Every line item MUST have qty_status='confirmed' or qty_status='calculated'.\n"
+                "No qty_status='assumption' items should remain — the user resolved them all above.\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "EXPAND EVERY REQUESTED COMPONENT TO ITS FULL SKU BUNDLE:\n"
+                "  Router  → chassis + IOS + DNA sub (if confirmed tier) + SmartNet + WAN NIM + SFP (if confirmed) + rack kit (if confirmed)\n"
+                "  Firewall → appliance + IPS + URL + SSL + AMP + HA peer + support + rack (if confirmed) + SFPs (if confirmed)\n"
+                "  Switch  → chassis + license + stacking + SmartNet + SFP uplinks (if confirmed)\n"
+                "  AP      → unit + PoE injector + cloud license + mounting (if confirmed)\n"
+                "Output ONLY valid JSON inside ```json...``` fences.\n"
+                "Each line item MUST include: qty_status, quantity_basis, ha_role (if HA pair), price_basis, order_sequence.\n"
+                "NEVER output a single generic line like 'Cisco Router' — that fails the Vendor-Ready BOM Gate.\n"
+                f"KNOWN SO FAR: {json.dumps(known, default=str)}"
+            )
+
+        # ── PATH B: first entry into GENERATE — ask only unresolved assumption items ──
+        unconfirmed = _get_unconfirmed_assumptions(agent_state)
+        if not unconfirmed:
+            # All assumption items already answered in conversation — generate immediately
+            confirmed_summary = []
+            for field, question, _ in _ASSUMPTION_CHECKLIST:
+                val = agent_state.get(field)
+                if val is not None:
+                    confirmed_summary.append(f"  ✓ {question.split('—')[0].strip()}: {val}")
+            confirmed_block = "\n".join(confirmed_summary) if confirmed_summary else ""
+            return (
+                f"\n\n[CURRENT PHASE: BOM GENERATION — ALL ASSUMPTIONS RESOLVED — {vendor}, {sites} sites, {criticality}]\n"
+                "All assumption items were confirmed during earlier qualification. Generate the BOM now.\n"
+                f"CONFIRMED ASSUMPTIONS:\n{confirmed_block}\n\n"
+                "Include in line_items[] ONLY: layers explicitly requested + confirmed assumption items.\n"
+                "Every line item MUST have qty_status='confirmed' or qty_status='calculated'.\n"
+                "Output ONLY valid JSON inside ```json...``` fences.\n"
+                "Each line item MUST include: qty_status, quantity_basis, ha_role (if HA pair), price_basis, order_sequence.\n"
+                f"KNOWN SO FAR: {json.dumps(known, default=str)}"
+            )
+
+        # Build numbered question list from only unresolved items
+        questions_block = "\n".join(
+            f"  {i+1}. {question}"
+            for i, (_, question) in enumerate(unconfirmed)
+        )
         return (
-            f"\n\n[CURRENT PHASE: BOM GENERATION — {vendor}, {sites} sites, {criticality}]\n"
+            f"\n\n[CURRENT PHASE: BOM GENERATION — ASSUMPTION PRE-CHECK — {vendor}, {sites} sites, {criticality}]\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "SCOPE DISCIPLINE — READ BEFORE GENERATING\n"
+            "MANDATORY: CONFIRM THE FOLLOWING ITEMS BEFORE GENERATING BOM\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Include in line_items[] ONLY the hardware/software layers the user\n"
-            "explicitly requested in the conversation. Do NOT add extra layers.\n"
-            "  ✗ If user asked for firewalls only → no routers, no switches, no APs\n"
-            "  ✗ If user asked for SD-WAN CPE only → no firewalls, no LAN switches\n"
-            "  ✗ If user asked for EDR only → no SIEM, no PAM, no email security\n"
-            "  ✗ Do NOT add FortiManager, FortiAnalyzer, vManage, Catalyst Center,\n"
-            "    or any management/orchestration platform unless the user named it\n"
-            "Mandatory dependencies of REQUESTED hardware ARE allowed in line_items[]:\n"
-            "  ✓ Support contract (SmartNet/FortiCare) per requested hardware unit\n"
-            "  ✓ Software license required to operate the requested hardware\n"
-            "  ✓ Physical accessories (rack kit, cables, SFPs) per requested unit\n"
-            "  ✓ Spares kit (10% of requested fleet)\n"
-            "Any additional items you think are useful → put in optional_recommendations[]\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "EXPAND EVERY REQUESTED COMPONENT TO ITS FULL SKU BUNDLE:\n"
-            "  Router  → 8 lines  (chassis + IOS + DNA subscription + SmartNet + WAN NIM + SFP + cables + rack kit)\n"
-            "  Firewall → 10 lines (appliance + IPS + URL + SSL + AMP + HA peer + support + rack + SFPs)\n"
-            "  Switch  → 5 lines  (chassis + license + stacking + SmartNet + SFP uplinks)\n"
-            "  AP      → 4 lines  (unit + PoE injector + cloud license + mounting)\n"
-            "Output ONLY valid JSON inside ```json...``` fences.\n"
-            "Each line item MUST include: quantity_basis, ha_role (if HA pair), price_basis, order_sequence.\n"
-            "NEVER output a single 'Cisco Router' line — that fails the Vendor-Ready BOM Gate.\n"
+            "Before emitting any BOM JSON you MUST do the following ON THIS TURN:\n"
+            "1. Start your response with the EXACT token on its own line: [ASSUMPTION_CHECK]\n"
+            "   The orchestrator uses this token to hold BOM generation until the user replies.\n"
+            "2. Ask the user ONLY the following unresolved questions (these are the items not yet\n"
+            "   confirmed in this conversation — do NOT re-ask anything already answered above):\n"
+            f"{questions_block}\n"
+            "3. Ask the user to reply with a yes/no or specific detail for each number.\n"
+            "4. Do NOT emit any BOM JSON on this turn — wait for the user to answer.\n\n"
+            "After the user replies, the system enters ASSUMPTION CONFIRMATION COMPLETE mode\n"
+            "and you generate the full BOM honouring their answers.\n\n"
+            "SCOPE DISCIPLINE (applied after confirmation):\n"
+            "  ✓ Layers the user explicitly requested in conversation\n"
+            "  ✓ Items the user confirms YES to (with their specified details)\n"
+            "  ✗ Items the user says NO to → excluded from BOM entirely\n"
+            "  ✗ Items still unresolved → optional_recommendations[] only\n"
             f"KNOWN SO FAR: {json.dumps(known, default=str)}"
         )
 
@@ -1028,6 +1425,53 @@ class BOMOrchestrator:
         while msgs and msgs[0]["role"] == "assistant":
             msgs.pop(0)
 
+        # ── Hard assumption pre-gate (fires BEFORE AI call) ──────────────────
+        # Re-scan the full conversation so assumption answers given in early turns
+        # (before GENERATE phase was reached) are captured in agent_state.
+        # Then: if any assumption items are still unconfirmed, return the question
+        # list directly — the AI is never called until all items are resolved.
+        # assumptions_gate_passed=True means the user has already answered this
+        # cycle; skip the gate so BOM revisions don't re-trigger it.
+        #
+        # Restricted to SIZING and GENERATE phases only — the gate must NOT fire
+        # during QUALIFY or SCOPE. The AI still needs to ask about conveyance
+        # details, cutover dates, and scope of other network layers before
+        # assumption items become relevant. Firing too early causes assumption
+        # questions to appear before the user has finished basic qualification.
+        _bom_ready_to_generate = (
+            bool(agent_state.get("site_count"))
+            and bool(agent_state.get("conveyance_status"))
+            and current_phase in (BOMPhase.SIZING, BOMPhase.GENERATE)
+        )
+        if (
+            _bom_ready_to_generate
+            and not agent_state.get("pending_assumption_confirmation")
+            and not agent_state.get("assumptions_gate_passed")
+            and not agent_state.get("pending_change_request")
+        ):
+            agent_state = _extract_assumptions_from_conversation(
+                session.get("conversation", []), agent_state
+            )
+            _pre_unconfirmed = _get_unconfirmed_assumptions(agent_state)
+            if _pre_unconfirmed:
+                agent_state["pending_assumption_confirmation"] = True
+                _q_block = "\n".join(
+                    f"{i+1}. {q}" for i, (_, q) in enumerate(_pre_unconfirmed)
+                )
+                _gate_response = (
+                    "Before I generate the BOM, I need to confirm a few things with you:\n\n"
+                    + _q_block
+                    + "\n\nPlease reply with yes/no or a specific detail for each number."
+                )
+                context["agent_state"] = agent_state
+                context["current_phase_name"] = current_phase.value
+                context["current_phase"] = _PHASE_ORDER.index(current_phase) + 1
+                logger.info(
+                    "AssumptionPreGate: intercepted GENERATE — %d unconfirmed items, skipping AI call",
+                    len(_pre_unconfirmed),
+                )
+                return _gate_response, None, _PHASE_PROGRESS.get(current_phase, 80), False
+
         # ── Call AI ────────────────────────────────────────────────────────
         response_text = call_ai(msgs, system=system)
         if response_text is None:
@@ -1035,7 +1479,59 @@ class BOMOrchestrator:
             response_text = self._rule_based(category, current_phase, message, agent_state, user_turns)
 
         # ── Post-process ───────────────────────────────────────────────────
-        partial_bom, bom_found = self._extract_bom(response_text)
+        # Detect assumption pre-check: AI outputs [ASSUMPTION_CHECK] token to signal
+        # it needs the user to confirm/deny assumed items before generating JSON.
+        # Hold BOM generation on this turn; resume when user replies.
+        if "[ASSUMPTION_CHECK]" in response_text:
+            agent_state["pending_assumption_confirmation"] = True
+            # Strip the token so the user only sees the clean question text
+            response_text = response_text.replace("[ASSUMPTION_CHECK]", "").strip()
+            partial_bom, bom_found = None, False
+        else:
+            # ── Assumption safety net ────────────────────────────────────────────
+            # Guard against the AI ignoring the [ASSUMPTION_CHECK] instruction and
+            # jumping straight to BOM JSON generation.  When we're in GENERATE phase,
+            # the user has NOT yet answered assumption questions, AND the AI produced
+            # JSON anyway — strip the JSON and force the assumption pre-check.
+            # This prevents SFPs, spares, DNA tier, rack kits, OOB consoles, and
+            # Smart Hands from silently appearing in the BOM without user sign-off.
+            _safety_net_fired = False
+            if (
+                not agent_state.get("pending_assumption_confirmation")
+                and not agent_state.get("assumptions_gate_passed")
+                and not agent_state.get("pending_change_request")
+                and re.search(r"```json", response_text)
+            ):
+                _unconfirmed_safety = _get_unconfirmed_assumptions(agent_state)
+                if _unconfirmed_safety:
+                    logger.info(
+                        "AssumptionSafetyNet: AI skipped [ASSUMPTION_CHECK] in GENERATE phase "
+                        "— stripping BOM JSON and enforcing pre-check (%d unconfirmed items)",
+                        len(_unconfirmed_safety),
+                    )
+                    response_text = re.sub(r"```json[\s\S]*?```", "", response_text).strip()
+                    agent_state["pending_assumption_confirmation"] = True
+                    if not response_text:
+                        _q_block = "\n".join(
+                            f"{i+1}. {q}" for i, (_, q) in enumerate(_unconfirmed_safety)
+                        )
+                        response_text = (
+                            "Before I generate the BOM, I need to confirm a few items "
+                            "with you:\n\n" + _q_block +
+                            "\n\nPlease reply with yes/no or a specific detail for each number."
+                        )
+                    partial_bom, bom_found = None, False
+                    _safety_net_fired = True
+
+            if not _safety_net_fired:
+                if agent_state.get("pending_assumption_confirmation"):
+                    # User has now replied to the assumption questions — clear the flag.
+                    # _phase_addendum will enter PATH A (confirmation-complete) on next call.
+                    # Set assumptions_gate_passed so the pre-gate does not re-trigger
+                    # on subsequent GENERATE calls (e.g. BOM revisions).
+                    agent_state["pending_assumption_confirmation"] = False
+                    agent_state["assumptions_gate_passed"] = True
+                partial_bom, bom_found = self._extract_bom(response_text)
 
         # -- Scope enforcement - deterministic post-AI filter -----------------------
         # Runs on every generated BOM before display or persistence.
@@ -1057,8 +1553,10 @@ class BOMOrchestrator:
                 )
 
         # ── Phase transition ───────────────────────────────────────────────
-        # Also extract fields the AI mentioned in its response
-        agent_state = _extract_fields_from_message(response_text, agent_state)
+        # Extract core fields (site count, vendor, etc.) the AI may have echoed back.
+        # Pass from_ai=True to skip assumption extractors — AI phrasing must not
+        # be treated as user confirmation of SFPs, spares, DNA tier, etc.
+        agent_state = _extract_fields_from_message(response_text, agent_state, from_ai=True)
         new_phase = _detect_phase_transition(response_text, current_phase, agent_state, bom_found)
 
         # ── Persist state back to session context ──────────────────────────
@@ -1189,6 +1687,42 @@ class BOMOrchestrator:
         else:
             data.setdefault("optional_recommendations", [])
         data, _ = _validate_bom_dependencies(data)
+
+        # ── Universal assumption gate ─────────────────────────────────────────
+        # Any line item where qty_status="assumption" means the AI added it without
+        # explicit user confirmation. Move ALL such items to optional_recommendations[]
+        # regardless of category. This is the principle-based enforcement — no
+        # pattern-matching needed; it catches SFPs, Smart Hands, and anything else
+        # in future that the AI marks as an assumption.
+        confirmed_items = [i for i in data["line_items"] if i.get("qty_status") != "assumption"]
+        assumed_items   = [i for i in data["line_items"] if i.get("qty_status") == "assumption"]
+        if assumed_items:
+            optional = data.setdefault("optional_recommendations", [])
+            for item in assumed_items:
+                optional.append({
+                    "description":           item.get("description", ""),
+                    "category":              item.get("category", ""),
+                    "sku":                   item.get("sku", ""),
+                    "qty":                   item.get("qty"),
+                    "vendor":                item.get("vendor", ""),
+                    "estimated_unit_price":  item.get("unit_price"),
+                    "recommendation_reason": (
+                        item.get("notes")
+                        or "Included as an assumption — not explicitly confirmed in conversation."
+                    ),
+                    "recommendation_type":   "unconfirmed_assumption",
+                })
+            data["line_items"] = confirmed_items
+            data.setdefault("warnings", []).append(
+                f"ℹ️ {len(assumed_items)} assumption item(s) moved to Optional Recommendations "
+                "— confirm with the user before adding to the ordered BOM."
+            )
+            logger.info(
+                "AssumptionGate: moved %d item(s) to optional_recommendations: %s",
+                len(assumed_items),
+                [i.get("description", "") for i in assumed_items],
+            )
+
         return data, True
 
     # ── Rule-based fallback ───────────────────────────────────────────────
@@ -1356,10 +1890,8 @@ class BOMOrchestrator:
         }
 
         # ── Conveyance guard — use circuits-only template when hardware is conveying ──
-        hardware_conveying = (
-            agent_state.get("hardware_conveying", False)
-            or agent_state.get("conveyance_status") == "conveying_active"
-        )
+        # Only True when extractor matched explicit CPE/router conveying language.
+        hardware_conveying = agent_state.get("hardware_conveying", False)
         eol_needed = (
             agent_state.get("eol_replacement_needed", False)
             or agent_state.get("conveyance_status") == "conveying_eol"
